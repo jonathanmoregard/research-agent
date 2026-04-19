@@ -41,13 +41,14 @@ exec bwrap \
   --ro-bind /lib64 /lib64 \
   --ro-bind /bin /bin \
   --ro-bind /sbin /sbin \
+  --ro-bind /proc /proc \
+  --dev /dev \
+  --tmpfs /tmp \
+  --tmpfs /home/vscode \
   --ro-bind /home/vscode/.local /home/vscode/.local \
   --ro-bind "${AGENT_DIR}" "${AGENT_DIR}" \
   --bind "${FINAL_FILE}" "${SCRATCH_FILE}" \
-  --tmpfs /tmp \
-  --tmpfs /home/vscode \
-  --proc /proc \
-  --dev /dev \
+  --unshare-user \
   --unshare-pid \
   --unshare-uts \
   --unshare-ipc \
@@ -55,6 +56,7 @@ exec bwrap \
   --new-session \
   --chdir "${AGENT_DIR}" \
   --setenv HOME "/home/vscode" \
+  --setenv PATH "/home/vscode/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   --setenv EXA_API_KEY "${EXA_API_KEY:-}" \
   --setenv TAVILY_API_KEY "${TAVILY_API_KEY:-}" \
   --setenv RESEARCH_SCRATCH_PATH "${SCRATCH_FILE}" \

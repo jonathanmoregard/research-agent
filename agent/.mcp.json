@@ -2,19 +2,11 @@
   "mcpServers": {
     "exa": {
       "type": "http",
-      "url": "https://mcp.exa.ai/mcp",
-      "headers": {
-        "Authorization": "Bearer ${EXA_API_KEY}"
-      },
-      "description": "Exa web search and fetch"
+      "url": "https://mcp.exa.ai/mcp"
     },
     "tavily-remote-mcp": {
       "type": "http",
-      "url": "https://mcp.tavily.com/mcp/",
-      "headers": {
-        "Authorization": "Bearer ${TAVILY_API_KEY}"
-      },
-      "description": "Tavily search, extract, research"
+      "url": "https://mcp.tavily.com/mcp/"
     }
   }
 }
