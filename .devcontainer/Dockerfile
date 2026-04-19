@@ -14,6 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       bubblewrap \
       ca-certificates \
       curl \
+      iptables \
+      ipset \
       jq \
       tini \
       python3 \
@@ -27,6 +29,14 @@ ENV PATH="/home/vscode/.local/bin:$PATH"
 
 # Claude Code (native installer).
 RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Switch back to root so the entrypoint can configure iptables.
+# run-agent.sh drops privileges for the actual agent invocation via bwrap.
+USER root
+# bwrap inside --unshare-user maps uid 0 -> nobody, so the nsroot must be
+# able to stat /home/vscode (default 750) to set up the ro-bind of .local.
+RUN chmod 755 /home/vscode
+ENTRYPOINT ["/workspace/scripts/container-entrypoint.sh"]
 
 # Host mounts this repo at /workspace. Reports land in /out (bind mount
 # from host reports/). Each research call uses a fresh tmpfs scratch dir

@@ -13,6 +13,7 @@
   },
   "runArgs": [
     "--init",
+    "--cap-add=NET_ADMIN",
     "--security-opt=seccomp=unconfined",
     "--security-opt=apparmor=unconfined"
   ],

@@ -24,11 +24,12 @@ OUT_DIR="${RESEARCH_REPORTS_DIR:-/out}"
 SCRATCH_FILE="/scratch/${REPORT_UUID}.md"
 FINAL_FILE="${OUT_DIR}/${REPORT_UUID}.md"
 
-# Pre-create the final file so bwrap can bind it writable (bwrap --bind on a
-# non-existent target fails). We truncate to zero so the agent writes into a
-# known empty file via its /out view. Actually we mount /scratch writable
-# and the agent writes there; server.py moves the file after scan.
+# Pre-create the final file so bwrap can bind it writable. bwrap's
+# --unshare-user maps the outer uid to 'nobody' (65534) inside the jail;
+# the bound file must be writable by that uid, so we chmod 666 up front.
+# The file is ephemeral — only valid for this one call.
 touch "${FINAL_FILE}"
+chmod 666 "${FINAL_FILE}"
 
 # Prompt passed via a file to avoid shell-quoting issues with arbitrary content.
 PROMPT_CONTENT="$(cat "${PROMPT_FILE}")"
@@ -57,9 +58,11 @@ exec bwrap \
   --chdir "${AGENT_DIR}" \
   --setenv HOME "/home/vscode" \
   --setenv PATH "/home/vscode/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --setenv CLAUDE_CODE_OAUTH_TOKEN "${CLAUDE_CODE_OAUTH_TOKEN:-}" \
   --setenv EXA_API_KEY "${EXA_API_KEY:-}" \
   --setenv TAVILY_API_KEY "${TAVILY_API_KEY:-}" \
   --setenv RESEARCH_SCRATCH_PATH "${SCRATCH_FILE}" \
   -- \
   claude -p "${PROMPT_CONTENT}" \
+    --add-dir /scratch \
     --allowed-tools "mcp__exa__web_search_exa,mcp__exa__web_fetch_exa,mcp__tavily-remote-mcp__tavily_search,mcp__tavily-remote-mcp__tavily_extract,Write"

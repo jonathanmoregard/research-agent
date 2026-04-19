@@ -35,6 +35,67 @@ from mcp.server.fastmcp import FastMCP
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REPORTS_DIR = Path(os.environ.get("RESEARCH_REPORTS_DIR", REPO_ROOT / "reports"))
 
+
+def _keyring_env() -> dict[str, str]:
+    """Ensure secret-tool can reach the user's D-Bus session bus.
+
+    When the MCP server is launched by Claude Code as a subprocess, the parent
+    env may omit DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR. Fall back to the
+    conventional systemd per-user paths (/run/user/<uid>).
+    """
+    env = dict(os.environ)
+    if "DBUS_SESSION_BUS_ADDRESS" not in env:
+        bus = f"/run/user/{os.getuid()}/bus"
+        if Path(bus).exists():
+            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+    if "XDG_RUNTIME_DIR" not in env:
+        xdg = f"/run/user/{os.getuid()}"
+        if Path(xdg).is_dir():
+            env["XDG_RUNTIME_DIR"] = xdg
+    return env
+
+
+def _keyring_lookup(key: str) -> str | None:
+    """Fetch a secret from the GNOME keyring. Returns None if not found.
+
+    Secrets are stored with the attribute pair (app=research-agent, key=<key>),
+    e.g. `secret-tool store --label="..." app research-agent key claude-token`.
+    """
+    try:
+        r = subprocess.run(
+            ["secret-tool", "lookup", "app", "research-agent", "key", key],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=_keyring_env(),
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    val = r.stdout.strip()
+    return val or None
+
+
+SECRETS_CACHE: dict[str, str] = {}
+
+
+def _secrets() -> dict[str, str]:
+    """Load secrets once per server startup and cache them in-process.
+
+    Tokens are never written to disk. The cache lives only in the MCP server's
+    memory; the server passes them into the container via `docker exec -e`
+    for each call so they are not visible in the container's static env
+    (docker inspect).
+    """
+    if SECRETS_CACHE:
+        return SECRETS_CACHE
+    for name in ("claude-token", "exa-api-key", "tavily-api-key"):
+        val = _keyring_lookup(name)
+        if val:
+            SECRETS_CACHE[name] = val
+    return SECRETS_CACHE
+
 # Name of the long-running container that holds the agent. Matches the
 # `name` field in .devcontainer/devcontainer.json (actual runtime name will
 # vary with the orchestrator — override via env).
@@ -91,16 +152,26 @@ def _run_agent(prompt: str, report_id: str) -> tuple[int, str]:
         )
         if cp.returncode != 0:
             return cp.returncode, f"docker cp failed: {cp.stderr.strip()}"
+        secrets = _secrets()
+        exec_cmd = ["docker", "exec"]
+        # Inject secrets per-call via -e so they don't live in the container's
+        # static env (visible in `docker inspect`). They do appear briefly in
+        # the docker CLI's argv on the host, but not in any filesystem state.
+        if "claude-token" in secrets:
+            exec_cmd += ["-e", f"CLAUDE_CODE_OAUTH_TOKEN={secrets['claude-token']}"]
+        if "exa-api-key" in secrets:
+            exec_cmd += ["-e", f"EXA_API_KEY={secrets['exa-api-key']}"]
+        if "tavily-api-key" in secrets:
+            exec_cmd += ["-e", f"TAVILY_API_KEY={secrets['tavily-api-key']}"]
+        exec_cmd += [
+            CONTAINER,
+            "bash",
+            f"{CONTAINER_WORKSPACE}/scripts/run-agent.sh",
+            report_id,
+            container_prompt_file,
+        ]
         result = subprocess.run(
-            [
-                "docker",
-                "exec",
-                CONTAINER,
-                "bash",
-                f"{CONTAINER_WORKSPACE}/scripts/run-agent.sh",
-                report_id,
-                container_prompt_file,
-            ],
+            exec_cmd,
             capture_output=True,
             text=True,
             timeout=AGENT_TIMEOUT,
@@ -117,6 +188,9 @@ def _run_agent(prompt: str, report_id: str) -> tuple[int, str]:
 
 def _scan(path: Path) -> tuple[bool, str]:
     """Run the scanner on the report file. Returns (ok, reason)."""
+    import sys
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
     from scanner.regex import scan_file
 
     return scan_file(path)
