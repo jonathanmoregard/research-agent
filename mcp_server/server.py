@@ -27,10 +27,15 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
+
+Depth = Literal["fast", "normal", "deep"]
+VALID_DEPTHS: tuple[Depth, ...] = ("fast", "normal", "deep")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REPORTS_DIR = Path(os.environ.get("RESEARCH_REPORTS_DIR", REPO_ROOT / "reports"))
@@ -108,18 +113,43 @@ AGENT_TIMEOUT = int(os.environ.get("RESEARCH_AGENT_TIMEOUT", "600"))
 # created by devcontainer.json (default: /workspace).
 CONTAINER_WORKSPACE = os.environ.get("RESEARCH_CONTAINER_WORKSPACE", "/workspace")
 
+# Per-depth guidance the agent receives. Tools themselves are gated via
+# --allowed-tools in run-agent.sh; the prompt tells the agent how aggressively
+# to use them.
+DEPTH_GUIDANCE: dict[Depth, str] = {
+    "fast": (
+        "Research depth: FAST. One search query, numResults=3, "
+        "livecrawl='never'. Do not fetch individual URLs. Produce a short "
+        "report (<15 lines) from snippets."
+    ),
+    "normal": (
+        "Research depth: NORMAL. Use up to 3 search queries at numResults=8 "
+        "with livecrawl='fallback'. Fetch the top 2 most relevant URLs for "
+        "fuller context. Cross-reference."
+    ),
+    "deep": (
+        "Research depth: DEEP. Use up to 5 search queries at numResults=15 "
+        "with livecrawl='always' for freshness. Fetch the top 5 URLs. "
+        "If available, use `mcp__tavily-remote-mcp__tavily_research` to "
+        "run an end-to-end deep research synthesis over a specific "
+        "sub-question. Aim for broad source coverage and explicit "
+        "cross-referencing."
+    ),
+}
+
 PROMPT_TEMPLATE = (
     "You are the research-agent. Investigate the following prompt using the "
     "available web MCPs (exa, tavily), then write a cited markdown report to "
     "exactly this path:\n\n"
     "    {scratch_path}\n\n"
+    "{depth_guidance}\n\n"
     "Do not write to any other location. Do not print the report to stdout. "
     "When done, say only 'DONE' and nothing else.\n\n"
     "Research prompt:\n\n{prompt}\n"
 )
 
 
-def _run_agent(prompt: str, report_id: str) -> tuple[int, str]:
+def _run_agent(prompt: str, report_id: str, depth: Depth) -> tuple[int, str]:
     """Run a single research call inside the container's bubblewrap jail.
 
     Returns (exit_code, combined_output).
@@ -128,7 +158,11 @@ def _run_agent(prompt: str, report_id: str) -> tuple[int, str]:
     # The host-visible equivalent is the pre-created reports/<uuid>.md file
     # that run-agent.sh bind-mounts into /scratch for the jail.
     scratch_path = f"/scratch/{report_id}.md"
-    full_prompt = PROMPT_TEMPLATE.format(scratch_path=scratch_path, prompt=prompt)
+    full_prompt = PROMPT_TEMPLATE.format(
+        scratch_path=scratch_path,
+        depth_guidance=DEPTH_GUIDANCE[depth],
+        prompt=prompt,
+    )
 
     # Ship the prompt into the container via a temp file to avoid shell
     # quoting issues with arbitrary characters.
@@ -163,6 +197,8 @@ def _run_agent(prompt: str, report_id: str) -> tuple[int, str]:
             exec_cmd += ["-e", f"EXA_API_KEY={secrets['exa-api-key']}"]
         if "tavily-api-key" in secrets:
             exec_cmd += ["-e", f"TAVILY_API_KEY={secrets['tavily-api-key']}"]
+        # Pass depth to the runner so it can pick the right --allowed-tools.
+        exec_cmd += ["-e", f"RESEARCH_DEPTH={depth}"]
         exec_cmd += [
             CONTAINER,
             "bash",
@@ -200,16 +236,28 @@ mcp = FastMCP("research-agent")
 
 
 @mcp.tool()
-def research(prompt: str) -> dict:
+def research(prompt: str, depth: str = "normal") -> dict:
     """Run a web-research task in the isolated agent and return the report path.
 
     Args:
         prompt: The research question or instructions for the agent.
+        depth: 'fast' | 'normal' | 'deep'. Controls how many queries the
+            agent runs, numResults per query, livecrawl aggressiveness, and
+            whether deep-research synthesis tools are enabled.
 
     Returns:
-        On success: {"status": "done", "report_path": str}.
-        On failure: {"status": "error", "error": str}.
+        On success: {"status": "done", "report_path": str,
+                     "timings_ms": {"agent": int, "scan": int, "total": int}}.
+        On failure: {"status": "error", "error": str,
+                     "timings_ms": {...}}.
     """
+    if depth not in VALID_DEPTHS:
+        return {
+            "status": "error",
+            "error": f"invalid depth {depth!r}; must be one of {list(VALID_DEPTHS)}",
+        }
+
+    t_received = time.monotonic()
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     report_id = uuid.uuid4().hex
     # Pre-create the destination file so bwrap can bind it into the jail.
@@ -217,7 +265,7 @@ def research(prompt: str) -> dict:
     report_path.touch()
 
     try:
-        code, output = _run_agent(prompt, report_id)
+        code, output = _run_agent(prompt, report_id, depth)  # type: ignore[arg-type]
     except subprocess.TimeoutExpired:
         report_path.unlink(missing_ok=True)
         return {"status": "error", "error": f"agent timeout after {AGENT_TIMEOUT}s"}
@@ -228,11 +276,16 @@ def research(prompt: str) -> dict:
         report_path.unlink(missing_ok=True)
         return {"status": "error", "error": f"agent invocation failed: {e}"}
 
+    t_scan_start = time.monotonic()
+    agent_ms = int((t_scan_start - t_received) * 1000)
+
     if code != 0 or report_path.stat().st_size == 0:
         report_path.unlink(missing_ok=True)
+        total_ms = int((time.monotonic() - t_received) * 1000)
         return {
             "status": "error",
             "error": f"agent failed (exit={code}): {output[-500:]}",
+            "timings_ms": {"agent": agent_ms, "scan": 0, "total": total_ms},
         }
 
     ok, reason = _scan(report_path)
@@ -242,7 +295,16 @@ def research(prompt: str) -> dict:
         quarantine = REPORTS_DIR / "_quarantine"
         quarantine.mkdir(exist_ok=True)
         shutil.move(str(report_path), str(quarantine / f"{report_id}.md"))
-        return {"status": "error", "error": f"scanner rejected report: {reason}"}
+        t_done = time.monotonic()
+        return {
+            "status": "error",
+            "error": f"scanner rejected report: {reason}",
+            "timings_ms": {
+                "agent": agent_ms,
+                "scan": int((t_done - t_scan_start) * 1000),
+                "total": int((t_done - t_received) * 1000),
+            },
+        }
 
     # Wrap the delivered file so any downstream reader — the host Claude
     # session, another agent, a human — sees explicit untrusted markers.
@@ -273,7 +335,16 @@ def research(prompt: str) -> dict:
     )
     report_path.write_text(wrapped, encoding="utf-8")
 
-    return {"status": "done", "report_path": str(report_path)}
+    t_done = time.monotonic()
+    return {
+        "status": "done",
+        "report_path": str(report_path),
+        "timings_ms": {
+            "agent": agent_ms,
+            "scan": int((t_done - t_scan_start) * 1000),
+            "total": int((t_done - t_received) * 1000),
+        },
+    }
 
 
 if __name__ == "__main__":

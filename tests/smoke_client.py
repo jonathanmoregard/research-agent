@@ -51,16 +51,17 @@ async def main() -> int:
                 return 1
 
             prompt = (
-                "Search the web for the current year Python 3 major release "
-                "number. Return a one-line finding with one citation. Keep "
-                "the report under 20 lines."
+                "One-line fact: the latest Python 3 minor version. One "
+                "citation. Keep report under 10 lines."
             )
-            print(f"\n== call research(prompt={prompt[:60]}...) ==")
-            result = await session.call_tool("research", {"prompt": prompt})
+            print(f"\n== call research(prompt=..., depth='fast') ==")
+            result = await session.call_tool(
+                "research", {"prompt": prompt, "depth": "fast"}
+            )
             print(f"  isError: {result.isError}")
             for item in result.content:
                 if hasattr(item, "text"):
-                    print(f"  content: {item.text[:600]}")
+                    print(f"  content: {item.text[:800]}")
                 else:
                     print(f"  content: {item!r}")
 

@@ -18,6 +18,30 @@ set -euo pipefail
 
 REPORT_UUID="${1:?uuid required}"
 PROMPT_FILE="${2:?prompt file required}"
+DEPTH="${RESEARCH_DEPTH:-normal}"
+
+# Per-depth tool allowlist. The prompt tells the agent *how* to use these;
+# we restrict *which* are callable at all.
+EXA_TOOLS="mcp__exa__web_search_exa,mcp__exa__web_fetch_exa"
+TAVILY_SEARCH="mcp__tavily-remote-mcp__tavily_search,mcp__tavily-remote-mcp__tavily_extract"
+TAVILY_DEEP="mcp__tavily-remote-mcp__tavily_research,mcp__tavily-remote-mcp__tavily_crawl"
+
+case "${DEPTH}" in
+  fast)
+    # Snippet-only search, no fetch.
+    ALLOWED_TOOLS="mcp__exa__web_search_exa,mcp__tavily-remote-mcp__tavily_search,Write"
+    ;;
+  normal)
+    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},Write"
+    ;;
+  deep)
+    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${TAVILY_DEEP},Write"
+    ;;
+  *)
+    echo "run-agent: invalid RESEARCH_DEPTH=${DEPTH}" >&2
+    exit 2
+    ;;
+esac
 
 AGENT_DIR="/workspace/agent"
 OUT_DIR="${RESEARCH_REPORTS_DIR:-/out}"
@@ -65,4 +89,4 @@ exec bwrap \
   -- \
   claude -p "${PROMPT_CONTENT}" \
     --add-dir /scratch \
-    --allowed-tools "mcp__exa__web_search_exa,mcp__exa__web_fetch_exa,mcp__tavily-remote-mcp__tavily_search,mcp__tavily-remote-mcp__tavily_extract,Write"
+    --allowed-tools "${ALLOWED_TOOLS}"
