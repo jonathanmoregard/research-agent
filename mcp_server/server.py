@@ -79,16 +79,18 @@ def _run_agent(prompt: str, report_id: str) -> tuple[int, str]:
     container_prompt_file = f"/tmp/research-prompt-{report_id}.txt"
 
     try:
-        subprocess.run(
+        cp = subprocess.run(
             [
                 "docker",
                 "cp",
                 host_prompt_file,
                 f"{CONTAINER}:{container_prompt_file}",
             ],
-            check=True,
             capture_output=True,
+            text=True,
         )
+        if cp.returncode != 0:
+            return cp.returncode, f"docker cp failed: {cp.stderr.strip()}"
         result = subprocess.run(
             [
                 "docker",
@@ -148,12 +150,15 @@ def research(prompt: str) -> dict:
     except FileNotFoundError as e:
         report_path.unlink(missing_ok=True)
         return {"status": "error", "error": f"docker not available: {e}"}
+    except Exception as e:
+        report_path.unlink(missing_ok=True)
+        return {"status": "error", "error": f"agent invocation failed: {e}"}
 
-    if report_path.stat().st_size == 0:
+    if code != 0 or report_path.stat().st_size == 0:
         report_path.unlink(missing_ok=True)
         return {
             "status": "error",
-            "error": f"agent produced no report (exit={code})\n{output[-500:]}",
+            "error": f"agent failed (exit={code}): {output[-500:]}",
         }
 
     ok, reason = _scan(report_path)
