@@ -1,0 +1,24 @@
+{
+  "name": "research-agent",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "mounts": [
+    "source=${localWorkspaceFolder}/reports,target=/out,type=bind,consistency=cached"
+  ],
+  "containerEnv": {
+    "RESEARCH_SCRATCH_DIR": "/scratch",
+    "RESEARCH_REPORTS_DIR": "/out",
+    "EXA_API_KEY": "${localEnv:EXA_API_KEY}",
+    "TAVILY_API_KEY": "${localEnv:TAVILY_API_KEY}"
+  },
+  "runArgs": [
+    "--cap-drop=ALL",
+    "--security-opt=no-new-privileges",
+    "--read-only",
+    "--tmpfs=/tmp",
+    "--tmpfs=/scratch"
+  ],
+  "remoteUser": "vscode",
+  "postCreateCommand": "pip install -r mcp_server/requirements.txt"
+}

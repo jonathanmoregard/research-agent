@@ -1,0 +1,26 @@
+# Reports are runtime output, not source
+reports/*
+!reports/.gitkeep
+
+# Scratch (pre-scan) output
+scratch/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
