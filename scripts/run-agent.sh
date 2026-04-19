@@ -93,9 +93,6 @@ exec bwrap \
   --chdir "${AGENT_DIR}" \
   --setenv HOME "/home/vscode" \
   --setenv PATH "/home/vscode/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-  --setenv CLAUDE_CODE_OAUTH_TOKEN "${CLAUDE_CODE_OAUTH_TOKEN:-}" \
-  --setenv EXA_API_KEY "${EXA_API_KEY:-}" \
-  --setenv TAVILY_API_KEY "${TAVILY_API_KEY:-}" \
   --setenv RESEARCH_SCRATCH_PATH "${SCRATCH_FILE}" \
   -- \
   claude -p "${PROMPT_CONTENT}" \
