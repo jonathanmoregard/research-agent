@@ -24,7 +24,16 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "role_swap",
         re.compile(
-            r"\b(you\s+are\s+now|from\s+now\s+on(?:\s+you)?|pretend\s+to\s+be|act\s+as(?:\s+a)?|become\s+a)\b",
+            # Match only second-person commands that flip the reader's role.
+            # Avoid catching prose like "attackers can become a malicious actor".
+            r"\b(?:"
+            r"you\s+are\s+(?:now|a|the)\s+[A-Za-z]"
+            r"|you\s+(?:will|must|should)\s+(?:pretend|act|become|roleplay|simulate)"
+            r"|you\s+become\s+(?:a|the)\b"
+            r"|pretend\s+(?:to\s+be|you(?:'re|\s+are))\s+"
+            r"|roleplay\s+as\b"
+            r"|from\s+now\s+on[,\s]"
+            r")",
             re.IGNORECASE,
         ),
     ),

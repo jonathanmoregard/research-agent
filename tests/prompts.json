@@ -1,0 +1,22 @@
+[
+  {
+    "topic": "sota_prompt_injection_detection",
+    "prompt": "State of the art for detecting prompt injection attacks in LLM agent outputs, as of 2025-2026. Cover: 1) Classifier-based scanners (Meta's Prompt-Guard, llm-guard by protectai, Rebuff, Lakera Guard, Azure Prompt Shields, PromptGuard by Anthropic). Compare precision/recall and failure modes. 2) Known evasion techniques. 3) Deployment patterns and latency trade-offs. 4) Which are open source. Prefer: peer-reviewed papers (USENIX, IEEE S&P, NDSS, ACL), arXiv papers with institutional authors, official docs from Meta/Anthropic/Microsoft/OWASP/NIST/MITRE, security research labs (Trail of Bits, NCC Group, HiddenLayer). SKIP low-quality blogs, SEO content, vendor marketing without technical detail. 5-10 sources minimum."
+  },
+  {
+    "topic": "honeypot_canary_defenses",
+    "prompt": "Honeypot and canary-token defenses for LLM agents. Specifically: injecting 'tempting' actions (fake secrets, fake exfiltration endpoints, decoy commands) into agent contexts to detect compromised behavior. Cover 2024-2026 academic and industry research. Include: 1) Canary-token mechanisms for prompt-injection detection. 2) Dual-use agent traps (tools that look real but log-only). 3) Behavioral anomaly detection for tool-call sequences. 4) Case studies where these caught real attacks. Prefer: USENIX, IEEE S&P, NDSS, arXiv institutional papers, Google/Anthropic/OpenAI safety research, Trail of Bits, Microsoft Security Response Center. SKIP personal blogs and vendor marketing. 5-10 sources minimum."
+  },
+  {
+    "topic": "indirect_injection_surveys",
+    "prompt": "Academic surveys and systematization-of-knowledge papers on indirect prompt injection attacks and mitigations against LLM agents, 2023-2026. Include: 1) The Greshake et al. 'Not what you've signed up for' paper and follow-ups. 2) SoK papers on LLM agent security. 3) Taxonomies of injection attack vectors. 4) Empirical evaluations of existing defenses. 5) OWASP Top 10 for LLM Applications. Prefer arXiv with institutional affiliations, USENIX, IEEE S&P, NDSS, ACL, CCS, OWASP project documentation. SKIP personal blogs, vendor marketing. 5-10 sources minimum, citations with DOI or arXiv ID where possible."
+  },
+  {
+    "topic": "output_side_filter_architectures",
+    "prompt": "Production architectures for output-side safety filtering of LLM agent responses, as of 2025-2026. Specifically the pattern where an agent produces content, and a SEPARATE filter judges it before delivery to a downstream consumer. Cover: 1) Multi-layer filter stacks (regex + classifier + judge LLM). 2) Information flow control approaches (CaMeL by Microsoft, IFC-LLM research). 3) Structured-output validation. 4) Latency / cost trade-offs. 5) False positive rates observed. 6) Open-source implementations (langchain guardrails, NeMo Guardrails, Guardrails AI). Prefer: Microsoft Research, Google Research, Meta AI, Anthropic, academic venues (USENIX, IEEE S&P, NDSS, MLSys, NeurIPS). SKIP vendor marketing, SEO blogs. 5-10 sources minimum."
+  },
+  {
+    "topic": "data_exfiltration_detection_llm",
+    "prompt": "Detection of data exfiltration attempts in LLM agent outputs (e.g. the agent smuggling secrets, session tokens, or internal URLs into content it generates for a downstream reader). Cover 2024-2026 research. Include: 1) Secret-shape scanners (gitleaks, trufflehog patterns applied to LLM output). 2) Homoglyph / steganography detection in agent text. 3) URL allowlists at the output boundary. 4) Covert-channel analyses (whitespace, zero-width chars). 5) Academic results on detection rates. Prefer: academic conferences (USENIX Security, IEEE S&P, NDSS, CCS), Google/Meta/Microsoft research, Trail of Bits, GitHub Security Lab, institutional arXiv papers. SKIP personal blogs, SEO listicles. 5-10 sources minimum."
+  }
+]
