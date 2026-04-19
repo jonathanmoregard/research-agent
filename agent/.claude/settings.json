@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "mcp__(exa|tavily-remote-mcp)__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /workspace/agent/wrap-untrusted.py"
+          }
+        ]
+      }
+    ]
+  }
+}

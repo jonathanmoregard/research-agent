@@ -50,15 +50,17 @@ async def main() -> int:
                 print(f"FAIL: tool {expected!r} not found")
                 return 1
 
-            print("\n== call research(prompt='...') ==")
-            result = await session.call_tool(
-                "research",
-                {"prompt": "Smoke test: return anything. Container may be absent."},
+            prompt = (
+                "Search the web for the current year Python 3 major release "
+                "number. Return a one-line finding with one citation. Keep "
+                "the report under 20 lines."
             )
+            print(f"\n== call research(prompt={prompt[:60]}...) ==")
+            result = await session.call_tool("research", {"prompt": prompt})
             print(f"  isError: {result.isError}")
             for item in result.content:
                 if hasattr(item, "text"):
-                    print(f"  content: {item.text[:400]}")
+                    print(f"  content: {item.text[:600]}")
                 else:
                     print(f"  content: {item!r}")
 
