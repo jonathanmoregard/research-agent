@@ -27,29 +27,24 @@ TAVILY_SEARCH="mcp__tavily-remote-mcp__tavily_search,mcp__tavily-remote-mcp__tav
 TAVILY_DEEP="mcp__tavily-remote-mcp__tavily_research,mcp__tavily-remote-mcp__tavily_crawl"
 
 case "${DEPTH}" in
-  fast)
-    # Snippet-only search, no fetch. Use haiku — cheaper and faster,
-    # plenty for a one-shot snippet summary.
-    ALLOWED_TOOLS="mcp__exa__web_search_exa,mcp__tavily-remote-mcp__tavily_search,Write"
-    MODEL="claude-haiku-4-5-20251001"
-    ;;
   normal)
     ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},Write"
-    MODEL=""  # default (sonnet)
+    MODEL="claude-opus-4-7"
     ;;
   deep)
     ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${TAVILY_DEEP},Write"
-    MODEL=""  # default (sonnet); upgrade to opus via env if desired
+    MODEL="claude-opus-4-7"
     ;;
   *)
+    # fast is handled server-side (direct Exa call, no agent);
+    # anything else here is an error.
     echo "run-agent: invalid RESEARCH_DEPTH=${DEPTH}" >&2
     exit 2
     ;;
 esac
 
-# Optional per-depth model override via env, e.g. RESEARCH_MODEL_DEEP=opus.
+# Optional per-depth model override via env.
 case "${DEPTH}" in
-  fast)   MODEL="${RESEARCH_MODEL_FAST:-$MODEL}" ;;
   normal) MODEL="${RESEARCH_MODEL_NORMAL:-$MODEL}" ;;
   deep)   MODEL="${RESEARCH_MODEL_DEEP:-$MODEL}" ;;
 esac

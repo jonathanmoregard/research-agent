@@ -23,6 +23,7 @@ state isolation is enforced by bubblewrap, not by container restart.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -116,6 +117,76 @@ CONTAINER_WORKSPACE = os.environ.get("RESEARCH_CONTAINER_WORKSPACE", "/workspace
 # Per-depth guidance the agent receives. Tools themselves are gated via
 # --allowed-tools in run-agent.sh; the prompt tells the agent how aggressively
 # to use them.
+EXA_API_URL = "https://api.exa.ai/search"
+
+
+def _direct_exa(prompt: str) -> tuple[bool, str]:
+    """Bypass the agent: call Exa directly from the host, format as markdown.
+
+    Returns (ok, text). On failure, ok=False and text is an error message.
+    No agent, no container — fastest path, least synthesis.
+    """
+    import urllib.request
+    import urllib.error
+
+    secrets = _secrets()
+    key = secrets.get("exa-api-key")
+    if not key:
+        return False, "direct: exa-api-key not in keyring"
+
+    payload = json.dumps(
+        {
+            "query": prompt,
+            "type": "auto",
+            "numResults": 5,
+            "contents": {"highlights": True},
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        EXA_API_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "x-api-key": key,
+            "User-Agent": "research-agent/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return False, f"direct: exa http {e.code}: {e.read()[:200]!r}"
+    except Exception as e:
+        return False, f"direct: exa call failed: {e}"
+
+    results = body.get("results") or []
+    lines = [
+        f"# Direct Exa Search",
+        "",
+        f"*Query: {prompt}*",
+        f"*Results: {len(results)} | Mode: direct (no agent synthesis)*",
+        "",
+        "## Findings",
+    ]
+    for r in results:
+        title = r.get("title") or "(untitled)"
+        url = r.get("url") or ""
+        hl = r.get("highlights") or []
+        snippet = (hl[0] if hl else r.get("text", ""))[:280]
+        lines.append(f"- **[{title}]({url})** — {snippet}")
+    lines.append("")
+    lines.append("## Sources")
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. [{r.get('title', '(untitled)')}]({r.get('url', '')})")
+    lines.append("")
+    lines.append("## Suspicious content")
+    lines.append("(not checked in direct mode — agent synthesis skipped)")
+    lines.append("")
+    return True, "\n".join(lines)
+
+
 DEPTH_GUIDANCE: dict[Depth, str] = {
     "fast": (
         "Research depth: FAST. Call `mcp__exa__web_search_exa` once with "
@@ -282,33 +353,44 @@ def research(prompt: str, depth: str = "normal") -> dict:
     t_received = time.monotonic()
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     report_id = uuid.uuid4().hex
-    # Pre-create the destination file so bwrap can bind it into the jail.
     report_path = REPORTS_DIR / f"{report_id}.md"
-    report_path.touch()
 
-    try:
-        code, output = _run_agent(prompt, report_id, depth)  # type: ignore[arg-type]
-    except subprocess.TimeoutExpired:
-        report_path.unlink(missing_ok=True)
-        return {"status": "error", "error": f"agent timeout after {AGENT_TIMEOUT}s"}
-    except FileNotFoundError as e:
-        report_path.unlink(missing_ok=True)
-        return {"status": "error", "error": f"docker not available: {e}"}
-    except Exception as e:
-        report_path.unlink(missing_ok=True)
-        return {"status": "error", "error": f"agent invocation failed: {e}"}
-
-    t_scan_start = time.monotonic()
-    agent_ms = int((t_scan_start - t_received) * 1000)
-
-    if code != 0 or report_path.stat().st_size == 0:
-        report_path.unlink(missing_ok=True)
-        total_ms = int((time.monotonic() - t_received) * 1000)
-        return {
-            "status": "error",
-            "error": f"agent failed (exit={code}): {output[-500:]}",
-            "timings_ms": {"agent": agent_ms, "scan": 0, "total": total_ms},
-        }
+    if depth == "fast":
+        # Direct server-side Exa call. No container, no agent. Fastest path.
+        ok, body = _direct_exa(prompt)
+        t_scan_start = time.monotonic()
+        agent_ms = int((t_scan_start - t_received) * 1000)
+        if not ok:
+            return {
+                "status": "error",
+                "error": body,
+                "timings_ms": {"agent": agent_ms, "scan": 0, "total": agent_ms},
+            }
+        report_path.write_text(body, encoding="utf-8")
+    else:
+        # normal / deep — agent in bwrap jail.
+        report_path.touch()
+        try:
+            _code, _output = _run_agent(prompt, report_id, depth)  # type: ignore[arg-type]
+        except subprocess.TimeoutExpired:
+            report_path.unlink(missing_ok=True)
+            return {"status": "error", "error": f"agent timeout after {AGENT_TIMEOUT}s"}
+        except FileNotFoundError as e:
+            report_path.unlink(missing_ok=True)
+            return {"status": "error", "error": f"docker not available: {e}"}
+        except Exception as e:
+            report_path.unlink(missing_ok=True)
+            return {"status": "error", "error": f"agent invocation failed: {e}"}
+        t_scan_start = time.monotonic()
+        agent_ms = int((t_scan_start - t_received) * 1000)
+        if _code != 0 or report_path.stat().st_size == 0:
+            report_path.unlink(missing_ok=True)
+            total_ms = int((time.monotonic() - t_received) * 1000)
+            return {
+                "status": "error",
+                "error": f"agent failed (exit={_code}): {_output[-500:]}",
+                "timings_ms": {"agent": agent_ms, "scan": 0, "total": total_ms},
+            }
 
     ok, reason = _scan(report_path)
     if not ok:
