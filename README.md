@@ -64,12 +64,18 @@ host Claude session receives result
 - [x] Repo skeleton
 - [x] MCP server (`docker exec` into hot container)
 - [x] Per-call bubblewrap wrapper script
-- [x] Regex scanner seed (passing tests)
+- [x] Regex scanner seed (passing tests) — includes token-shape leak patterns
 - [x] Devcontainer based on Trail of Bits pattern (Ubuntu 24.04 + bwrap + Claude Code)
-- [ ] End-to-end smoke test from host Claude session
-- [ ] LLM scanner layer (`llm-guard` or Haiku)
-- [ ] Network egress allowlist (exa.ai, tavily.com, api.anthropic.com only)
-- [ ] Host `~/.claude.json` cleanup — remove exa/tavily once container works
+- [x] End-to-end smoke test round-trips cleanly (`status:done` with agent-written report)
+- [x] Network egress allowlist (api.anthropic.com, exa.ai, tavily.com only; default DROP)
+- [x] Secrets in GNOME keyring — never on disk, never in container static env
+- [x] Host `~/.claude.json` cleanup — exa + tavily removed; `research-agent` MCP is the only web tool in the main session
+- [ ] LLM scanner layer (`llm-guard` or Haiku) on top of the regex seed
+- [ ] External egress proxy container (route outbound through squid/envoy so
+      the research-agent itself doesn't hold `NET_ADMIN`)
+- [ ] Tier-2 secret isolation (separate systemd user for the MCP server so
+      even a compromised main session running as `jonathan` can't read the
+      research-agent service account's keyring)
 
 ## Directory layout
 
