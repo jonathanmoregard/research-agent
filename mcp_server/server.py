@@ -118,22 +118,25 @@ CONTAINER_WORKSPACE = os.environ.get("RESEARCH_CONTAINER_WORKSPACE", "/workspace
 # to use them.
 DEPTH_GUIDANCE: dict[Depth, str] = {
     "fast": (
-        "Research depth: FAST. One search query, numResults=3, "
-        "livecrawl='never'. Do not fetch individual URLs. Produce a short "
-        "report (<15 lines) from snippets."
+        "Research depth: FAST. Call `mcp__exa__web_search_exa` once with "
+        "`type='auto'`, `numResults=3`, `livecrawl='never'`. Do not fetch "
+        "individual URLs. Produce a short report (<15 lines) from snippets."
     ),
     "normal": (
-        "Research depth: NORMAL. Use up to 3 search queries at numResults=8 "
-        "with livecrawl='fallback'. Fetch the top 2 most relevant URLs for "
+        "Research depth: NORMAL. Up to 3 `mcp__exa__web_search_exa` calls "
+        "with `type='auto'`, `numResults=8`, `livecrawl='fallback'`. Fetch "
+        "the top 2 most relevant URLs via `mcp__exa__web_fetch_exa` for "
         "fuller context. Cross-reference."
     ),
     "deep": (
-        "Research depth: DEEP. Use up to 5 search queries at numResults=15 "
-        "with livecrawl='always' for freshness. Fetch the top 5 URLs. "
-        "If available, use `mcp__tavily-remote-mcp__tavily_research` to "
-        "run an end-to-end deep research synthesis over a specific "
-        "sub-question. Aim for broad source coverage and explicit "
-        "cross-referencing."
+        "Research depth: DEEP. Call `mcp__exa__web_search_exa` with "
+        "`type='deep'` (Exa's built-in deep-research mode), "
+        "`numResults=15`, `livecrawl='always'` for freshness. Fan out "
+        "to 2-3 sub-questions. Fetch the top 5 URLs via "
+        "`mcp__exa__web_fetch_exa`. If available, also use "
+        "`mcp__tavily-remote-mcp__tavily_research` to run a cross-provider "
+        "synthesis over one sub-question. Aim for broad coverage and "
+        "explicit cross-referencing."
     ),
 }
 
