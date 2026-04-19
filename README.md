@@ -1,16 +1,16 @@
 # research-agent
 
-Isolated web-research subsystem for Claude Code. Main session delegates via a single MCP tool; all web access happens inside a dev container. Reports are scanned before delivery.
+Isolated web-research subsystem for Claude Code. The host session has no exa/tavily access; it calls a single MCP tool, the call is forwarded into a long-running dev container, the container spawns a fresh bubblewrap jail per call, and the resulting report is scanned before the host can read it.
 
 ## Interface
 
-MCP tool exposed to the host Claude session:
+One MCP tool, exposed to the host Claude session:
 
 ```
 research(prompt: str) -> { status: "done" | "error", report_path: str, error?: str }
 ```
 
-One call, one report. Main session waits for the tool to return, then tells the user where to find the file.
+The main session writes nothing about web access itself — it just calls this and reports the path back to the user.
 
 ## Architecture
 
@@ -19,47 +19,69 @@ host Claude session
         |
         | MCP call: research(prompt)
         v
-mcp_server/server.py              (process on host)
+mcp_server/server.py                 (host process)
         |
-        | spawn / IPC
+        | docker exec
         v
-agent (Claude Code inside dev container)
+research-agent container             (long-running, hot)
         |
-        | uses exa + tavily MCPs (container-only)
-        | writes report to /scratch/<uuid>.md
+        | scripts/run-agent.sh
         v
-scanner/regex.py                  (runs on container output)
+bubblewrap jail                      (ephemeral, per call)
+   - tmpfs $HOME
+   - tmpfs /tmp
+   - read-only system, agent dir
+   - writable bind: /scratch/<uuid>.md only
         |
-        | pass  -> mv to /reports/<uuid>.md, return path
-        | fail  -> delete scratch, return error
+        | claude -p (tools: exa, tavily, Write)
+        v
+scanner/regex.py                     (host-side, after jail exits)
+        |
+        | pass  -> reports/<uuid>.md, return path
+        | fail  -> reports/_quarantine/<uuid>.md, return error
         v
 host Claude session receives result
 ```
 
+### Per-call isolation
+
+- Container is **hot** (no startup cost).
+- Each call runs inside a **fresh bubblewrap jail** with tmpfs `$HOME` and tmpfs `/tmp`. No config, history, cache, or scratch persists between calls.
+- Writable destination is **one pre-created file** in `/out/<uuid>.md` (bind mount of host `reports/`). The agent cannot write anywhere else.
+
 ### Trust boundaries
-- **Host Claude**: no exa/tavily keys, no web MCPs, cannot see scratch dir.
-- **Container Claude**: exa/tavily configured, writes only to `/scratch`.
-- **Scanner**: regex-seed now; LLM layer planned.
-- **Reports dir**: host-readable *only after scan passes*.
+
+| Layer | Secrets | Web | Writable paths |
+|-------|---------|-----|----------------|
+| Host Claude (main) | none | **none** | repo, user files |
+| MCP server (host) | reads prompt, no keys | none | `reports/` only |
+| Container (long-running) | exa/tavily keys in env | yes, via MCPs only | container FS |
+| Per-call bwrap jail | inherits env | yes | `/scratch/<uuid>.md` only |
+| Scanner | none | none | `reports/_quarantine/` |
 
 ## Status
-- [x] Repo skeleton
-- [x] MCP server stub (subprocess spawn of container agent)
-- [x] Regex scanner seed
-- [ ] Dev container based on Trail of Bits image
-- [ ] Long-running container worker (IPC instead of spawn-per-call)
-- [ ] LLM scanner layer (`llm-guard` or Haiku-based)
-- [ ] Network egress allowlist (exa.ai, tavily.com only)
-- [ ] Host-side hook: remove exa/tavily from main `~/.claude.json`
 
-## Roadmap
-See [docs/roadmap.md](docs/roadmap.md) (planned).
+- [x] Repo skeleton
+- [x] MCP server (`docker exec` into hot container)
+- [x] Per-call bubblewrap wrapper script
+- [x] Regex scanner seed (passing tests)
+- [x] Devcontainer based on Trail of Bits pattern (Ubuntu 24.04 + bwrap + Claude Code)
+- [ ] End-to-end smoke test from host Claude session
+- [ ] LLM scanner layer (`llm-guard` or Haiku)
+- [ ] Network egress allowlist (exa.ai, tavily.com, api.anthropic.com only)
+- [ ] Host `~/.claude.json` cleanup — remove exa/tavily once container works
 
 ## Directory layout
+
 ```
-mcp_server/    # host-side MCP server
-agent/         # container-side Claude config + skills
-scanner/       # regex + future LLM scanners
-reports/       # post-scan output (gitignored)
-.devcontainer/ # container build + runtime config
+mcp_server/     # host-side MCP server
+agent/          # container-side CLAUDE.md + .mcp.json (exa, tavily)
+scanner/        # regex + future LLM scanners
+scripts/        # run-agent.sh — bwrap invocation per call
+reports/        # post-scan output (gitignored)
+.devcontainer/  # Ubuntu 24.04 + bubblewrap + Claude Code
 ```
+
+## Credits
+
+Devcontainer pattern inspired by [trailofbits/claude-code-devcontainer](https://github.com/trailofbits/claude-code-devcontainer) — same base image, same bubblewrap approach, adapted for a single-tool MCP research server.

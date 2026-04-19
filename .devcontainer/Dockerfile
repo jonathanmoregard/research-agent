@@ -1,25 +1,33 @@
-# Base: Trail of Bits dev container.
+# research-agent container.
 #
-# TODO: pin the exact Trail of Bits image tag. Replace the FROM line below
-# with the canonical reference once confirmed. Candidates:
-#   - ghcr.io/trailofbits/devcontainers/base
-#   - ghcr.io/trailofbits/algo-vm (security-hardened)
-# For now we fall back to the Microsoft Python devcontainer image, which is
-# the same upstream base many ToB containers extend.
-FROM mcr.microsoft.com/devcontainers/python:3.12
+# Pattern borrowed from trailofbits/claude-code-devcontainer:
+#   https://github.com/trailofbits/claude-code-devcontainer
+# Same Ubuntu 24.04 base, same bubblewrap-based per-call sandbox. We keep
+# the image minimal — only what the research agent needs.
+FROM mcr.microsoft.com/devcontainers/base:ubuntu24.04
 
-# Claude Code CLI
-# Official install script; version pinned via CLAUDE_CODE_VERSION env if needed.
-RUN curl -fsSL https://claude.ai/install.sh | bash -s -- --yes \
-    && claude --version
+ARG DEBIAN_FRONTEND=noninteractive
 
-# Non-root user 'vscode' already exists in the base image.
+# Base tools + bubblewrap (bwrap) — used to spin a fresh, ephemeral jail for
+# every research call so no state, cache, or scratch leaks between runs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bubblewrap \
+      ca-certificates \
+      curl \
+      jq \
+      tini \
+      python3 \
+      python3-pip \
+      python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
 USER vscode
 WORKDIR /workspace
+ENV PATH="/home/vscode/.local/bin:$PATH"
 
-# Minimal Python deps; the rest come from postCreateCommand so the image
-# rebuild isn't required when server deps change.
-RUN pip install --user --no-cache-dir mcp>=1.0.0
+# Claude Code (native installer).
+RUN curl -fsSL https://claude.ai/install.sh | bash
 
-# Scratch dir is tmpfs (see devcontainer.json runArgs). /out is the bind
-# mount from the host reports/ directory.
+# Host mounts this repo at /workspace. Reports land in /out (bind mount
+# from host reports/). Each research call uses a fresh tmpfs scratch dir
+# via bubblewrap — see scripts/run-agent.sh.
