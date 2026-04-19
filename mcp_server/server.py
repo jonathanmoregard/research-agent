@@ -190,27 +190,46 @@ def _run_agent(prompt: str, report_id: str, depth: Depth) -> tuple[int, str]:
         if cp.returncode != 0:
             return cp.returncode, f"docker cp failed: {cp.stderr.strip()}"
         secrets = _secrets()
-        exec_cmd = ["docker", "exec"]
-        # Inject secrets per-call via -e so they don't live in the container's
-        # static env (visible in `docker inspect`). They do appear briefly in
-        # the docker CLI's argv on the host, but not in any filesystem state.
-        if "claude-token" in secrets:
-            exec_cmd += ["-e", f"CLAUDE_CODE_OAUTH_TOKEN={secrets['claude-token']}"]
-        if "exa-api-key" in secrets:
-            exec_cmd += ["-e", f"EXA_API_KEY={secrets['exa-api-key']}"]
-        if "tavily-api-key" in secrets:
-            exec_cmd += ["-e", f"TAVILY_API_KEY={secrets['tavily-api-key']}"]
-        # Pass depth to the runner so it can pick the right --allowed-tools.
-        exec_cmd += ["-e", f"RESEARCH_DEPTH={depth}"]
-        exec_cmd += [
+        # Secrets via stdin (not `docker exec -e`) so they never appear in the
+        # host's process argv, which any `ps` reader can see. The container
+        # reads exactly three null-terminated values from stdin and exports
+        # them into the environment before handing off to run-agent.sh.
+        stdin_payload = "".join(
+            s + "\0"
+            for s in (
+                secrets.get("claude-token", ""),
+                secrets.get("exa-api-key", ""),
+                secrets.get("tavily-api-key", ""),
+            )
+        )
+        exec_cmd = [
+            "docker",
+            "exec",
+            "-i",
+            # RESEARCH_DEPTH is not a secret, safe via -e.
+            "-e",
+            f"RESEARCH_DEPTH={depth}",
             CONTAINER,
             "bash",
-            f"{CONTAINER_WORKSPACE}/scripts/run-agent.sh",
+            "-c",
+            # Read three null-terminated fields, export, then run the agent.
+            # Using `read -d ''` gives us null-terminator parsing so newlines
+            # inside a token can't split it.
+            (
+                "IFS= read -r -d '' CLAUDE_CODE_OAUTH_TOKEN; "
+                "IFS= read -r -d '' EXA_API_KEY; "
+                "IFS= read -r -d '' TAVILY_API_KEY; "
+                "export CLAUDE_CODE_OAUTH_TOKEN EXA_API_KEY TAVILY_API_KEY; "
+                f'exec bash "{CONTAINER_WORKSPACE}/scripts/run-agent.sh" '
+                '"$1" "$2"'
+            ),
+            "bash",  # $0 for the inline script
             report_id,
             container_prompt_file,
         ]
         result = subprocess.run(
             exec_cmd,
+            input=stdin_payload,
             capture_output=True,
             text=True,
             timeout=AGENT_TIMEOUT,
