@@ -90,12 +90,18 @@ def scan(path: Path, use_honeypot: bool | None = None) -> Verdict:
             sanitized_text=san.text,
         )
 
-    # L3 honeypot (opt-in).
+    # L3 honeypot. Default ON. Opt-out via RESEARCH_HONEYPOT=0 for local
+    # dev or when the anthropic API budget is tight. The honeypot module
+    # itself degrades to "skipped:<why>" when its SDK or API key is
+    # unreachable, so "always on" never hard-breaks a call.
     if use_honeypot is None:
-        use_honeypot = os.environ.get("RESEARCH_HONEYPOT", "") in ("1", "true", "yes")
+        use_honeypot = os.environ.get("RESEARCH_HONEYPOT", "1") not in ("0", "false", "no")
     if use_honeypot:
         hp = honeypot_check(san.text)
         layers["honeypot"] = hp.reason
+        # Attach per-scenario breakdown for audit.
+        for s in hp.per_scenario:
+            layers[f"honeypot.{s.scenario}"] = f"{s.verdict}:{s.signal}"
         if not hp.ok:
             return Verdict(
                 ok=False,
