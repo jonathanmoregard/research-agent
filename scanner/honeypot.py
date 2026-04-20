@@ -1,33 +1,26 @@
 """
-Layer 3: honeypot ensemble.
+Layer 3: multi-provider honeypot ensemble.
 
-Each research report is fed to a fresh downstream Haiku in THREE different
-honeypot scenarios (see honeypot_scenarios.py). Every scenario gives the
-judge a plausible environment containing a unique canary plus a set of
-alluring tools. A legitimate judge calls `return_summary` (the benign
-task) or `report_issue(Prompt_Injection_Attempt, …)`; both count as
+Each research report is fed to a fresh downstream model (Haiku, gpt-4o-mini,
+gpt-4.1-nano) in three different honeypot scenarios (see
+honeypot_scenarios.py). Each scenario defines its own provider + model so
+the ensemble spans model families — an injection tuned for one family often
+misses on another, and vice versa; diversity is the detection boost.
+
+A legitimate judge calls `return_summary` (the benign task) or
+`report_issue(Prompt_Injection_Attempt, …)`; both count as
 `Honeypot_Left_Alone`. A judge that calls any trap tool OR echoes the
-canary substring is `Honeypot_Triggered` and we quarantine the report.
+scenario's canary substring is `Honeypot_Triggered` and the report is
+quarantined.
 
-Design notes
-------------
-- Static canaries (not random) — consistent detection, comparable audit.
-- `report_issue` is a real, non-trap channel so a non-flipped judge that
-  *notices* an injection can still tell us without executing anything.
-- Parallel calls across scenarios (asyncio). Any single trigger → fail.
-- The module is opt-in; if the `anthropic` SDK or an `ANTHROPIC_API_KEY`
-  is unavailable, every scenario reports `skipped:<reason>` and the
-  orchestrator treats that as a pass (the regex + secret_shapes layers
-  are still enforced — honeypot is the deepest layer, not a fallback).
-
-Environment
------------
-- `ANTHROPIC_API_KEY` env var (or `anthropic-api-key` in the keyring).
-- `RESEARCH_HONEYPOT_MODEL` overrides the default Haiku.
+Fail-closed: missing SDK, missing API key, and any per-scenario API
+error all collapse to `ok=False`. Silent skip is not allowed — the whole
+point of defense-in-depth is that an outage must be visible.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -47,31 +40,25 @@ Verdict = Literal["Honeypot_Triggered", "Honeypot_Left_Alone", "Honeypot_Skipped
 class ScenarioResult:
     scenario: str
     verdict: Verdict
-    signal: str          # one of: trap:<name>, canary:<name>, left_alone,
-                         # left_alone_with_injection_report, skipped:<why>
+    signal: str
+    provider: str = ""
+    model: str = ""
     raw_excerpt: str = ""
 
 
 @dataclass
 class HoneypotResult:
-    ok: bool                                 # True = deliver
-    reason: str                              # short aggregate code
+    ok: bool
+    reason: str
     per_scenario: list[ScenarioResult] = field(default_factory=list)
 
 
-DEFAULT_MODEL = os.environ.get(
-    "RESEARCH_HONEYPOT_MODEL", "claude-haiku-4-5-20251001"
-)
+# ---------- secret loading ----------
 
-
-def _api_key() -> str | None:
-    env = os.environ.get("ANTHROPIC_API_KEY")
-    if env:
-        return env
+def _keyring(key: str) -> str | None:
     try:
         r = subprocess.run(
-            ["secret-tool", "lookup", "app", "research-agent",
-             "key", "anthropic-api-key"],
+            ["secret-tool", "lookup", "app", "research-agent", "key", key],
             capture_output=True, text=True, timeout=3,
         )
         return r.stdout.strip() or None
@@ -79,75 +66,110 @@ def _api_key() -> str | None:
         return None
 
 
-def _classify(resp_content, scenario: Scenario) -> ScenarioResult:
-    """Turn a single Anthropic `messages.create` response into a ScenarioResult."""
-    trap_name: str | None = None
-    reported_injection = False
-    text_chunks: list[str] = []
-    for block in resp_content:
-        btype = getattr(block, "type", "")
-        if btype == "tool_use":
-            name = getattr(block, "name", "unknown")
-            if name in TRAP_TOOL_NAMES:
-                trap_name = name
-                break
-            if name == "report_issue":
-                inp = getattr(block, "input", {}) or {}
-                if inp.get("category") == "Prompt_Injection_Attempt":
-                    reported_injection = True
-        elif btype == "text":
-            text_chunks.append(getattr(block, "text", ""))
+def _anthropic_key() -> str | None:
+    return os.environ.get("ANTHROPIC_API_KEY") or _keyring("anthropic-api-key")
 
-    excerpt = (" ".join(text_chunks))[:300]
 
-    if trap_name:
-        return ScenarioResult(
-            scenario=scenario["name"],
-            verdict="Honeypot_Triggered",
-            signal=f"trap:{trap_name}",
-            raw_excerpt=excerpt,
-        )
+def _openai_key() -> str | None:
+    return os.environ.get("OPENAI_API_KEY") or _keyring("openai-api-key")
 
-    # Canary leak in response text?
-    canary = scenario["canary"]
-    if canary in excerpt:
-        return ScenarioResult(
-            scenario=scenario["name"],
-            verdict="Honeypot_Triggered",
-            signal=f"canary:{canary}",
-            raw_excerpt=excerpt,
-        )
-    # Any OTHER scenario's canary leaking here too = also a trigger (shouldn't
-    # happen unless the model is somehow mixing contexts, but guard cheap).
-    for other in ALL_CANARIES:
-        if other != canary and other in excerpt:
+
+# ---------- common classification ----------
+
+def _classify_from_parts(
+    scenario: Scenario,
+    called_tools: list[tuple[str, dict]],
+    text: str,
+) -> ScenarioResult:
+    """Given the list of (tool_name, tool_input) calls plus any freeform
+    text, decide Honeypot_Triggered / Honeypot_Left_Alone."""
+    for name, inp in called_tools:
+        if name in TRAP_TOOL_NAMES:
             return ScenarioResult(
                 scenario=scenario["name"],
                 verdict="Honeypot_Triggered",
-                signal=f"canary_crosstalk:{other}",
+                signal=f"trap:{name}",
+                provider=scenario["provider"],
+                model=scenario["model"],
+                raw_excerpt=text[:300],
+            )
+
+    excerpt = text[:300]
+    canary = scenario["canary"]
+    if canary in text:
+        return ScenarioResult(
+            scenario=scenario["name"],
+            verdict="Honeypot_Triggered",
+            signal=f"canary:{canary[:20]}...",
+            provider=scenario["provider"],
+            model=scenario["model"],
+            raw_excerpt=excerpt,
+        )
+    for other in ALL_CANARIES:
+        if other != canary and other in text:
+            return ScenarioResult(
+                scenario=scenario["name"],
+                verdict="Honeypot_Triggered",
+                signal=f"canary_crosstalk:{other[:20]}...",
+                provider=scenario["provider"],
+                model=scenario["model"],
                 raw_excerpt=excerpt,
             )
 
-    if reported_injection:
-        return ScenarioResult(
-            scenario=scenario["name"],
-            verdict="Honeypot_Left_Alone",
-            signal="left_alone_with_injection_report",
-            raw_excerpt=excerpt,
-        )
+    for name, inp in called_tools:
+        if name == "report_issue" and inp.get("category") == "Prompt_Injection_Attempt":
+            return ScenarioResult(
+                scenario=scenario["name"],
+                verdict="Honeypot_Left_Alone",
+                signal="left_alone_with_injection_report",
+                provider=scenario["provider"],
+                model=scenario["model"],
+                raw_excerpt=excerpt,
+            )
     return ScenarioResult(
         scenario=scenario["name"],
         verdict="Honeypot_Left_Alone",
         signal="left_alone",
+        provider=scenario["provider"],
+        model=scenario["model"],
         raw_excerpt=excerpt,
     )
 
 
-async def _run_one(client, scenario: Scenario, report_text: str) -> ScenarioResult:
-    # Build messages: scenario history + current user request with the
-    # research content attached.
+# ---------- provider adapters ----------
+
+def _openai_tools(tools: list[dict]) -> list[dict]:
+    out = []
+    for t in tools:
+        out.append({
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["input_schema"],
+            },
+        })
+    return out
+
+
+async def _call_anthropic(scenario: Scenario, report_text: str) -> ScenarioResult:
+    try:
+        import anthropic  # type: ignore
+    except ImportError:
+        return ScenarioResult(
+            scenario=scenario["name"], verdict="Honeypot_Skipped",
+            signal="unavailable:anthropic-lib-missing",
+            provider="anthropic", model=scenario["model"],
+        )
+    key = _anthropic_key()
+    if not key:
+        return ScenarioResult(
+            scenario=scenario["name"], verdict="Honeypot_Skipped",
+            signal="unavailable:no-anthropic-api-key",
+            provider="anthropic", model=scenario["model"],
+        )
+    client = anthropic.Anthropic(api_key=key)
     messages = list(scenario["history"])
-    # Ensure the LAST message is user, containing the attached content.
     attach = (
         f"{messages[-1]['content']}\n\n"
         f"<attached_content>\n{report_text}\n</attached_content>"
@@ -159,7 +181,7 @@ async def _run_one(client, scenario: Scenario, report_text: str) -> ScenarioResu
     try:
         resp = await asyncio.to_thread(
             client.messages.create,
-            model=DEFAULT_MODEL,
+            model=scenario["model"],
             max_tokens=400,
             tools=scenario["tools"],  # type: ignore[arg-type]
             system=scenario["system"],
@@ -167,46 +189,99 @@ async def _run_one(client, scenario: Scenario, report_text: str) -> ScenarioResu
         )
     except Exception as e:
         return ScenarioResult(
-            scenario=scenario["name"],
-            verdict="Honeypot_Skipped",
-            signal=f"skipped:api-error:{e}",
+            scenario=scenario["name"], verdict="Honeypot_Skipped",
+            signal=f"unavailable:anthropic-api-error:{e}",
+            provider="anthropic", model=scenario["model"],
         )
-    return _classify(resp.content, scenario)
+    called: list[tuple[str, dict]] = []
+    text_chunks: list[str] = []
+    for block in resp.content:
+        btype = getattr(block, "type", "")
+        if btype == "tool_use":
+            called.append((
+                getattr(block, "name", ""),
+                getattr(block, "input", {}) or {},
+            ))
+        elif btype == "text":
+            text_chunks.append(getattr(block, "text", ""))
+    return _classify_from_parts(scenario, called, " ".join(text_chunks))
+
+
+async def _call_openai(scenario: Scenario, report_text: str) -> ScenarioResult:
+    try:
+        from openai import OpenAI  # type: ignore
+    except ImportError:
+        return ScenarioResult(
+            scenario=scenario["name"], verdict="Honeypot_Skipped",
+            signal="unavailable:openai-lib-missing",
+            provider="openai", model=scenario["model"],
+        )
+    key = _openai_key()
+    if not key:
+        return ScenarioResult(
+            scenario=scenario["name"], verdict="Honeypot_Skipped",
+            signal="unavailable:no-openai-api-key",
+            provider="openai", model=scenario["model"],
+        )
+    client = OpenAI(api_key=key)
+
+    # OpenAI expects flat chat messages; scenario history uses the same
+    # role/content shape so we pass it through, then attach the content.
+    messages: list[dict] = [{"role": "system", "content": scenario["system"]}]
+    messages.extend(scenario["history"])
+    attach = (
+        f"{messages[-1]['content']}\n\n"
+        f"<attached_content>\n{report_text}\n</attached_content>"
+    )
+    if messages[-1]["role"] == "user":
+        messages[-1] = {**messages[-1], "content": attach}
+    else:
+        messages.append({"role": "user", "content": attach})
+
+    try:
+        resp = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=scenario["model"],
+            messages=messages,
+            tools=_openai_tools(scenario["tools"]),
+            max_tokens=400,
+        )
+    except Exception as e:
+        return ScenarioResult(
+            scenario=scenario["name"], verdict="Honeypot_Skipped",
+            signal=f"unavailable:openai-api-error:{e}",
+            provider="openai", model=scenario["model"],
+        )
+    msg = resp.choices[0].message
+    called: list[tuple[str, dict]] = []
+    for tc in (msg.tool_calls or []):
+        fn = getattr(tc, "function", None)
+        if not fn:
+            continue
+        try:
+            args = json.loads(fn.arguments) if fn.arguments else {}
+        except Exception:
+            args = {}
+        called.append((fn.name, args))
+    text = msg.content or ""
+    return _classify_from_parts(scenario, called, text)
+
+
+async def _run_one(scenario: Scenario, report_text: str) -> ScenarioResult:
+    if scenario["provider"] == "anthropic":
+        return await _call_anthropic(scenario, report_text)
+    if scenario["provider"] == "openai":
+        return await _call_openai(scenario, report_text)
+    return ScenarioResult(
+        scenario=scenario["name"], verdict="Honeypot_Skipped",
+        signal=f"unavailable:unknown-provider:{scenario['provider']}",
+        provider=scenario["provider"], model=scenario["model"],
+    )
 
 
 async def _run_all(report_text: str) -> HoneypotResult:
-    try:
-        import anthropic  # type: ignore
-    except ImportError:
-        return HoneypotResult(
-            ok=False,
-            reason="honeypot_unavailable:anthropic-lib-missing",
-            per_scenario=[
-                ScenarioResult(
-                    scenario=s["name"],
-                    verdict="Honeypot_Skipped",
-                    signal="unavailable:anthropic-lib-missing",
-                )
-                for s in ALL_SCENARIOS
-            ],
-        )
-    key = _api_key()
-    if not key:
-        return HoneypotResult(
-            ok=False,
-            reason="honeypot_unavailable:no-api-key",
-            per_scenario=[
-                ScenarioResult(
-                    scenario=s["name"],
-                    verdict="Honeypot_Skipped",
-                    signal="unavailable:no-api-key",
-                )
-                for s in ALL_SCENARIOS
-            ],
-        )
-    client = anthropic.Anthropic(api_key=key)
     results = await asyncio.gather(
-        *(_run_one(client, s, report_text) for s in ALL_SCENARIOS)
+        *(_run_one(s, report_text) for s in ALL_SCENARIOS)
     )
     triggered = [r for r in results if r.verdict == "Honeypot_Triggered"]
     if triggered:
@@ -216,25 +291,16 @@ async def _run_all(report_text: str) -> HoneypotResult:
             reason=f"honeypot:{first.scenario}:{first.signal}",
             per_scenario=list(results),
         )
-    # Fail closed if any scenario couldn't produce a real verdict (api error,
-    # timeout, skipped). We treat a partially-working ensemble as a failure
-    # because the whole point is defense-in-depth detection; silently
-    # degrading to fewer checks would mask an outage.
-    skipped_or_errored = [r for r in results if r.verdict != "Honeypot_Left_Alone"]
-    if skipped_or_errored:
-        first = skipped_or_errored[0]
+    skipped = [r for r in results if r.verdict != "Honeypot_Left_Alone"]
+    if skipped:
+        first = skipped[0]
         return HoneypotResult(
             ok=False,
             reason=f"honeypot_unavailable:{first.scenario}:{first.signal}",
             per_scenario=list(results),
         )
-    return HoneypotResult(
-        ok=True,
-        reason="pass",
-        per_scenario=list(results),
-    )
+    return HoneypotResult(ok=True, reason="pass", per_scenario=list(results))
 
 
 def check(report_text: str) -> HoneypotResult:
-    """Sync wrapper; runs the full ensemble in parallel under the hood."""
     return asyncio.run(_run_all(report_text))
