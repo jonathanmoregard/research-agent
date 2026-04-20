@@ -55,11 +55,29 @@ class HoneypotResult:
 
 # ---------- secret loading ----------
 
+def _keyring_env() -> dict[str, str]:
+    """Ensure secret-tool can reach the user's D-Bus session bus. MCP-server
+    subprocesses may not inherit DBUS_SESSION_BUS_ADDRESS; fall back to the
+    systemd per-user path."""
+    import pathlib
+    env = dict(os.environ)
+    if "DBUS_SESSION_BUS_ADDRESS" not in env:
+        bus = f"/run/user/{os.getuid()}/bus"
+        if pathlib.Path(bus).exists():
+            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+    if "XDG_RUNTIME_DIR" not in env:
+        xdg = f"/run/user/{os.getuid()}"
+        if pathlib.Path(xdg).is_dir():
+            env["XDG_RUNTIME_DIR"] = xdg
+    return env
+
+
 def _keyring(key: str) -> str | None:
     try:
         r = subprocess.run(
             ["secret-tool", "lookup", "app", "research-agent", "key", key],
             capture_output=True, text=True, timeout=3,
+            env=_keyring_env(),
         )
         return r.stdout.strip() or None
     except Exception:
@@ -303,4 +321,16 @@ async def _run_all(report_text: str) -> HoneypotResult:
 
 
 def check(report_text: str) -> HoneypotResult:
-    return asyncio.run(_run_all(report_text))
+    # The MCP server hosts its tool handlers inside a FastMCP event loop,
+    # so a plain asyncio.run() here raises "cannot be called from a running
+    # event loop". Run the async ensemble in a fresh worker thread that
+    # owns its own loop — keeps this function sync for all callers without
+    # leaking async into scanner.intercept.
+    import concurrent.futures
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_run_all(report_text))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(lambda: asyncio.run(_run_all(report_text))).result()
