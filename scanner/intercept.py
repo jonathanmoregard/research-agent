@@ -41,11 +41,12 @@ class Verdict:
         return d
 
 
-def scan(path: Path, use_honeypot: bool | None = None) -> Verdict:
+def scan(path: Path, use_honeypot: bool = True) -> Verdict:
     """Run all layers on the file at `path`. Returns a Verdict.
 
-    `use_honeypot`: None = use env RESEARCH_HONEYPOT (default off),
-                    True/False = override.
+    `use_honeypot` defaults to True and is kept only so tests can force it
+    off for unit runs that must not hit the Anthropic API. In production
+    call paths, callers should NOT pass this — the honeypot is always on.
     """
     raw = path.read_text(encoding="utf-8", errors="replace")
     layers: dict[str, str] = {}
@@ -90,16 +91,14 @@ def scan(path: Path, use_honeypot: bool | None = None) -> Verdict:
             sanitized_text=san.text,
         )
 
-    # L3 honeypot. Default ON. Opt-out via RESEARCH_HONEYPOT=0 for local
-    # dev or when the anthropic API budget is tight. The honeypot module
-    # itself degrades to "skipped:<why>" when its SDK or API key is
-    # unreachable, so "always on" never hard-breaks a call.
-    if use_honeypot is None:
-        use_honeypot = os.environ.get("RESEARCH_HONEYPOT", "1") not in ("0", "false", "no")
+    # L3 honeypot. Always runs. The module itself degrades to
+    # "skipped:<why>" when its SDK or API key is unreachable, so it can
+    # never hard-fail a call; it just doesn't add detection value in that
+    # degraded mode. The `use_honeypot=False` path is used by unit tests
+    # that must not hit the Anthropic API.
     if use_honeypot:
         hp = honeypot_check(san.text)
         layers["honeypot"] = hp.reason
-        # Attach per-scenario breakdown for audit.
         for s in hp.per_scenario:
             layers[f"honeypot.{s.scenario}"] = f"{s.verdict}:{s.signal}"
         if not hp.ok:
@@ -111,7 +110,7 @@ def scan(path: Path, use_honeypot: bool | None = None) -> Verdict:
                 sanitized_text=san.text,
             )
     else:
-        layers["honeypot"] = "disabled"
+        layers["honeypot"] = "disabled (test-only)"
 
     return Verdict(
         ok=True,
