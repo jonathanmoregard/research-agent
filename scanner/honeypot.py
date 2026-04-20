@@ -179,13 +179,13 @@ async def _run_all(report_text: str) -> HoneypotResult:
         import anthropic  # type: ignore
     except ImportError:
         return HoneypotResult(
-            ok=True,
-            reason="skipped:anthropic-lib-missing",
+            ok=False,
+            reason="honeypot_unavailable:anthropic-lib-missing",
             per_scenario=[
                 ScenarioResult(
                     scenario=s["name"],
                     verdict="Honeypot_Skipped",
-                    signal="skipped:anthropic-lib-missing",
+                    signal="unavailable:anthropic-lib-missing",
                 )
                 for s in ALL_SCENARIOS
             ],
@@ -193,13 +193,13 @@ async def _run_all(report_text: str) -> HoneypotResult:
     key = _api_key()
     if not key:
         return HoneypotResult(
-            ok=True,
-            reason="skipped:no-api-key",
+            ok=False,
+            reason="honeypot_unavailable:no-api-key",
             per_scenario=[
                 ScenarioResult(
                     scenario=s["name"],
                     verdict="Honeypot_Skipped",
-                    signal="skipped:no-api-key",
+                    signal="unavailable:no-api-key",
                 )
                 for s in ALL_SCENARIOS
             ],
@@ -214,6 +214,18 @@ async def _run_all(report_text: str) -> HoneypotResult:
         return HoneypotResult(
             ok=False,
             reason=f"honeypot:{first.scenario}:{first.signal}",
+            per_scenario=list(results),
+        )
+    # Fail closed if any scenario couldn't produce a real verdict (api error,
+    # timeout, skipped). We treat a partially-working ensemble as a failure
+    # because the whole point is defense-in-depth detection; silently
+    # degrading to fewer checks would mask an outage.
+    skipped_or_errored = [r for r in results if r.verdict != "Honeypot_Left_Alone"]
+    if skipped_or_errored:
+        first = skipped_or_errored[0]
+        return HoneypotResult(
+            ok=False,
+            reason=f"honeypot_unavailable:{first.scenario}:{first.signal}",
             per_scenario=list(results),
         )
     return HoneypotResult(
