@@ -23,6 +23,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
+# Python SDKs for Exa and Tavily. Shims in agent/shims/*_shim.py use these
+# directly — same REST path the provider playgrounds use — bypassing both
+# the hosted mcp.exa.ai/mcp.tavily.com endpoints and the Smithery-wrapped
+# stdio MCPs (which break when spawned by Claude Code's MCP client via a
+# currently-unexplained interaction with its spawn path in bwrap).
+# --break-system-packages because container image is throwaway.
+RUN pip3 install --no-cache-dir --break-system-packages \
+      exa-py \
+      tavily-python \
+      curl_cffi
+
 USER vscode
 WORKDIR /workspace
 ENV PATH="/home/vscode/.local/bin:$PATH"

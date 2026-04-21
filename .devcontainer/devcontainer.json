@@ -17,6 +17,5 @@
     "--security-opt=seccomp=unconfined",
     "--security-opt=apparmor=unconfined"
   ],
-  "remoteUser": "vscode",
-  "postCreateCommand": "pip install --user -r mcp_server/requirements.txt"
+  "remoteUser": "vscode"
 }

@@ -1,12 +1,18 @@
 {
   "mcpServers": {
     "exa": {
-      "type": "http",
-      "url": "https://mcp.exa.ai/mcp"
+      "command": "python3",
+      "args": ["/workspace/agent/shims/exa_shim.py"],
+      "env": {
+        "EXA_API_KEY": "${EXA_API_KEY}"
+      }
     },
     "tavily-remote-mcp": {
-      "type": "http",
-      "url": "https://mcp.tavily.com/mcp/"
+      "command": "python3",
+      "args": ["/workspace/agent/shims/tavily_shim.py"],
+      "env": {
+        "TAVILY_API_KEY": "${TAVILY_API_KEY}"
+      }
     }
   }
 }

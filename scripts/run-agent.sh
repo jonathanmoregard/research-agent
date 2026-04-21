@@ -69,8 +69,17 @@ chmod 666 "${FINAL_FILE}"
 # Prompt passed via a file to avoid shell-quoting issues with arbitrary content.
 PROMPT_CONTENT="$(cat "${PROMPT_FILE}")"
 
+# Claude Code does NOT expand ${VAR} in `.mcp.json` `url` / `headers` fields.
+# Render a resolved copy with env substitution and bind-mount it over the
+# read-only original inside the jail. Ephemeral per call; cleaned up on exit.
+RENDERED_MCP=$(mktemp --suffix=.mcp.json)
+chmod 644 "${RENDERED_MCP}"
+python3 -c 'import os,sys; sys.stdout.write(os.path.expandvars(sys.stdin.read()))' \
+  < "${AGENT_DIR}/.mcp.json" > "${RENDERED_MCP}"
+trap 'rm -f "${RENDERED_MCP}"' EXIT
+
 # Build the bwrap invocation. Each run = fresh ephemeral FS.
-exec bwrap \
+bwrap \
   --ro-bind /usr /usr \
   --ro-bind /etc /etc \
   --ro-bind /lib /lib \
@@ -83,6 +92,7 @@ exec bwrap \
   --tmpfs /home/vscode \
   --ro-bind /home/vscode/.local /home/vscode/.local \
   --ro-bind "${AGENT_DIR}" "${AGENT_DIR}" \
+  --ro-bind "${RENDERED_MCP}" "${AGENT_DIR}/.mcp.json" \
   --bind "${FINAL_FILE}" "${SCRATCH_FILE}" \
   --unshare-user \
   --unshare-pid \
@@ -94,6 +104,8 @@ exec bwrap \
   --setenv HOME "/home/vscode" \
   --setenv PATH "/home/vscode/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   --setenv RESEARCH_SCRATCH_PATH "${SCRATCH_FILE}" \
+  --setenv EXA_API_KEY "${EXA_API_KEY}" \
+  --setenv TAVILY_API_KEY "${TAVILY_API_KEY}" \
   -- \
   claude -p "${PROMPT_CONTENT}" \
     --add-dir /scratch \
