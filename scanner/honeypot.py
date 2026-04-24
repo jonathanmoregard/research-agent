@@ -206,9 +206,13 @@ async def _call_anthropic(scenario: Scenario, report_text: str) -> ScenarioResul
             messages=messages,
         )
     except Exception as e:
+        # Use only the exception *type* — some SDKs stringify exceptions
+        # with request/response fragments, which could echo attacker-shaped
+        # content back up into the signal string. The audit record lives in
+        # the quarantine zone today, but keep the signal flat by default.
         return ScenarioResult(
             scenario=scenario["name"], verdict="Honeypot_Skipped",
-            signal=f"unavailable:anthropic-api-error:{e}",
+            signal=f"unavailable:anthropic-api-error:{type(e).__name__}",
             provider="anthropic", model=scenario["model"],
         )
     called: list[tuple[str, dict]] = []
@@ -267,7 +271,7 @@ async def _call_openai(scenario: Scenario, report_text: str) -> ScenarioResult:
     except Exception as e:
         return ScenarioResult(
             scenario=scenario["name"], verdict="Honeypot_Skipped",
-            signal=f"unavailable:openai-api-error:{e}",
+            signal=f"unavailable:openai-api-error:{type(e).__name__}",
             provider="openai", model=scenario["model"],
         )
     msg = resp.choices[0].message

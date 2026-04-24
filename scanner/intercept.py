@@ -35,9 +35,19 @@ class Verdict:
     sanitized_text: str            # cleaned text the server should deliver
 
     def to_audit(self) -> dict:
+        """Return an audit record safe to persist to disk or forward to an
+        operator context. Never includes any report text — the whole point
+        of a quarantine is that the bytes stay out of any interactive
+        session. Callers needing the raw bytes must read the quarantined
+        file directly outside the session.
+        """
         d = asdict(self)
-        # Never dump the whole sanitized text into logs — truncate.
-        d["sanitized_text"] = d["sanitized_text"][:200] + "..."
+        d.pop("sanitized_text", None)
+        d["sanitized_len"] = len(self.sanitized_text)
+        if isinstance(d.get("sanitize_stats"), dict):
+            d["sanitize_stats"] = {
+                k: v for k, v in d["sanitize_stats"].items() if k != "text"
+            }
         return d
 
 
@@ -48,7 +58,20 @@ def scan(path: Path, use_honeypot: bool = True) -> Verdict:
     off for unit runs that must not hit the Anthropic API. In production
     call paths, callers should NOT pass this — the honeypot is always on.
     """
-    raw = path.read_text(encoding="utf-8", errors="replace")
+    return scan_text(
+        path.read_text(encoding="utf-8", errors="replace"),
+        use_honeypot=use_honeypot,
+    )
+
+
+def scan_text(raw: str, use_honeypot: bool = True) -> Verdict:
+    """Run all layers on pre-read `raw` text. Returns a Verdict.
+
+    Separate entry point so callers that need symlink/TOCTOU-safe reads can
+    load the content into memory themselves (e.g. `os.open(..., O_NOFOLLOW)`)
+    and scan the same bytes they've already snapshotted — no second disk
+    read that could race against a file swap.
+    """
     layers: dict[str, str] = {}
 
     # L0
