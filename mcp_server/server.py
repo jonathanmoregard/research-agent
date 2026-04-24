@@ -501,10 +501,17 @@ def research(prompt: str, depth: str = "normal") -> dict:
             whether deep-research synthesis tools are enabled.
 
     Returns:
-        On success: {"status": "done", "report_path": str,
+        On success: {"status": "done", "report_path": str, "report": str,
                      "timings_ms": {"agent": int, "scan": int, "total": int}}.
-        On failure: {"status": "error", "error": str,
+            `report` is the wrapped sanitized report — already framed in
+            <untrusted_external_content>/<system-reminder> tags so the
+            caller can inline it directly. `report_path` points at the
+            same content on disk for retry / re-reading.
+        On failure: {"status": "error", "error": str, "report_id"?: str,
                      "timings_ms": {...}}.
+            When `error` is "scanner rejected report (quarantined)",
+            `report_id` is included — pass it back to `retry_research` to
+            re-scan the quarantined report.
     """
     if depth not in VALID_DEPTHS:
         return {
@@ -688,6 +695,7 @@ def _scan_and_deliver(
     return {
         "status": "done",
         "report_path": str(dst),
+        "report": wrapped,
         "timings_ms": {
             "agent": agent_ms,
             "scan": int((t_done - t_scan_start) * 1000),
