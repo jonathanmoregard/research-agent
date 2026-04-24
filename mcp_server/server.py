@@ -44,6 +44,13 @@ REPORT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 # precise timings.
 _SCAN_TIMING_BUCKET_MS = 5000
 
+# Upper bound on report size (bytes). Caps both the memory the server uses
+# to hold the in-flight content and the size of the `report` field we
+# return to the caller — a prompt-injected agent that emits megabytes of
+# benign-looking text would otherwise balloon the caller's context and
+# could hit MCP-transport truncation that strips the trailing wrap tag.
+_MAX_CONTENT_BYTES = 512 * 1024
+
 from mcp.server.fastmcp import FastMCP
 
 Depth = Literal["fast", "normal", "deep"]
@@ -351,40 +358,95 @@ def _safe_read(path: Path) -> str:
     Opens with O_NOFOLLOW so a symlink planted at `path` fails the open with
     ELOOP rather than letting us read an attacker-chosen file elsewhere on
     the filesystem. Also requires the opened fd to point at a regular file.
-    Raises OSError on symlink or non-regular file.
+    Caps bytes read at `_MAX_CONTENT_BYTES`; larger files raise OSError so
+    the caller treats them as unreadable (fail-closed). Raises OSError on
+    symlink, non-regular file, or oversized input.
     """
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         st = os.fstat(fd)
         if not stat_mod.S_ISREG(st.st_mode):
             raise OSError(f"{path}: not a regular file")
+        if st.st_size > _MAX_CONTENT_BYTES:
+            raise OSError(f"{path}: oversized ({st.st_size} > {_MAX_CONTENT_BYTES})")
         with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
             fd = -1  # fdopen takes ownership
-            return f.read()
+            # Read one byte past the limit so concurrent growth during read
+            # is detected rather than silently truncated.
+            data = f.read(_MAX_CONTENT_BYTES + 1)
+            if len(data.encode("utf-8", errors="replace")) > _MAX_CONTENT_BYTES:
+                raise OSError(
+                    f"{path}: content grew past limit during read"
+                )
+            return data
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def _open_parent_dir(path: Path) -> int:
+    """Open `path.parent` with O_DIRECTORY | O_NOFOLLOW.
+
+    Refuses to open if the parent is a symlink (ELOOP). All writes issued
+    relative to the returned dir fd are pinned to that inode — even if an
+    attacker later renames or deletes `path.parent` in the filesystem
+    namespace, our writes still land on the original directory. Without
+    this, a same-user attacker who swaps `reports/_quarantine/` for a
+    symlink to `~/.claude/` mid-call would redirect every subsequent
+    audit/quarantine write to attacker-chosen locations.
+    """
+    return os.open(
+        path.parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
 
 
 def _atomic_write_excl(path: Path, content: str) -> None:
     """Write `content` to `path` atomically, failing if `path` exists.
 
-    Uses O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW so an attacker who
-    pre-places a symlink at `path` (or a regular file) can't redirect the
-    write. Removes any partial file on failure.
+    Opens the parent dir with O_NOFOLLOW (so a symlinked parent is
+    rejected), then creates the file relative to that dir fd with
+    O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW. No path component of the
+    final write can be swapped between our checks and the write — the
+    parent fd pins the inode. Removes any partial file on failure.
     """
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC
-    fd = os.open(path, flags, 0o600)
+    parent_fd = _open_parent_dir(path)
+    name = path.name
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            fd = -1
-            f.write(content)
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = -1
+                f.write(content)
+        except Exception:
+            try:
+                os.unlink(name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            raise
+        finally:
+            if fd >= 0:
+                os.close(fd)
     finally:
-        if fd >= 0:
-            os.close(fd)
+        os.close(parent_fd)
+
+
+def _append_jsonl_via_dirfd(path: Path, line: str) -> None:
+    """Append one line to `path`, opening via parent dir fd + O_NOFOLLOW.
+
+    Same parent-dir symlink guard as `_atomic_write_excl`, but tailored
+    to append-mode for audit.jsonl / agent_failures.jsonl.
+    """
+    parent_fd = _open_parent_dir(path)
+    name = path.name
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(line)
+    finally:
+        os.close(parent_fd)
 
 
 def _log_agent_failure(report_id: str, exit_code: int, output: str) -> None:
@@ -399,15 +461,21 @@ def _log_agent_failure(report_id: str, exit_code: int, output: str) -> None:
     quarantine_dir = REPORTS_DIR / "_quarantine"
     try:
         quarantine_dir.mkdir(exist_ok=True)
-        log_path = quarantine_dir / "agent_failures.jsonl"
-        record = {
-            "ts": datetime.datetime.utcnow().isoformat() + "Z",
-            "report_id": report_id,
-            "exit_code": exit_code,
-            "output": output,
-        }
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, default=str) + "\n")
+    except OSError as e:
+        print(
+            f"research-agent: agent-failure mkdir failed for {report_id}: {e}",
+            file=sys.stderr,
+        )
+        return
+    log_path = quarantine_dir / "agent_failures.jsonl"
+    record = {
+        "ts": datetime.datetime.utcnow().isoformat() + "Z",
+        "report_id": report_id,
+        "exit_code": exit_code,
+        "output": output,
+    }
+    try:
+        _append_jsonl_via_dirfd(log_path, json.dumps(record, default=str) + "\n")
     except OSError as e:
         # Visibility-only fallback. stderr from the MCP server is captured
         # by the CC host but not routed into the tool-result payload, so
@@ -441,7 +509,14 @@ def _write_quarantine_audit(
     """
     import datetime
     quarantine_dir = REPORTS_DIR / "_quarantine"
-    quarantine_dir.mkdir(exist_ok=True)
+    try:
+        quarantine_dir.mkdir(exist_ok=True)
+    except OSError as e:
+        print(
+            f"research-agent: audit mkdir failed for {report_id}: {e}",
+            file=sys.stderr,
+        )
+        return
     audit_path = quarantine_dir / "audit.jsonl"
     record = {
         "ts": datetime.datetime.utcnow().isoformat() + "Z",
@@ -451,8 +526,7 @@ def _write_quarantine_audit(
         "report_text": content,
     }
     try:
-        with audit_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, default=str) + "\n")
+        _append_jsonl_via_dirfd(audit_path, json.dumps(record, default=str) + "\n")
     except OSError as e:
         print(
             f"research-agent: audit write failed for {report_id}: {e}",
@@ -631,16 +705,20 @@ def _scan_error_verdict(exc: BaseException):
     """Synthetic Verdict used when the scanner itself raises.
 
     Fail-closed: any exception inside the scanner is treated as a reject.
-    The exception message is captured into the audit record (which lives
-    in the quarantine zone and is deny-listed), never the caller response.
+    Only the exception *type* is captured — same discipline as the
+    honeypot SDK-error path. Some library exceptions stringify with
+    request/response fragments, so never embed `str(exc)` here even
+    though today the Verdict only reaches the quarantine-zoned audit
+    log. Keeps us safe if an audit surface (viewer, OTel tag, metric
+    label) is added later.
     """
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
     from scanner.intercept import Verdict
     return Verdict(
         ok=False,
-        reason=f"scanner_error:{type(exc).__name__}:{exc}",
-        layers={"scanner_error": f"{type(exc).__name__}:{exc}"},
+        reason=f"scanner_error:{type(exc).__name__}",
+        layers={"scanner_error": type(exc).__name__},
         sanitize_stats={},
         sanitized_text="",
     )
@@ -667,16 +745,47 @@ def _scan_and_deliver(
 
     Scanner exceptions are treated as fail-closed rejects.
     """
-    try:
-        verdict = _scan_text(content)
-    except Exception as exc:
-        verdict = _scan_error_verdict(exc)
+    # Hard cap: oversized reports are rejected without running the scanner.
+    # Catches a prompt-injected agent that emits megabytes of benign-looking
+    # text (would balloon the caller's context and risk MCP-transport
+    # truncation that strips the closing wrap tag).
+    content_len = len(content.encode("utf-8", errors="replace"))
+    if content_len > _MAX_CONTENT_BYTES:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        from scanner.intercept import Verdict as _V
+        verdict = _V(
+            ok=False,
+            reason=f"oversized:{content_len}>{_MAX_CONTENT_BYTES}",
+            layers={"size_limit": f"oversized:{content_len}"},
+            sanitize_stats={},
+            sanitized_text="",
+        )
+    else:
+        try:
+            verdict = _scan_text(content)
+        except Exception as exc:
+            verdict = _scan_error_verdict(exc)
 
     if not verdict.ok:
         quarantine = REPORTS_DIR / "_quarantine"
-        quarantine.mkdir(exist_ok=True)
+        try:
+            quarantine.mkdir(exist_ok=True)
+        except OSError as e:
+            # Quarantine dir is unusable (e.g. attacker symlinked it to a
+            # non-existent target). Fail-soft so the caller still gets a
+            # generic reject — we lose the on-disk copy, but no content
+            # ever leaves via the response.
+            print(
+                f"research-agent: quarantine mkdir failed for {report_id}: {e}",
+                file=sys.stderr,
+            )
+            return _reject_response(report_id, agent_ms, t_received, t_scan_start)
         q_path = quarantine / f"{report_id}.md"
-        q_path.unlink(missing_ok=True)
+        try:
+            q_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         try:
             _atomic_write_excl(q_path, content)
         except OSError as e:

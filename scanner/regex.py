@@ -41,6 +41,18 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         "system_tag",
         re.compile(r"<\s*/?\s*(system|assistant|user|tool_result)[\s>]", re.IGNORECASE),
     ),
+    # Wrap-escape: the server frames delivered reports in
+    # `<untrusted_external_content>` + `<system-reminder>` tags. A
+    # report body that embeds those literal tags can close the untrusted
+    # region and open a forged system-reminder — the wrap is defeatable
+    # unless the scanner rejects any such tag in the body.
+    (
+        "wrap_escape",
+        re.compile(
+            r"<\s*/?\s*(?:system-reminder|untrusted_external_content)\b",
+            re.IGNORECASE,
+        ),
+    ),
     (
         "claude_directive",
         re.compile(
