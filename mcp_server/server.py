@@ -748,9 +748,13 @@ def _scan_and_deliver(
     # Hard cap: oversized reports are rejected without running the scanner.
     # Catches a prompt-injected agent that emits megabytes of benign-looking
     # text (would balloon the caller's context and risk MCP-transport
-    # truncation that strips the closing wrap tag).
+    # truncation that strips the closing wrap tag). Oversized content is
+    # NOT written to the quarantine file — otherwise an attacker can force
+    # unbounded disk growth via repeated rejects. Audit row only, with a
+    # length marker instead of the full bytes.
     content_len = len(content.encode("utf-8", errors="replace"))
-    if content_len > _MAX_CONTENT_BYTES:
+    oversized = content_len > _MAX_CONTENT_BYTES
+    if oversized:
         if str(REPO_ROOT) not in sys.path:
             sys.path.insert(0, str(REPO_ROOT))
         from scanner.intercept import Verdict as _V
@@ -781,19 +785,26 @@ def _scan_and_deliver(
                 file=sys.stderr,
             )
             return _reject_response(report_id, agent_ms, t_received, t_scan_start)
-        q_path = quarantine / f"{report_id}.md"
-        try:
-            q_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        try:
-            _atomic_write_excl(q_path, content)
-        except OSError as e:
-            print(
-                f"research-agent: quarantine write failed for {report_id}: {e}",
-                file=sys.stderr,
-            )
-        _write_quarantine_audit(report_id, prompt, verdict, content)
+        # Oversized rejects: skip the quarantine-file write and keep the
+        # audit-row text field to a fixed ceiling so repeated oversized
+        # rejects can't fill the disk.
+        if not oversized:
+            q_path = quarantine / f"{report_id}.md"
+            try:
+                q_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                _atomic_write_excl(q_path, content)
+            except OSError as e:
+                print(
+                    f"research-agent: quarantine write failed for {report_id}: {e}",
+                    file=sys.stderr,
+                )
+            audit_content = content
+        else:
+            audit_content = f"<oversized:{content_len} bytes, not stored>"
+        _write_quarantine_audit(report_id, prompt, verdict, audit_content)
         return _reject_response(report_id, agent_ms, t_received, t_scan_start)
 
     dst = REPORTS_DIR / f"{report_id}.md"

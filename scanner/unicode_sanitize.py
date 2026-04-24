@@ -34,6 +34,16 @@ ZERO_WIDTH = (0x200B, 0x200C, 0x200D, 0xFEFF)   # Bad Characters
 # to desynchronize tokenizers but not always malicious. We strip only the
 # zero-width variants; NBSP is left alone.
 
+# Confusable slashes that NFKC does NOT fold to ASCII `/`. Without
+# explicit translation, a tag like `<∕system-reminder>` (U+2215 DIVISION
+# SLASH) passes every regex that expects ASCII `/` — defeating the
+# wrap_escape defense. NFKC normalizes U+FF0F FULLWIDTH SOLIDUS already,
+# so this table only covers the cases NFKC misses.
+CONFUSABLE_SLASH_MAP = str.maketrans({
+    "⁄": "/",  # FRACTION SLASH
+    "∕": "/",  # DIVISION SLASH
+})
+
 
 @dataclass
 class SanitizeResult:
@@ -68,13 +78,16 @@ def sanitize(text: str) -> SanitizeResult:
         buf.append(ch)
     raw_clean = "".join(buf)
     nfkc = unicodedata.normalize("NFKC", raw_clean)
+    # Fold confusable slashes that NFKC missed so downstream regex layers
+    # don't have to carry parallel Unicode alternates.
+    folded = nfkc.translate(CONFUSABLE_SLASH_MAP)
     return SanitizeResult(
-        text=nfkc,
+        text=folded,
         stripped=bidi + tag + zw,
         bidi_hits=bidi,
         tag_hits=tag,
         zw_hits=zw,
-        nfkc_changed=(nfkc != raw_clean),
+        nfkc_changed=(folded != raw_clean),
     )
 
 

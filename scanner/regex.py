@@ -45,11 +45,25 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # `<untrusted_external_content>` + `<system-reminder>` tags. A
     # report body that embeds those literal tags can close the untrusted
     # region and open a forged system-reminder — the wrap is defeatable
-    # unless the scanner rejects any such tag in the body.
+    # unless the scanner rejects any such tag in the body. We also reject
+    # a broader denylist of tag names the downstream model (or a sibling
+    # harness) may treat with elevated trust: important_instructions,
+    # developer, admin, priority, reminder, instructions. unicode_sanitize
+    # already folds U+2215 / U+2044 confusable slashes to `/` before this
+    # layer runs, so the slash class stays ASCII-only here.
     (
         "wrap_escape",
         re.compile(
-            r"<\s*/?\s*(?:system-reminder|untrusted_external_content)\b",
+            r"<\s*/?\s*(?:"
+            r"system-reminder"
+            r"|untrusted_external_content"
+            r"|important_instructions?"
+            r"|developer"
+            r"|admin"
+            r"|priority"
+            r"|reminder"
+            r"|instructions?"
+            r")\b",
             re.IGNORECASE,
         ),
     ),
