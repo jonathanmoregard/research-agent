@@ -346,9 +346,7 @@ def _scan_text(content: str):
     between the file arriving on disk and the scanner reading it. Callers
     snapshot the bytes under O_NOFOLLOW, then hand the string here.
     """
-    if str(REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(REPO_ROOT))
-    from scanner.intercept import scan_text as _intercept_scan_text
+    from injection_scanner.intercept import scan_text as _intercept_scan_text
     return _intercept_scan_text(content)
 
 
@@ -712,9 +710,7 @@ def _scan_error_verdict(exc: BaseException):
     log. Keeps us safe if an audit surface (viewer, OTel tag, metric
     label) is added later.
     """
-    if str(REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(REPO_ROOT))
-    from scanner.intercept import Verdict
+    from injection_scanner.intercept import Verdict
     return Verdict(
         ok=False,
         reason=f"scanner_error:{type(exc).__name__}",
@@ -755,9 +751,7 @@ def _scan_and_deliver(
     content_len = len(content.encode("utf-8", errors="replace"))
     oversized = content_len > _MAX_CONTENT_BYTES
     if oversized:
-        if str(REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(REPO_ROOT))
-        from scanner.intercept import Verdict as _V
+        from injection_scanner.intercept import Verdict as _V
         verdict = _V(
             ok=False,
             reason=f"oversized:{content_len}>{_MAX_CONTENT_BYTES}",

@@ -6,6 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.96.0",
+    "injection-scanner",
     "mcp>=1.27.0",
     "openai>=2.32.0",
 ]
+
+[tool.uv.sources]
+injection-scanner = { path = "../injection-scanner", editable = true }

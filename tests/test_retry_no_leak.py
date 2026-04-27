@@ -27,7 +27,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from mcp_server import server as srv  # noqa: E402
-from scanner.intercept import Verdict  # noqa: E402
+from injection_scanner.intercept import Verdict  # noqa: E402
 
 
 CANARY_REASON = "RETRY_REASON_CANARY_abc123"

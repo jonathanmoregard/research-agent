@@ -18,11 +18,7 @@ import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from scanner.intercept import scan  # noqa: E402
+from injection_scanner.intercept import scan
 
 
 def run_one(label: str, text: str) -> dict:

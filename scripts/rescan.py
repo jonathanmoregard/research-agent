@@ -23,10 +23,7 @@ import json
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT))
-
-from scanner.intercept import scan as intercept_scan  # noqa: E402
+from injection_scanner.intercept import scan as intercept_scan
 
 
 def resolve_path(ref: str) -> Path:
