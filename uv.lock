@@ -268,19 +268,11 @@ wheels = [
 [[package]]
 name = "injection-scanner"
 version = "0.1.0"
-source = { editable = "../injection-scanner" }
+source = { git = "https://github.com/jonathanmoregard/injection-scanner?rev=main#6ab5dd318e803bac53b69e1f842fbbeb2191268b" }
 dependencies = [
     { name = "anthropic" },
     { name = "openai" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "anthropic", specifier = ">=0.96.0" },
-    { name = "openai", specifier = ">=2.32.0" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
-]
-provides-extras = ["test"]
 
 [[package]]
 name = "jiter"
@@ -614,7 +606,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", specifier = ">=0.96.0" },
-    { name = "injection-scanner", editable = "../injection-scanner" },
+    { name = "injection-scanner", git = "https://github.com/jonathanmoregard/injection-scanner?rev=main" },
     { name = "mcp", specifier = ">=1.27.0" },
     { name = "openai", specifier = ">=2.32.0" },
 ]

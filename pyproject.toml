@@ -12,4 +12,4 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-injection-scanner = { path = "../injection-scanner", editable = true }
+injection-scanner = { git = "https://github.com/jonathanmoregard/injection-scanner", rev = "main" }

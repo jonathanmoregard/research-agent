@@ -867,5 +867,28 @@ def retry_research(report_id: str) -> dict:
     )
 
 
+def _boot_smoke() -> None:
+    """Run the scanner self-test before mcp.run() binds.
+
+    Refuses to start the MCP server if any canary regresses or if the
+    L3 honeypot is unreachable. Costs one Anthropic + two OpenAI
+    round-trips at boot — research-agent serves real research, so a
+    silent scanner regression here would let attacker-authored reports
+    through to the operator session.
+    """
+    import logging
+    from injection_scanner.smoke import SmokeFailure, run_smoke
+
+    log = logging.getLogger("research-agent.boot")
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    try:
+        run_smoke(log_info=log.info, log_error=log.error)
+    except SmokeFailure as e:
+        log.error("research-agent: aborting startup, scanner self-test failed: %s", e.reason)
+        raise SystemExit(2) from e
+
+
 if __name__ == "__main__":
+    _boot_smoke()
     mcp.run()
