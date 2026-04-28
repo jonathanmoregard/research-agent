@@ -104,6 +104,13 @@ def _keyring_lookup(key: str) -> str | None:
 SECRETS_CACHE: dict[str, str] = {}
 
 
+_SECRET_ENV = {
+    "claude-token": "CLAUDE_CODE_OAUTH_TOKEN",
+    "exa-api-key": "EXA_API_KEY",
+    "tavily-api-key": "TAVILY_API_KEY",
+}
+
+
 def _secrets() -> dict[str, str]:
     """Load secrets once per server startup and cache them in-process.
 
@@ -111,11 +118,24 @@ def _secrets() -> dict[str, str]:
     memory; the server passes them into the container via `docker exec -e`
     for each call so they are not visible in the container's static env
     (docker inspect).
+
+    Resolution order: env var first (per `_SECRET_ENV`), GNOME keyring
+    fallback. An empty-string env var falls through to the keyring on
+    purpose — operators who `export X=` likely meant "unset". Lets
+    agenix-driven NixOS deployments populate via wrapper-exported env
+    without touching secret-tool.
+
+    Scope: this function returns secrets needed by the *agent-side* paths
+    (`claude-token`, `exa-api-key`, `tavily-api-key`). Scanner keys
+    (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) are read directly from
+    `os.environ` inside `injection_scanner.honeypot` and don't pass through
+    here — keep them out of `_SECRET_ENV` to avoid implying parity that
+    isn't enforced at this layer.
     """
     if SECRETS_CACHE:
         return SECRETS_CACHE
-    for name in ("claude-token", "exa-api-key", "tavily-api-key"):
-        val = _keyring_lookup(name)
+    for name, env_var in _SECRET_ENV.items():
+        val = os.environ.get(env_var) or _keyring_lookup(name)
         if val:
             SECRETS_CACHE[name] = val
     return SECRETS_CACHE
