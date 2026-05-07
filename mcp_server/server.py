@@ -1040,7 +1040,19 @@ def _boot_smoke() -> None:
         raise SystemExit(2) from e
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point for the `research-agent-mcp` console script.
+
+    Identical to the `__main__` block — declared as a function so
+    `[project.scripts]` in pyproject.toml can wire `research-agent-mcp =
+    "mcp_server.server:main"` and produce a binary on PATH. Lets the
+    Nix wrapper at `home/research-agent.nix` shell out without having
+    to know the project layout.
+    """
     _maybe_update_scanner()
     _boot_smoke()
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
