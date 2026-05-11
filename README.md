@@ -1,6 +1,6 @@
 # research-agent
 
-Isolated web-research subsystem for Claude Code. The host session has no exa/tavily access; it calls a single MCP tool, the call is forwarded into a long-running dev container, the container spawns a fresh bubblewrap jail per call, and the resulting report is scanned before the host can read it.
+Isolated web-research subsystem for Claude Code. The host session has no exa/tavily access; it calls a single MCP tool, the call is forwarded over ssh into a long-running microvm (qemu+KVM), the microvm spawns a fresh bubblewrap jail per call, and the resulting report is scanned before the host can read it.
 
 ## Interface
 
@@ -17,13 +17,16 @@ The main session writes nothing about web access itself — it just calls this a
 ```
 host Claude session
         |
-        | MCP call: research(prompt)
+        | MCP call: research(prompt, depth)
         v
 mcp_server/server.py                 (host process)
         |
-        | docker exec
+        | ssh -i agenix:research-agent-host-key -p 2223 agent@127.0.0.1
         v
-research-agent container             (long-running, hot)
+research-agent microvm               (qemu+KVM, hot)
+   - virtiofs RO  /workspace
+   - virtiofs RW  /out
+   - nftables egress allowlist (anthropic, exa, tavily only)
         |
         | scripts/run-agent.sh
         v
@@ -35,9 +38,9 @@ bubblewrap jail                      (ephemeral, per call)
         |
         | claude -p (tools: exa, tavily, Write)
         v
-scanner/regex.py                     (host-side, after jail exits)
+injection-scanner                    (host-side, after ssh returns)
         |
-        | pass  -> reports/<uuid>.md, return path
+        | pass  -> reports/<uuid>.md, return wrapped report
         | fail  -> reports/_quarantine/<uuid>.md, return error
         v
 host Claude session receives result
@@ -45,9 +48,9 @@ host Claude session receives result
 
 ### Per-call isolation
 
-- Container is **hot** (no startup cost).
+- microVM is **hot** (no per-call boot cost). KVM-isolated kernel separates the agent from the host.
 - Each call runs inside a **fresh bubblewrap jail** with tmpfs `$HOME` and tmpfs `/tmp`. No config, history, cache, or scratch persists between calls.
-- Writable destination is **one pre-created file** in `/out/<uuid>.md` (bind mount of host `reports/`). The agent cannot write anywhere else.
+- Writable destination is **one pre-created file** in `/out/<uuid>.md` (virtiofs bind mount of host `reports/`). The agent cannot write anywhere else.
 
 ### Trust boundaries
 
@@ -55,22 +58,21 @@ host Claude session receives result
 |-------|---------|-----|----------------|
 | Host Claude (main) | none | **none** | repo, user files |
 | MCP server (host) | reads prompt, no keys | none | `reports/` only |
-| Container (long-running) | exa/tavily keys in env | yes, via MCPs only | container FS |
+| microVM (long-running) | exa/tavily keys via per-call ssh stdin only | yes, via MCPs only | VM FS (in-memory) |
 | Per-call bwrap jail | inherits env | yes | `/scratch/<uuid>.md` only |
 | Scanner | none | none | `reports/_quarantine/` |
 
 ## Status
 
 - [x] Repo skeleton
-- [x] MCP server (`docker exec` into hot container)
-- [x] Per-call bubblewrap wrapper script
-- [x] Regex scanner seed (passing tests) — includes token-shape leak patterns
-- [x] Devcontainer based on Trail of Bits pattern (Ubuntu 24.04 + bwrap + Claude Code)
+- [x] MCP server (`ssh` into the hot microvm)
+- [x] microvm.nix host module (qemu+KVM, virtiofs shares, declarative nftables) — replaces Docker
+- [x] Per-call bubblewrap jail inside the microvm
+- [x] Regex + LLM-honeypot scanner (injection-scanner package) — pre-delivery scan on every report
 - [x] End-to-end smoke test round-trips cleanly (`status:done` with agent-written report)
-- [x] Network egress allowlist (api.anthropic.com, exa.ai, tavily.com only; default DROP)
-- [x] Secrets in GNOME keyring — never on disk, never in container static env
+- [x] Network egress allowlist (api.anthropic.com, exa.ai, tavily.com only; declarative nftables)
+- [x] Secrets in agenix (NixOS) — never on disk inside the VM, never in static env
 - [x] Host `~/.claude.json` cleanup — exa + tavily removed; `research-agent` MCP is the only web tool in the main session
-- [ ] LLM scanner layer (`llm-guard` or Haiku) on top of the regex seed
 - [ ] External egress proxy container (route outbound through squid/envoy so
       the research-agent itself doesn't hold `NET_ADMIN`)
 - [ ] Tier-2 secret isolation (separate systemd user for the MCP server so
@@ -80,14 +82,19 @@ host Claude session receives result
 ## Directory layout
 
 ```
-mcp_server/     # host-side MCP server
-agent/          # container-side CLAUDE.md + .mcp.json (exa, tavily)
-scanner/        # regex + future LLM scanners
-scripts/        # run-agent.sh — bwrap invocation per call
-reports/        # post-scan output (gitignored)
-.devcontainer/  # Ubuntu 24.04 + bubblewrap + Claude Code
+mcp_server/     # host-side MCP server (ssh-driven)
+agent/          # guest-side CLAUDE.md + .mcp.json (exa, tavily)
+scripts/        # run-agent.sh — bwrap invocation per call (runs inside the microvm)
+reports/        # post-scan output (gitignored; virtiofs-shared into the microvm at /out)
 ```
+
+NixOS module declaring the microvm lives in
+`modules/nixos/research-agent-microvm.nix` in the system nixos-config
+repo.
 
 ## Credits
 
-Devcontainer pattern inspired by [trailofbits/claude-code-devcontainer](https://github.com/trailofbits/claude-code-devcontainer) — same base image, same bubblewrap approach, adapted for a single-tool MCP research server.
+Per-call bubblewrap jail pattern inspired by
+[trailofbits/claude-code-devcontainer](https://github.com/trailofbits/claude-code-devcontainer).
+Container outer boundary swapped for a qemu+KVM microvm via
+[astro/microvm.nix](https://github.com/astro/microvm.nix).
