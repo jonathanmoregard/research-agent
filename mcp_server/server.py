@@ -163,47 +163,52 @@ def _direct_exa(prompt: str) -> tuple[bool, str]:
 
     Returns (ok, text). On failure, ok=False and text is an error message.
     No agent, no container — fastest path, least synthesis.
+
+    Uses curl_cffi (impersonate=chrome) instead of stdlib urllib because
+    Cloudflare in front of api.exa.ai blocks Python's TLS/HTTP-2
+    fingerprint with error 1010 ("browser signature banned") even when
+    the User-Agent header is browser-shaped. curl_cffi replays a real
+    Chrome wire signature (TLS cipher order, ALPN, H2 SETTINGS frame),
+    which sails through. Same library the container's Dockerfile already
+    installs for the agent-side path.
     """
-    import urllib.request
-    import urllib.error
+    from curl_cffi import requests as cffi_requests
 
     secrets = _secrets()
     key = secrets.get("exa-api-key")
     if not key:
         return False, "direct: exa-api-key not in keyring"
 
-    payload = json.dumps(
-        {
-            "query": prompt,
-            "type": "auto",
-            "numResults": 5,
-            "contents": {"highlights": True},
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        EXA_API_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "x-api-key": key,
-            "User-Agent": "research-agent/1.0",
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        # Don't include response body in the error string — an attacker who
-        # can shape Exa's response (crafted query that triggers an echoing
-        # 4xx, MITM, etc.) could otherwise leak bytes straight to the caller
-        # without passing through the scanner.
-        return False, f"direct: exa http {e.code}"
+        resp = cffi_requests.post(
+            EXA_API_URL,
+            json={
+                "query": prompt,
+                "type": "auto",
+                "numResults": 5,
+                "contents": {"highlights": True},
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "x-api-key": key,
+            },
+            impersonate="chrome",
+            timeout=30,
+        )
     except Exception:
-        # Same reason — exception stringification can include URLs or
-        # response fragments. Keep the error opaque.
+        # Don't surface exception text — could include URLs or response
+        # fragments. Keep the error opaque (same rationale as before).
         return False, "direct: exa call failed"
+
+    if resp.status_code >= 400:
+        # Mirror the prior shape: status code only, no body.
+        return False, f"direct: exa http {resp.status_code}"
+
+    try:
+        body = resp.json()
+    except Exception:
+        return False, "direct: exa parse failed"
 
     results = body.get("results") or []
     lines = [
