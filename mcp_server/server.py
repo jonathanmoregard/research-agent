@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import stat as stat_mod
 import subprocess
@@ -140,17 +141,30 @@ def _secrets() -> dict[str, str]:
             SECRETS_CACHE[name] = val
     return SECRETS_CACHE
 
-# Name of the long-running container that holds the agent. Matches the
-# `name` field in .devcontainer/devcontainer.json (actual runtime name will
-# vary with the orchestrator — override via env).
-CONTAINER = os.environ.get("RESEARCH_CONTAINER", "research-agent")
-
 # Timeout for a single research call (seconds).
 AGENT_TIMEOUT = int(os.environ.get("RESEARCH_AGENT_TIMEOUT", "600"))
 
-# Where the container sees the agent scripts. Matches the workspace mount
-# created by devcontainer.json (default: /workspace).
-CONTAINER_WORKSPACE = os.environ.get("RESEARCH_CONTAINER_WORKSPACE", "/workspace")
+
+def _ssh_settings() -> dict[str, str]:
+    """Resolve SSH transport settings from env at call time.
+
+    Read on every invocation rather than at module import so wrappers
+    (NixOS home-manager wrapper, agenix-driven exports) that set these
+    after the server is loaded are honoured. Also makes tests easier:
+    monkeypatched env vars take effect without forcing a module reload.
+    """
+    return {
+        "host": os.environ.get("RESEARCH_SSH_HOST", "127.0.0.1"),
+        "port": os.environ.get("RESEARCH_SSH_PORT", "2223"),
+        "key": os.environ.get(
+            "RESEARCH_SSH_KEY", "/run/agenix/research-agent-host-key"
+        ),
+        "user": os.environ.get("RESEARCH_SSH_USER", "agent"),
+        "known_hosts": os.environ.get(
+            "RESEARCH_SSH_KNOWN_HOSTS",
+            str(Path.home() / ".cache" / "research-agent" / "known_hosts"),
+        ),
+    }
 
 # Per-depth guidance the agent receives. Tools themselves are gated via
 # --allowed-tools in run-agent.sh; the prompt tells the agent how aggressively
@@ -272,14 +286,39 @@ PROMPT_TEMPLATE = (
 )
 
 
+# Guest-side inline bash run by sshd inside the microvm. Reads four
+# null-terminated fields from stdin (claude_token, exa, tavily,
+# prompt_body), writes the prompt to a tmp file under $HOME, then
+# exec's run-agent.sh with (uuid, prompt_file). The EXIT trap cleans
+# the tmp file even if SSH disconnects mid-call.
+#
+# Script is passed via `bash -c` (argv) so stdin can carry the
+# four binary-safe secret fields without conflicting with the
+# script source.
+_GUEST_SCRIPT = (
+    "set -euo pipefail; "
+    "IFS= read -r -d '' CLAUDE_CODE_OAUTH_TOKEN; "
+    "IFS= read -r -d '' EXA_API_KEY; "
+    "IFS= read -r -d '' TAVILY_API_KEY; "
+    "IFS= read -r -d '' PROMPT_BODY; "
+    "export CLAUDE_CODE_OAUTH_TOKEN EXA_API_KEY TAVILY_API_KEY; "
+    'TMP=$(mktemp -p "$HOME" research-prompt.XXXXXX); '
+    'chmod 600 "$TMP"; '
+    "trap 'rm -f \"$TMP\"' EXIT; "
+    'printf %s "$PROMPT_BODY" > "$TMP"; '
+    'exec /workspace/scripts/run-agent.sh "$1" "$TMP"'
+)
+
+
 def _run_agent(prompt: str, report_id: str, depth: Depth) -> tuple[int, str]:
-    """Run a single research call inside the container's bubblewrap jail.
+    """Run a single research call inside the microvm's bubblewrap jail.
+
+    Connects to the agent's sshd on RESEARCH_SSH_HOST:RESEARCH_SSH_PORT,
+    streams four null-terminated fields over stdin (three secrets +
+    prompt body), and waits for run-agent.sh inside the VM to complete.
 
     Returns (exit_code, combined_output).
     """
-    # Scratch path *as seen from inside the bwrap jail* — /scratch/<uuid>.md.
-    # The host-visible equivalent is the pre-created reports/<uuid>.md file
-    # that run-agent.sh bind-mounts into /scratch for the jail.
     scratch_path = f"/scratch/{report_id}.md"
     full_prompt = PROMPT_TEMPLATE.format(
         scratch_path=scratch_path,
@@ -287,81 +326,54 @@ def _run_agent(prompt: str, report_id: str, depth: Depth) -> tuple[int, str]:
         prompt=prompt,
     )
 
-    # Ship the prompt into the container via a temp file to avoid shell
-    # quoting issues with arbitrary characters.
-    with tempfile.NamedTemporaryFile(
-        "w", prefix="research-prompt-", suffix=".txt", delete=False
-    ) as tmp:
-        tmp.write(full_prompt)
-        host_prompt_file = tmp.name
-    container_prompt_file = f"/tmp/research-prompt-{report_id}.txt"
+    secrets = _secrets()
+    # Four null-terminated fields. Mirrors the docker-era contract but
+    # carries the prompt body as the fourth field — eliminates the
+    # separate docker-cp step.
+    stdin_payload = "".join(
+        s + "\0"
+        for s in (
+            secrets.get("claude-token", ""),
+            secrets.get("exa-api-key", ""),
+            secrets.get("tavily-api-key", ""),
+            full_prompt,
+        )
+    )
 
-    try:
-        cp = subprocess.run(
-            [
-                "docker",
-                "cp",
-                host_prompt_file,
-                f"{CONTAINER}:{container_prompt_file}",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if cp.returncode != 0:
-            return cp.returncode, f"docker cp failed: {cp.stderr.strip()}"
-        secrets = _secrets()
-        # Secrets via stdin (not `docker exec -e`) so they never appear in the
-        # host's process argv, which any `ps` reader can see. The container
-        # reads exactly three null-terminated values from stdin and exports
-        # them into the environment before handing off to run-agent.sh.
-        stdin_payload = "".join(
-            s + "\0"
-            for s in (
-                secrets.get("claude-token", ""),
-                secrets.get("exa-api-key", ""),
-                secrets.get("tavily-api-key", ""),
-            )
-        )
-        exec_cmd = [
-            "docker",
-            "exec",
-            "-i",
-            # RESEARCH_DEPTH is not a secret, safe via -e.
-            "-e",
-            f"RESEARCH_DEPTH={depth}",
-            CONTAINER,
-            "bash",
-            "-c",
-            # Read three null-terminated fields, export, then run the agent.
-            # Using `read -d ''` gives us null-terminator parsing so newlines
-            # inside a token can't split it.
-            (
-                "IFS= read -r -d '' CLAUDE_CODE_OAUTH_TOKEN; "
-                "IFS= read -r -d '' EXA_API_KEY; "
-                "IFS= read -r -d '' TAVILY_API_KEY; "
-                "export CLAUDE_CODE_OAUTH_TOKEN EXA_API_KEY TAVILY_API_KEY; "
-                f'exec bash "{CONTAINER_WORKSPACE}/scripts/run-agent.sh" '
-                '"$1" "$2"'
-            ),
-            "bash",  # $0 for the inline script
-            report_id,
-            container_prompt_file,
+    ssh = _ssh_settings()
+    Path(ssh["known_hosts"]).parent.mkdir(parents=True, exist_ok=True)
+
+    # The remote command is one shell-joined string: ssh joins all argv
+    # after user@host with spaces and re-parses on the remote side.
+    # Quote each piece explicitly so the script source survives intact.
+    remote_cmd = " ".join(
+        [
+            f"RESEARCH_DEPTH={shlex.quote(str(depth))}",
+            "bash", "-c", shlex.quote(_GUEST_SCRIPT),
+            "bash", shlex.quote(report_id),
         ]
-        result = subprocess.run(
-            exec_cmd,
-            input=stdin_payload,
-            capture_output=True,
-            text=True,
-            timeout=AGENT_TIMEOUT,
-        )
-        return result.returncode, (result.stdout + result.stderr)
-    finally:
-        Path(host_prompt_file).unlink(missing_ok=True)
-        # Best-effort cleanup inside container.
-        subprocess.run(
-            ["docker", "exec", CONTAINER, "rm", "-f", container_prompt_file],
-            capture_output=True,
-        )
+    )
+
+    ssh_cmd = [
+        "ssh",
+        "-i", ssh["key"],
+        "-p", str(ssh["port"]),
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", f"UserKnownHostsFile={ssh['known_hosts']}",
+        "-o", "ServerAliveInterval=30",
+        f"{ssh['user']}@{ssh['host']}",
+        remote_cmd,
+    ]
+
+    result = subprocess.run(
+        ssh_cmd,
+        input=stdin_payload,
+        capture_output=True,
+        text=True,
+        timeout=AGENT_TIMEOUT,
+    )
+    return result.returncode, (result.stdout + result.stderr)
 
 
 def _scan_text(content: str):
