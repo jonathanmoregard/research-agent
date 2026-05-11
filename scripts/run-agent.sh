@@ -73,7 +73,16 @@ PROMPT_CONTENT="$(cat "${PROMPT_FILE}")"
 # Render a resolved copy with env substitution and bind-mount it over the
 # read-only original inside the jail. Ephemeral per call; cleaned up on exit.
 RENDERED_MCP=$(mktemp --suffix=.mcp.json)
-chmod 644 "${RENDERED_MCP}"
+# Invariant: the rendered file holds substituted EXA_API_KEY +
+# TAVILY_API_KEY values. It MUST live on /tmp (in-VM disk), never on
+# /out (virtiofs share, visible to the host). Without this guard, a
+# future operator who exports TMPDIR=/out would silently leak keys to
+# the host's reports/ dir.
+case "${RENDERED_MCP}" in
+  /tmp/*) ;;
+  *) echo "run-agent: refusing to render .mcp.json outside /tmp (got ${RENDERED_MCP})" >&2; exit 3 ;;
+esac
+chmod 600 "${RENDERED_MCP}"
 python3 -c 'import os,sys; sys.stdout.write(os.path.expandvars(sys.stdin.read()))' \
   < "${AGENT_DIR}/.mcp.json" > "${RENDERED_MCP}"
 trap 'rm -f "${RENDERED_MCP}"' EXIT
