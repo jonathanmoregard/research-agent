@@ -1,6 +1,12 @@
 # Design: Migrate research-agent runtime from Docker to microvm.nix
 
 **Date:** 2026-05-11
+**Status:** revised after Opus advisor pass (2026-05-11). Key changes:
+guest `agent` uid pinned to 1000 (§1), SSH stdin protocol fully
+specified (§4), VM host keys persisted via virtiofs share (§6),
+egress-init failure gates sshd (§3), nested-KVM gotcha called out
+with plan B (§Testing), atomic cutover replaces dual-mode env flag
+(§Implementation order).
 **Repos affected:** `research-agent`, `nixos-config` (`/etc/nixos`)
 **Pipeline:** every change to `nixos-config` goes through the
 worktree → PR → CI (`dellan-vm`) → merge → webhook auto-deploy flow.
@@ -105,6 +111,14 @@ Replaces `modules/nixos/research-agent-container.nix`. Declares
 - One `user`-mode (SLIRP) network interface. No host bridge needed —
   egress is what we want; ingress is one port forward (host:2223 →
   guest:22) for the MCP server's SSH connection.
+  - **SLIRP + nftables interaction:** SLIRP serves DNS at `10.0.2.3`
+    and rewrites destination IPs for some traffic classes. `dellan-vm`
+    must include a **blocking** assertion that, from inside the guest,
+    `curl https://api.exa.ai` reaches the endpoint while
+    `curl https://example.com` is dropped. If SLIRP NAT shape breaks
+    the IP-allowlist semantics, the plan switches to a `tap` interface
+    on a host-side bridge with the same nftables policy. Verify first,
+    fall back if needed.
 - `environment.systemPackages`: `bubblewrap`, `python3`,
   `python3Packages.curl-cffi`, `python3Packages.exa-py`,
   `python3Packages.tavily-python`. Replaces the Dockerfile's
@@ -120,14 +134,40 @@ Replaces `modules/nixos/research-agent-container.nix`. Declares
 - `users.users.agent` (non-root) with `authorizedKeys` from
   `config.age.secrets.research-agent-host-key-pub.path`. Runs
   `scripts/run-agent.sh`.
+  - **uid pinned to 1000** to match host `jonathan`. virtiofsd's
+    default passthrough exposes host file ownership as-is to the
+    guest; matching uids keeps `~/Repos/research-agent/reports`
+    writable by `agent` inside the guest **and** still owned by
+    `jonathan` from the host's view after the call. Without this
+    pin, bwrap's `--unshare-user` mapping (uid 0 → nobody/65534)
+    layered on top of a uid-mismatched virtiofs share produces
+    `nobody`-owned files in `reports/` that the host MCP server
+    cannot unlink. Verified in `dellan-vm`: after a `research()`
+    call, `stat reports/<uuid>.md` from the host shows `jonathan`
+    ownership.
 - `networking.nftables` with declarative ruleset implementing the
   egress allowlist (see §3).
 
 ### 2. flake.nix wiring
 
-- Add `inputs.microvm.url = "github:astro/microvm.nix"` with
+- Add `inputs.microvm.url = "github:astro/microvm.nix?ref=<TAG>"`
+  pinned to a tagged release (resolved at plan time) with
   `inputs.microvm.inputs.nixpkgs.follows = "nixpkgs"`.
-- Import `microvm.nixosModules.host` into the `dellan` host.
+  microvm.nix is an active project with breaking changes on `main`
+  (option renames in 2024 affected `microvm.shares` schema and
+  hypervisor defaults); pinning a tag stops a future
+  `nix flake update` from silently breaking the dellan rebuild
+  during an unrelated PR.
+- Import `microvm.nixosModules.host` into the `dellan` host. **Pre-flight
+  gate** in the implementation plan: in a worktree, `nix eval
+  .#nixosConfigurations.dellan.config.networking` and
+  `.config.systemd.services` **before and after** adding the import
+  and diff the resulting JSON. The `host` module touches networking
+  (sets up `/var/lib/microvms`, adds `microvm@.service` template,
+  may declare a bridge depending on options chosen). If the diff
+  surfaces an option-conflict with existing networking, the plan
+  decides whether to disable a microvm host sub-option or rework the
+  bridge config before merging.
 - Import `microvm.nixosModules.microvm` into the VM's module set (per
   microvm.nix convention).
 - Pass `inputs` to host modules via the standard
@@ -155,6 +195,30 @@ Allowed FQDNs match current `init-firewall.sh`:
 `api.anthropic.com`, `api.exa.ai`, `mcp.exa.ai`, `api.tavily.com`,
 `mcp.tavily.com`.
 
+**Failure mode = fail-closed at the SSH door.** Declaring
+`networking.nftables` brings the base ruleset up at boot (default
+drop) regardless of whether the egress-init oneshot populates the
+allowlist set. If DNS resolution fails after all retries, an empty
+set + default drop means every research call silently times out
+inside the VM rather than failing loud at the host MCP server.
+
+To fail loud, the VM's sshd unit gates on egress-init:
+
+```nix
+systemd.services.sshd = {
+  after = [ "research-agent-egress-init.service" ];
+  requires = [ "research-agent-egress-init.service" ];
+};
+```
+
+`Requires=` (not `Wants=`) means a failed egress-init transitions
+sshd to `failed` as well; the host MCP server's SSH attempt fails
+fast with `Connection refused`, surfaced as a normal `agent failed`
+error. Operators see the failure in `journalctl -u
+research-agent-egress-init` on the VM; on the host this looks like a
+single failing `research()` call rather than a 10-minute timeout
+hang.
+
 ### 4. MCP server changes — `mcp_server/server.py`
 
 Diff is localized to `_run_agent` and a small number of env-var reads:
@@ -167,22 +231,40 @@ Diff is localized to `_run_agent` and a small number of env-var reads:
 - Removed env vars: `RESEARCH_CONTAINER`, `RESEARCH_CONTAINER_WORKSPACE`.
 - `_run_agent`:
   - Replace `docker cp` (prompt file) with a single SSH stream. The
-    prompt file is piped via the SSH stdin alongside the three
-    secret tokens — still null-terminated, still parsed by the inline
+    prompt file body is piped via the SSH stdin alongside the three
+    secret tokens — still null-terminated, parsed by the inline
     bash on the guest before exec into `run-agent.sh`.
   - Replace `docker exec -i CONTAINER bash -c '…'` with
     `ssh -i $RESEARCH_SSH_KEY -p $RESEARCH_SSH_PORT
          -o BatchMode=yes
-         -o StrictHostKeyChecking=accept-new
+         -o StrictHostKeyChecking=yes
          -o UserKnownHostsFile=~/.cache/research-agent/known_hosts
          -o ServerAliveInterval=30
          $RESEARCH_SSH_USER@$RESEARCH_SSH_HOST
          RESEARCH_DEPTH=$depth bash -s -- "$uuid"`.
-    Inline bash on the guest reads four null-terminated fields from
-    stdin (prompt file path payload, then three secrets), writes the
-    prompt to a tmp file under the agent user's home, then `exec
-    /workspace/scripts/run-agent.sh "$uuid" "$tmpfile"`.
-  - `docker exec rm -f` cleanup → `ssh ... rm -f` cleanup.
+  - **Stdin protocol — exactly four null-terminated fields, in this
+    order:** `claude_token`, `exa_api_key`, `tavily_api_key`,
+    `prompt_body`. Guest-side inline bash:
+
+    ```bash
+    set -euo pipefail
+    IFS= read -r -d '' CLAUDE_CODE_OAUTH_TOKEN
+    IFS= read -r -d '' EXA_API_KEY
+    IFS= read -r -d '' TAVILY_API_KEY
+    IFS= read -r -d '' PROMPT_BODY
+    export CLAUDE_CODE_OAUTH_TOKEN EXA_API_KEY TAVILY_API_KEY
+    TMP=$(mktemp -p "$HOME" research-prompt.XXXXXX)
+    chmod 600 "$TMP"
+    trap 'rm -f "$TMP"' EXIT
+    printf '%s' "$PROMPT_BODY" > "$TMP"
+    exec /workspace/scripts/run-agent.sh "$1" "$TMP"
+    ```
+
+    Both argv slots (`$1` = uuid, `$2` = prompt file) are passed to
+    `run-agent.sh`; the EXIT trap cleans the tmp file even on SSH
+    disconnect.
+  - No separate `ssh ... rm -f` cleanup needed — the guest-side trap
+    handles it.
 - Error handling unchanged: `subprocess.TimeoutExpired`, non-zero exit,
   empty report, `_log_agent_failure`, all still apply.
 
@@ -191,6 +273,15 @@ Diff is localized to `_run_agent` and a small number of env-var reads:
 Unchanged. Paths `/workspace` and `/out` map identically to the
 virtiofs mount points. bwrap invocation, allowlist tools, model
 selection — all stay.
+
+**Note on the rendered `.mcp.json` tmpfile** (L75–79 of
+`scripts/run-agent.sh`): `mktemp` lands in the guest's `/tmp`
+(in-VM disk), not on `/out` (virtiofs RW share). This is correct
+already — the rendered file contains substituted `EXA_API_KEY` and
+`TAVILY_API_KEY` values; landing it on virtiofs would expose the
+key fragments to the host's filesystem. The implementation plan
+adds an explicit pre-condition check (`[[ "${RENDERED_MCP}" == /tmp/* ]]`)
+to make the intent enforceable rather than implicit.
 
 ### 6. Secrets — agenix
 
@@ -207,14 +298,16 @@ API keys (`EXA_API_KEY`, `TAVILY_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
 piped via stdin into the SSH stream per call. VM never holds them
 at rest.
 
-VM SSH host keys: generated declaratively via
-`services.openssh.hostKeys`. Persisted on a small virtiofs RW share
-(`~/.cache/research-agent/vm-ssh-host-keys` → `/etc/ssh`-keyfiles) so
-the host's `known_hosts` pin survives VM reboot. Alternative
-(accepted-on-first-use, regenerated each boot) is simpler but means
-the MCP server has to use `StrictHostKeyChecking=accept-new` every
-boot — acceptable for v1; revisit if it ever generates a useful audit
-signal.
+VM SSH host keys: **persisted via a dedicated virtiofs RW share** at
+host `~/.local/state/research-agent/vm-ssh/` mounted into the guest
+at `/etc/ssh/keys`. `services.openssh.hostKeys` points at that
+directory. First boot generates the keys; every subsequent boot
+reuses them, so the host's pinned `known_hosts` entry stays valid
+across reboots and the MCP server can use `StrictHostKeyChecking=yes`
+(fail-closed on key change). The "accept-new + regenerate each boot"
+alternative is rejected because the second boot would trigger
+`REMOTE HOST IDENTIFICATION HAS CHANGED` and brick `research()`
+until an operator manually deletes the known_hosts line.
 
 ### 7. Files deleted
 
@@ -253,24 +346,54 @@ Migration ships through the nixos-config pipeline.
 
 ### Automated — `tests/dellan-vm.nix`
 
-Add assertions:
+`tests/dellan-vm.nix` runs under the `nixosTest` framework, which
+boots the SUT inside QEMU. Running a **second** QEMU microvm inside
+the test VM requires nested KVM. GitHub Actions's `ubuntu-latest`
+runners with KVM nested-virt expose `/dev/kvm` — already in use by
+the existing test suite — so nested microvm boot is feasible there.
+On developer machines without nested KVM (e.g. some laptops),
+microvm.nix with `hypervisor = "qemu"` can fall back to TCG, accepting
+a slower boot. CI is the authoritative gate either way.
 
-1. `systemctl is-active microvm@research-agent.service` returns 0.
-2. SSH probe: `ssh -p 2223 -o BatchMode=yes -o ConnectTimeout=5
+Assertions (in order, each blocking):
+
+1. **Module evaluates + builds.** Confirmed implicitly by reaching the
+   test phase — failure here means the new module is broken, no
+   point running the rest.
+2. **`microvm@research-agent.service` becomes active** within the
+   test's 90s window. Failure here means the inner VM can't boot
+   under nested-KVM-on-TCG conditions; the spec switches plan B
+   (downgrade to a build-only check + move end-to-end to interactive
+   smoke).
+3. **SSH probe:** `ssh -p 2223 -o BatchMode=yes -o ConnectTimeout=5
    -o StrictHostKeyChecking=no agent@127.0.0.1 echo ok` returns `ok`.
-3. Egress allowlist active: from inside the VM,
-   `curl -sS -o /dev/null -w "%{http_code}" https://example.com
-   --max-time 5` fails (connect refused or timeout). Same probe
-   against `https://api.exa.ai` returns HTTP 200/403/4xx (any
-   non-zero connect).
-4. virtiofs mounts present:
-   `findmnt /workspace` and `findmnt /out` both return 0.
-5. End-to-end smoke: invoke `research()` via the MCP wrapper inside
-   the test VM with `depth=fast` (direct Exa, no agent — fastest
-   gate). Confirm a wrapped report comes back. Optional: `depth=normal`
-   gated behind a longer timeout for the full round-trip.
+4. **virtiofs mounts present in guest:**
+   `ssh ... findmnt /workspace` and `ssh ... findmnt /out` both
+   return 0.
+5. **virtiofs uid round-trip:** create a file in `/out` from the guest
+   `agent` user, verify host sees it owned by `jonathan` (uid 1000).
+6. **Egress allowlist active.** From inside the guest:
+   - `curl -sS -o /dev/null -w "%{http_code}" --max-time 5
+     https://example.com` fails (connect refused / timeout). **This
+     is a blocking assertion** — SLIRP NAT semantics interacting
+     with nftables drop policy is the single biggest risk in the
+     migration; if this passes locally and fails on CI (or vice
+     versa), implementation pauses for diagnosis before merge.
+   - `curl -sS -o /dev/null --max-time 5 https://api.exa.ai`
+     completes the TCP handshake (HTTP 200/403/4xx all acceptable).
+7. **End-to-end smoke:** invoke `research(prompt, depth="fast")` via
+   the MCP wrapper inside the test VM. `fast` is the direct-Exa path
+   (no agent, no nested bwrap inside the inner VM) — fastest, most
+   reliable end-to-end signal. A `depth="normal"` smoke gated behind
+   a longer test timeout is **opt-in** (skipped on CI by default,
+   runnable locally); the inner bwrap + claude CLI inside a nested
+   QEMU is a lot of moving parts to gate every PR on.
 
-This is the `dellan-vm` test that runs in GitHub Actions on PR.
+If assertion 2 fails on CI even after debugging, plan B: the
+automated test downgrades to "module evaluates + activation script
+of `microvm@research-agent.service` exists in dellan toplevel". The
+full end-to-end then lives only in the interactive `nix run
+.#feature-vm` smoke (still pre-PR per the SessionStart HARD RULE).
 
 ### Interactive — `nixos-agent-testing` skill
 
@@ -297,20 +420,38 @@ repo's deleted files are restored from the companion PR's revert.
 
 ## Implementation order (sketch — full plan via writing-plans skill)
 
-1. nixos-config worktree: add microvm.nix flake input + host module
-   import; write the new `research-agent-microvm.nix` module
-   end-to-end; extend `tests/dellan-vm.nix`. Verify via
-   `nix build .#checks.x86_64-linux.dellan-vm`.
-2. Interactive smoke via `nix run .#feature-vm`.
-3. research-agent repo: swap `_run_agent` to SSH transport behind an
-   env flag so the same MCP server can talk to either docker or
-   microvm during cutover. CI verifies the SSH path.
-4. nixos-config PR: flip the host's import from
-   `research-agent-container.nix` to `research-agent-microvm.nix`.
-   Merge → webhook deploy.
-5. Companion PR in research-agent: delete `.devcontainer/`,
-   `scripts/container-entrypoint.sh`, `scripts/init-firewall.sh`,
-   the docker-fallback branch in `_run_agent`. Update README.
+Atomic cutover (no env-flag dual-mode). The NixOS rebuild boundary
+already gives us an atomic deploy + rollback; emulating a Docker-era
+feature flag inside the MCP server adds branches with no upside.
+
+1. **research-agent repo PR** (lands first, no deploy impact): swap
+   `_run_agent` to SSH transport (the only transport), update
+   stdin protocol to 4 fields, update README + architecture diagram,
+   delete `.devcontainer/Dockerfile`,
+   `.devcontainer/devcontainer.json`,
+   `scripts/container-entrypoint.sh`,
+   `scripts/init-firewall.sh`. CI (host-side pytest) verifies the
+   SSH transport with a mocked SSH endpoint. The old
+   `research-agent-container.service` still works because nothing on
+   the deployed `dellan` references the deleted files yet — the
+   docker module builds the image from a git checkout, but the
+   deployed image already exists from the previous boot.
+2. **nixos-config worktree**: pin `inputs.microvm`, run the
+   `nix eval` pre-flight diff on `nixosConfigurations.dellan`, write
+   `modules/nixos/research-agent-microvm.nix`, add the two new
+   agenix entries, extend `tests/dellan-vm.nix`. Verify locally
+   via `nix build .#checks.x86_64-linux.dellan-vm`.
+3. **Interactive smoke** via `nix run .#feature-vm` (mandatory per
+   SessionStart HARD RULE — module contains branching logic and a
+   multistep activation script).
+4. **nixos-config PR**: flip the dellan host's import from
+   `research-agent-container.nix` to `research-agent-microvm.nix`,
+   delete `research-agent-container.nix`. CI runs the extended
+   `dellan-vm` test. Merge → webhook auto-deploys to dellan.
+5. **Post-deploy verification**: from a fresh terminal on dellan,
+   run a `research(depth="normal")` end-to-end via the live MCP
+   server. Confirm wrapped report. Capture
+   `journalctl -u microvm@research-agent.service` baseline.
 
 ## Open questions
 
