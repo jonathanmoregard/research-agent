@@ -98,6 +98,14 @@ trap 'rm -f "${RENDERED_MCP}"' EXIT
 # No /lib, /lib64, /sbin at the root. Binding those (as the docker era
 # did) fails with "Can't find source path /lib".
 HOME_DIR="/home/agent"
+# Strip env vars that nested `claude -p` inherits and that trigger a
+# known ~50%-rate hang when the child runs under CLAUDECODE=1 +
+# CLAUDE_CODE_ENTRYPOINT=cli (anthropic/claude-code#26190). The MCP
+# server spawning us already runs under those vars on the host; though
+# they shouldn't propagate through ssh-into-microvm, belt-and-braces
+# unset is cheap.
+unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
+
 bwrap \
   --ro-bind /nix/store /nix/store \
   --ro-bind /run/current-system /run/current-system \
@@ -118,12 +126,14 @@ bwrap \
   --unshare-ipc \
   --die-with-parent \
   --new-session \
+  --as-pid-1 \
   --chdir "${AGENT_DIR}" \
   --setenv HOME "${HOME_DIR}" \
   --setenv PATH "/run/current-system/sw/bin:/run/current-system/sw/sbin" \
   --setenv RESEARCH_SCRATCH_PATH "${SCRATCH_FILE}" \
   --setenv EXA_API_KEY "${EXA_API_KEY}" \
   --setenv TAVILY_API_KEY "${TAVILY_API_KEY}" \
+  --setenv CLAUDE_STREAM_IDLE_TIMEOUT_MS "1800000" \
   -- \
   claude -p "${PROMPT_CONTENT}" \
     --add-dir /scratch \
