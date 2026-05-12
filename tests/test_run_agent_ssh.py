@@ -119,3 +119,52 @@ def test_run_agent_timeout_propagates():
     with patch.object(subprocess, "run", side_effect=fake_run):
         with pytest.raises(subprocess.TimeoutExpired):
             server._run_agent(prompt="x", report_id="0" * 32, depth="normal")
+
+
+def test_run_agent_empty_secrets_still_ships_four_fields(monkeypatch):
+    """If _secrets() returns {} the stdin payload still has exactly four
+    NUL-terminated fields (empty strings for the three missing secrets,
+    then the prompt). The guest-side bash reads four fields regardless;
+    auth then fails inside the agent layer with a clear claude/exa/tavily
+    error rather than silently desynchronising the stdin protocol."""
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+    server = _import_server()
+    # Stub keyring lookups to None so no secrets land in the cache.
+    monkeypatch.setattr(server, "_keyring_lookup", lambda key: None)
+    server.SECRETS_CACHE.clear()
+
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["input"] = kwargs.get("input", "")
+        return MagicMock(returncode=0, stdout="DONE\n", stderr="")
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        server._run_agent(
+            prompt="hello world",
+            report_id="cafef00d" * 4,
+            depth="normal",
+        )
+
+    parts = captured["input"].split("\0")
+    assert parts[-1] == ""
+    fields = parts[:-1]
+    assert len(fields) == 4, f"expected 4 fields with empty secrets, got {len(fields)}"
+    assert fields[0] == ""  # claude
+    assert fields[1] == ""  # exa
+    assert fields[2] == ""  # tavily
+    assert "hello world" in fields[3]
+
+
+def test_ssh_settings_empty_env_falls_through_to_default(monkeypatch):
+    """`export RESEARCH_SSH_KEY=` (empty) must NOT poison ssh's -i path.
+    Matches the home-manager wrapper's `${VAR:-default}` semantics."""
+    monkeypatch.setenv("RESEARCH_SSH_KEY", "")
+    monkeypatch.setenv("RESEARCH_SSH_HOST", "")
+    server = _import_server()
+    settings = server._ssh_settings()
+    assert settings["key"] == "/run/agenix/research-agent-host-key"
+    assert settings["host"] == "127.0.0.1"

@@ -7,19 +7,23 @@ Exposes one tool:
 
 Flow per call:
   1. Host MCP server receives prompt.
-  2. Writes prompt to a temp file on the host.
-  3. `docker exec` into the long-running research container, which runs
-     scripts/run-agent.sh. That script spawns a fresh bubblewrap jail —
-     new tmpfs $HOME, new tmpfs /tmp, read-only system, writable-only
-     to one pre-created report file under /out/<uuid>.md.
+  2. ssh into the long-running research-agent microvm on 127.0.0.1:2223
+     (port-forwarded by microvm.nix from the guest's port 22). Four
+     null-terminated fields (claude_token, exa, tavily, prompt_body) ship
+     over stdin; a guest-side inline bash writes the prompt to a tmp
+     file under the agent user's $HOME and execs scripts/run-agent.sh.
+  3. scripts/run-agent.sh spawns a fresh bubblewrap jail — new tmpfs
+     $HOME, new tmpfs /tmp, read-only system, writable-only to one
+     pre-created report file under /out/<uuid>.md (virtiofs share of
+     the host's reports/ dir).
   4. When bwrap exits, tmpfs is reaped — no state leaks to the next call.
-  5. The report lands in the host `reports/` dir (bind-mounted at /out).
+  5. The report lands in the host `reports/` dir (virtiofs RW share).
   6. Scanner runs on the host, moves file out of scratch-equivalent
      staging (here: the file is already in reports/, so scanner either
      approves or we delete + return error).
 
-The container stays hot so there is no per-call startup cost. Per-call
-state isolation is enforced by bubblewrap, not by container restart.
+The microvm stays hot so there is no per-call startup cost. Per-call
+state isolation is enforced by bubblewrap, not by VM restart.
 """
 from __future__ import annotations
 
@@ -152,17 +156,24 @@ def _ssh_settings() -> dict[str, str]:
     (NixOS home-manager wrapper, agenix-driven exports) that set these
     after the server is loaded are honoured. Also makes tests easier:
     monkeypatched env vars take effect without forcing a module reload.
+
+    Uses `os.environ.get(...) or default` (not `.get(name, default)`) so
+    an empty-string env var falls through to the default. Mirrors the
+    `${VAR:-default}` semantics in the home-manager wrapper — a
+    `export RESEARCH_SSH_KEY=` ("unset") shouldn't poison the ssh -i
+    arg with an empty path.
     """
     return {
-        "host": os.environ.get("RESEARCH_SSH_HOST", "127.0.0.1"),
-        "port": os.environ.get("RESEARCH_SSH_PORT", "2223"),
-        "key": os.environ.get(
-            "RESEARCH_SSH_KEY", "/run/agenix/research-agent-host-key"
+        "host": os.environ.get("RESEARCH_SSH_HOST") or "127.0.0.1",
+        "port": os.environ.get("RESEARCH_SSH_PORT") or "2223",
+        "key": (
+            os.environ.get("RESEARCH_SSH_KEY")
+            or "/run/agenix/research-agent-host-key"
         ),
-        "user": os.environ.get("RESEARCH_SSH_USER", "agent"),
-        "known_hosts": os.environ.get(
-            "RESEARCH_SSH_KNOWN_HOSTS",
-            str(Path.home() / ".cache" / "research-agent" / "known_hosts"),
+        "user": os.environ.get("RESEARCH_SSH_USER") or "agent",
+        "known_hosts": (
+            os.environ.get("RESEARCH_SSH_KNOWN_HOSTS")
+            or str(Path.home() / ".cache" / "research-agent" / "known_hosts")
         ),
     }
 
@@ -519,6 +530,18 @@ def _log_agent_failure(report_id: str, exit_code: int, output: str) -> None:
         "exit_code": exit_code,
         "output": output,
     }
+    # Operator-facing remediation hint for the one failure mode that
+    # has a known one-line fix. The hint goes only into the quarantined
+    # audit record (deny-listed for Read/Grep), so an operator reading
+    # the file from a bare terminal sees what to do. The MCP response
+    # to the caller stays opaque.
+    if "REMOTE HOST IDENTIFICATION HAS CHANGED" in output:
+        record["hint"] = (
+            "Inner microvm SSH host key changed. Recovery: "
+            "`rm ~/.cache/research-agent/known_hosts` then retry the call. "
+            "Most likely cause: /var/lib/research-agent/vm-ssh wiped or "
+            "the microvm regenerated its host keys."
+        )
     try:
         _append_jsonl_via_dirfd(log_path, json.dumps(record, default=str) + "\n")
     except OSError as e:
