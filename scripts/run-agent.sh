@@ -20,6 +20,16 @@ REPORT_UUID="${1:?uuid required}"
 PROMPT_FILE="${2:?prompt file required}"
 DEPTH="${RESEARCH_DEPTH:-normal}"
 
+# Defense-in-depth: gate the uuid to 32 lowercase hex chars before it
+# reaches any path expansion below (touch / bwrap --bind / mktemp).
+# The MCP server already validates with `uuid.uuid4().hex`, so a bad
+# value can only arrive via direct ssh-into-microvm — but the cost of
+# checking here is one regex match.
+if ! [[ "${REPORT_UUID}" =~ ^[a-f0-9]{32}$ ]]; then
+  echo "run-agent: invalid REPORT_UUID '${REPORT_UUID}'" >&2
+  exit 4
+fi
+
 # Per-depth tool allowlist. The prompt tells the agent *how* to use these;
 # we restrict *which* are callable at all.
 EXA_TOOLS="mcp__exa__web_search_exa,mcp__exa__web_fetch_exa"
@@ -113,7 +123,7 @@ bwrap \
   --ro-bind /etc /etc \
   --ro-bind /bin /bin \
   --ro-bind /usr /usr \
-  --ro-bind /proc /proc \
+  --proc /proc \
   --dev /dev \
   --tmpfs /tmp \
   --tmpfs "${HOME_DIR}" \
