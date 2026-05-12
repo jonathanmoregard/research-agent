@@ -88,18 +88,27 @@ python3 -c 'import os,sys; sys.stdout.write(os.path.expandvars(sys.stdin.read())
 trap 'rm -f "${RENDERED_MCP}"' EXIT
 
 # Build the bwrap invocation. Each run = fresh ephemeral FS.
+#
+# NixOS guest layout (post-microvm migration):
+#   - /nix/store         — all binaries + libraries live here
+#   - /run/current-system/sw/bin — system PATH (symlinks into /nix/store)
+#   - /etc                — system config (incl. resolv.conf, nsswitch)
+#   - /bin/sh             — symlink to bash in /nix/store
+#   - /usr/bin/env        — symlink to coreutils
+# No /lib, /lib64, /sbin at the root. Binding those (as the docker era
+# did) fails with "Can't find source path /lib".
+HOME_DIR="/home/agent"
 bwrap \
-  --ro-bind /usr /usr \
+  --ro-bind /nix/store /nix/store \
+  --ro-bind /run/current-system /run/current-system \
+  --ro-bind /run/systemd/resolve /run/systemd/resolve \
   --ro-bind /etc /etc \
-  --ro-bind /lib /lib \
-  --ro-bind /lib64 /lib64 \
   --ro-bind /bin /bin \
-  --ro-bind /sbin /sbin \
+  --ro-bind /usr /usr \
   --ro-bind /proc /proc \
   --dev /dev \
   --tmpfs /tmp \
-  --tmpfs /home/vscode \
-  --ro-bind /home/vscode/.local /home/vscode/.local \
+  --tmpfs "${HOME_DIR}" \
   --ro-bind "${AGENT_DIR}" "${AGENT_DIR}" \
   --ro-bind "${RENDERED_MCP}" "${AGENT_DIR}/.mcp.json" \
   --bind "${FINAL_FILE}" "${SCRATCH_FILE}" \
@@ -110,8 +119,8 @@ bwrap \
   --die-with-parent \
   --new-session \
   --chdir "${AGENT_DIR}" \
-  --setenv HOME "/home/vscode" \
-  --setenv PATH "/home/vscode/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --setenv HOME "${HOME_DIR}" \
+  --setenv PATH "/run/current-system/sw/bin:/run/current-system/sw/sbin" \
   --setenv RESEARCH_SCRATCH_PATH "${SCRATCH_FILE}" \
   --setenv EXA_API_KEY "${EXA_API_KEY}" \
   --setenv TAVILY_API_KEY "${TAVILY_API_KEY}" \
