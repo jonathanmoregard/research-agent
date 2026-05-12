@@ -359,7 +359,17 @@ def _run_agent(prompt: str, report_id: str, depth: Depth) -> tuple[int, str]:
         "-i", ssh["key"],
         "-p", str(ssh["port"]),
         "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=yes",
+        # accept-new: trust-on-first-use, then strict. Loopback to a
+        # single-tenant microvm on the same host — MITM window is
+        # effectively zero. The alternative (StrictHostKeyChecking=yes)
+        # would fail the first research() call after every dellan
+        # deploy with "Host key verification failed" because nothing
+        # pre-seeds known_hosts. After the first connect the fingerprint
+        # is pinned and subsequent calls verify strictly. Legitimate
+        # key rotation (vm-ssh dir wiped) then surfaces as REMOTE HOST
+        # IDENTIFICATION HAS CHANGED — fail-loud, exactly the semantics
+        # the spec wants. Fix: rm ~/.cache/research-agent/known_hosts.
+        "-o", "StrictHostKeyChecking=accept-new",
         "-o", f"UserKnownHostsFile={ssh['known_hosts']}",
         "-o", "ServerAliveInterval=30",
         f"{ssh['user']}@{ssh['host']}",
@@ -683,7 +693,7 @@ def research(prompt: str, depth: str = "normal") -> dict:
             return {"status": "error", "error": f"agent timeout after {AGENT_TIMEOUT}s"}
         except FileNotFoundError as e:
             report_path.unlink(missing_ok=True)
-            return {"status": "error", "error": f"docker not available: {e}"}
+            return {"status": "error", "error": f"ssh not available: {e}"}
         except Exception:
             # Exception message may include attacker-influenced content
             # (tracebacks carry whatever the agent was handling when it
