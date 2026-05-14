@@ -20,6 +20,16 @@ REPORT_UUID="${1:?uuid required}"
 PROMPT_FILE="${2:?prompt file required}"
 DEPTH="${RESEARCH_DEPTH:-normal}"
 
+# Defense-in-depth: gate the uuid to 32 lowercase hex chars before it
+# reaches any path expansion below (touch / bwrap --bind / mktemp).
+# The MCP server already validates with `uuid.uuid4().hex`, so a bad
+# value can only arrive via direct ssh-into-microvm — but the cost of
+# checking here is one regex match.
+if ! [[ "${REPORT_UUID}" =~ ^[a-f0-9]{32}$ ]]; then
+  echo "run-agent: invalid REPORT_UUID '${REPORT_UUID}'" >&2
+  exit 4
+fi
+
 # Per-depth tool allowlist. The prompt tells the agent *how* to use these;
 # we restrict *which* are callable at all.
 EXA_TOOLS="mcp__exa__web_search_exa,mcp__exa__web_fetch_exa"
@@ -73,24 +83,50 @@ PROMPT_CONTENT="$(cat "${PROMPT_FILE}")"
 # Render a resolved copy with env substitution and bind-mount it over the
 # read-only original inside the jail. Ephemeral per call; cleaned up on exit.
 RENDERED_MCP=$(mktemp --suffix=.mcp.json)
-chmod 644 "${RENDERED_MCP}"
+# Invariant: the rendered file holds substituted EXA_API_KEY +
+# TAVILY_API_KEY values. It MUST live on /tmp (in-VM disk), never on
+# /out (virtiofs share, visible to the host). Without this guard, a
+# future operator who exports TMPDIR=/out would silently leak keys to
+# the host's reports/ dir.
+case "${RENDERED_MCP}" in
+  /tmp/*) ;;
+  *) echo "run-agent: refusing to render .mcp.json outside /tmp (got ${RENDERED_MCP})" >&2; exit 3 ;;
+esac
+chmod 600 "${RENDERED_MCP}"
 python3 -c 'import os,sys; sys.stdout.write(os.path.expandvars(sys.stdin.read()))' \
   < "${AGENT_DIR}/.mcp.json" > "${RENDERED_MCP}"
 trap 'rm -f "${RENDERED_MCP}"' EXIT
 
 # Build the bwrap invocation. Each run = fresh ephemeral FS.
+#
+# NixOS guest layout (post-microvm migration):
+#   - /nix/store         — all binaries + libraries live here
+#   - /run/current-system/sw/bin — system PATH (symlinks into /nix/store)
+#   - /etc                — system config (incl. resolv.conf, nsswitch)
+#   - /bin/sh             — symlink to bash in /nix/store
+#   - /usr/bin/env        — symlink to coreutils
+# No /lib, /lib64, /sbin at the root. Binding those (as the docker era
+# did) fails with "Can't find source path /lib".
+HOME_DIR="/home/agent"
+# Strip env vars that nested `claude -p` inherits and that trigger a
+# known ~50%-rate hang when the child runs under CLAUDECODE=1 +
+# CLAUDE_CODE_ENTRYPOINT=cli (anthropic/claude-code#26190). The MCP
+# server spawning us already runs under those vars on the host; though
+# they shouldn't propagate through ssh-into-microvm, belt-and-braces
+# unset is cheap.
+unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
+
 bwrap \
-  --ro-bind /usr /usr \
+  --ro-bind /nix/store /nix/store \
+  --ro-bind /run/current-system /run/current-system \
+  --ro-bind /run/systemd/resolve /run/systemd/resolve \
   --ro-bind /etc /etc \
-  --ro-bind /lib /lib \
-  --ro-bind /lib64 /lib64 \
   --ro-bind /bin /bin \
-  --ro-bind /sbin /sbin \
-  --ro-bind /proc /proc \
+  --ro-bind /usr /usr \
+  --proc /proc \
   --dev /dev \
   --tmpfs /tmp \
-  --tmpfs /home/vscode \
-  --ro-bind /home/vscode/.local /home/vscode/.local \
+  --tmpfs "${HOME_DIR}" \
   --ro-bind "${AGENT_DIR}" "${AGENT_DIR}" \
   --ro-bind "${RENDERED_MCP}" "${AGENT_DIR}/.mcp.json" \
   --bind "${FINAL_FILE}" "${SCRATCH_FILE}" \
@@ -100,12 +136,14 @@ bwrap \
   --unshare-ipc \
   --die-with-parent \
   --new-session \
+  --as-pid-1 \
   --chdir "${AGENT_DIR}" \
-  --setenv HOME "/home/vscode" \
-  --setenv PATH "/home/vscode/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  --setenv HOME "${HOME_DIR}" \
+  --setenv PATH "/run/current-system/sw/bin:/run/current-system/sw/sbin" \
   --setenv RESEARCH_SCRATCH_PATH "${SCRATCH_FILE}" \
   --setenv EXA_API_KEY "${EXA_API_KEY}" \
   --setenv TAVILY_API_KEY "${TAVILY_API_KEY}" \
+  --setenv CLAUDE_STREAM_IDLE_TIMEOUT_MS "1800000" \
   -- \
   claude -p "${PROMPT_CONTENT}" \
     --add-dir /scratch \

@@ -7,25 +7,30 @@ Exposes one tool:
 
 Flow per call:
   1. Host MCP server receives prompt.
-  2. Writes prompt to a temp file on the host.
-  3. `docker exec` into the long-running research container, which runs
-     scripts/run-agent.sh. That script spawns a fresh bubblewrap jail —
-     new tmpfs $HOME, new tmpfs /tmp, read-only system, writable-only
-     to one pre-created report file under /out/<uuid>.md.
+  2. ssh into the long-running research-agent microvm on 127.0.0.1:2223
+     (port-forwarded by microvm.nix from the guest's port 22). Four
+     null-terminated fields (claude_token, exa, tavily, prompt_body) ship
+     over stdin; a guest-side inline bash writes the prompt to a tmp
+     file under the agent user's $HOME and execs scripts/run-agent.sh.
+  3. scripts/run-agent.sh spawns a fresh bubblewrap jail — new tmpfs
+     $HOME, new tmpfs /tmp, read-only system, writable-only to one
+     pre-created report file under /out/<uuid>.md (virtiofs share of
+     the host's reports/ dir).
   4. When bwrap exits, tmpfs is reaped — no state leaks to the next call.
-  5. The report lands in the host `reports/` dir (bind-mounted at /out).
+  5. The report lands in the host `reports/` dir (virtiofs RW share).
   6. Scanner runs on the host, moves file out of scratch-equivalent
      staging (here: the file is already in reports/, so scanner either
      approves or we delete + return error).
 
-The container stays hot so there is no per-call startup cost. Per-call
-state isolation is enforced by bubblewrap, not by container restart.
+The microvm stays hot so there is no per-call startup cost. Per-call
+state isolation is enforced by bubblewrap, not by VM restart.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import shlex
 import shutil
 import stat as stat_mod
 import subprocess
@@ -140,17 +145,37 @@ def _secrets() -> dict[str, str]:
             SECRETS_CACHE[name] = val
     return SECRETS_CACHE
 
-# Name of the long-running container that holds the agent. Matches the
-# `name` field in .devcontainer/devcontainer.json (actual runtime name will
-# vary with the orchestrator — override via env).
-CONTAINER = os.environ.get("RESEARCH_CONTAINER", "research-agent")
-
 # Timeout for a single research call (seconds).
 AGENT_TIMEOUT = int(os.environ.get("RESEARCH_AGENT_TIMEOUT", "600"))
 
-# Where the container sees the agent scripts. Matches the workspace mount
-# created by devcontainer.json (default: /workspace).
-CONTAINER_WORKSPACE = os.environ.get("RESEARCH_CONTAINER_WORKSPACE", "/workspace")
+
+def _ssh_settings() -> dict[str, str]:
+    """Resolve SSH transport settings from env at call time.
+
+    Read on every invocation rather than at module import so wrappers
+    (NixOS home-manager wrapper, agenix-driven exports) that set these
+    after the server is loaded are honoured. Also makes tests easier:
+    monkeypatched env vars take effect without forcing a module reload.
+
+    Uses `os.environ.get(...) or default` (not `.get(name, default)`) so
+    an empty-string env var falls through to the default. Mirrors the
+    `${VAR:-default}` semantics in the home-manager wrapper — a
+    `export RESEARCH_SSH_KEY=` ("unset") shouldn't poison the ssh -i
+    arg with an empty path.
+    """
+    return {
+        "host": os.environ.get("RESEARCH_SSH_HOST") or "127.0.0.1",
+        "port": os.environ.get("RESEARCH_SSH_PORT") or "2223",
+        "key": (
+            os.environ.get("RESEARCH_SSH_KEY")
+            or "/run/agenix/research-agent-host-key"
+        ),
+        "user": os.environ.get("RESEARCH_SSH_USER") or "agent",
+        "known_hosts": (
+            os.environ.get("RESEARCH_SSH_KNOWN_HOSTS")
+            or str(Path.home() / ".cache" / "research-agent" / "known_hosts")
+        ),
+    }
 
 # Per-depth guidance the agent receives. Tools themselves are gated via
 # --allowed-tools in run-agent.sh; the prompt tells the agent how aggressively
@@ -272,14 +297,39 @@ PROMPT_TEMPLATE = (
 )
 
 
+# Guest-side inline bash run by sshd inside the microvm. Reads four
+# null-terminated fields from stdin (claude_token, exa, tavily,
+# prompt_body), writes the prompt to a tmp file under $HOME, then
+# exec's run-agent.sh with (uuid, prompt_file). The EXIT trap cleans
+# the tmp file even if SSH disconnects mid-call.
+#
+# Script is passed via `bash -c` (argv) so stdin can carry the
+# four binary-safe secret fields without conflicting with the
+# script source.
+_GUEST_SCRIPT = (
+    "set -euo pipefail; "
+    "IFS= read -r -d '' CLAUDE_CODE_OAUTH_TOKEN; "
+    "IFS= read -r -d '' EXA_API_KEY; "
+    "IFS= read -r -d '' TAVILY_API_KEY; "
+    "IFS= read -r -d '' PROMPT_BODY; "
+    "export CLAUDE_CODE_OAUTH_TOKEN EXA_API_KEY TAVILY_API_KEY; "
+    'TMP=$(mktemp -p "$HOME" research-prompt.XXXXXX); '
+    'chmod 600 "$TMP"; '
+    "trap 'rm -f \"$TMP\"' EXIT; "
+    'printf %s "$PROMPT_BODY" > "$TMP"; '
+    'exec /workspace/scripts/run-agent.sh "$1" "$TMP"'
+)
+
+
 def _run_agent(prompt: str, report_id: str, depth: Depth) -> tuple[int, str]:
-    """Run a single research call inside the container's bubblewrap jail.
+    """Run a single research call inside the microvm's bubblewrap jail.
+
+    Connects to the agent's sshd on RESEARCH_SSH_HOST:RESEARCH_SSH_PORT,
+    streams four null-terminated fields over stdin (three secrets +
+    prompt body), and waits for run-agent.sh inside the VM to complete.
 
     Returns (exit_code, combined_output).
     """
-    # Scratch path *as seen from inside the bwrap jail* — /scratch/<uuid>.md.
-    # The host-visible equivalent is the pre-created reports/<uuid>.md file
-    # that run-agent.sh bind-mounts into /scratch for the jail.
     scratch_path = f"/scratch/{report_id}.md"
     full_prompt = PROMPT_TEMPLATE.format(
         scratch_path=scratch_path,
@@ -287,81 +337,64 @@ def _run_agent(prompt: str, report_id: str, depth: Depth) -> tuple[int, str]:
         prompt=prompt,
     )
 
-    # Ship the prompt into the container via a temp file to avoid shell
-    # quoting issues with arbitrary characters.
-    with tempfile.NamedTemporaryFile(
-        "w", prefix="research-prompt-", suffix=".txt", delete=False
-    ) as tmp:
-        tmp.write(full_prompt)
-        host_prompt_file = tmp.name
-    container_prompt_file = f"/tmp/research-prompt-{report_id}.txt"
+    secrets = _secrets()
+    # Four null-terminated fields. Mirrors the docker-era contract but
+    # carries the prompt body as the fourth field — eliminates the
+    # separate docker-cp step.
+    stdin_payload = "".join(
+        s + "\0"
+        for s in (
+            secrets.get("claude-token", ""),
+            secrets.get("exa-api-key", ""),
+            secrets.get("tavily-api-key", ""),
+            full_prompt,
+        )
+    )
 
-    try:
-        cp = subprocess.run(
-            [
-                "docker",
-                "cp",
-                host_prompt_file,
-                f"{CONTAINER}:{container_prompt_file}",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if cp.returncode != 0:
-            return cp.returncode, f"docker cp failed: {cp.stderr.strip()}"
-        secrets = _secrets()
-        # Secrets via stdin (not `docker exec -e`) so they never appear in the
-        # host's process argv, which any `ps` reader can see. The container
-        # reads exactly three null-terminated values from stdin and exports
-        # them into the environment before handing off to run-agent.sh.
-        stdin_payload = "".join(
-            s + "\0"
-            for s in (
-                secrets.get("claude-token", ""),
-                secrets.get("exa-api-key", ""),
-                secrets.get("tavily-api-key", ""),
-            )
-        )
-        exec_cmd = [
-            "docker",
-            "exec",
-            "-i",
-            # RESEARCH_DEPTH is not a secret, safe via -e.
-            "-e",
-            f"RESEARCH_DEPTH={depth}",
-            CONTAINER,
-            "bash",
-            "-c",
-            # Read three null-terminated fields, export, then run the agent.
-            # Using `read -d ''` gives us null-terminator parsing so newlines
-            # inside a token can't split it.
-            (
-                "IFS= read -r -d '' CLAUDE_CODE_OAUTH_TOKEN; "
-                "IFS= read -r -d '' EXA_API_KEY; "
-                "IFS= read -r -d '' TAVILY_API_KEY; "
-                "export CLAUDE_CODE_OAUTH_TOKEN EXA_API_KEY TAVILY_API_KEY; "
-                f'exec bash "{CONTAINER_WORKSPACE}/scripts/run-agent.sh" '
-                '"$1" "$2"'
-            ),
-            "bash",  # $0 for the inline script
-            report_id,
-            container_prompt_file,
+    ssh = _ssh_settings()
+    Path(ssh["known_hosts"]).parent.mkdir(parents=True, exist_ok=True)
+
+    # The remote command is one shell-joined string: ssh joins all argv
+    # after user@host with spaces and re-parses on the remote side.
+    # Quote each piece explicitly so the script source survives intact.
+    remote_cmd = " ".join(
+        [
+            f"RESEARCH_DEPTH={shlex.quote(str(depth))}",
+            "bash", "-c", shlex.quote(_GUEST_SCRIPT),
+            "bash", shlex.quote(report_id),
         ]
-        result = subprocess.run(
-            exec_cmd,
-            input=stdin_payload,
-            capture_output=True,
-            text=True,
-            timeout=AGENT_TIMEOUT,
-        )
-        return result.returncode, (result.stdout + result.stderr)
-    finally:
-        Path(host_prompt_file).unlink(missing_ok=True)
-        # Best-effort cleanup inside container.
-        subprocess.run(
-            ["docker", "exec", CONTAINER, "rm", "-f", container_prompt_file],
-            capture_output=True,
-        )
+    )
+
+    ssh_cmd = [
+        "ssh",
+        "-i", ssh["key"],
+        "-p", str(ssh["port"]),
+        "-o", "BatchMode=yes",
+        # accept-new: trust-on-first-use, then strict. Loopback to a
+        # single-tenant microvm on the same host — MITM window is
+        # effectively zero. The alternative (StrictHostKeyChecking=yes)
+        # would fail the first research() call after every dellan
+        # deploy with "Host key verification failed" because nothing
+        # pre-seeds known_hosts. After the first connect the fingerprint
+        # is pinned and subsequent calls verify strictly. Legitimate
+        # key rotation (vm-ssh dir wiped) then surfaces as REMOTE HOST
+        # IDENTIFICATION HAS CHANGED — fail-loud, exactly the semantics
+        # the spec wants. Fix: rm ~/.cache/research-agent/known_hosts.
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", f"UserKnownHostsFile={ssh['known_hosts']}",
+        "-o", "ServerAliveInterval=30",
+        f"{ssh['user']}@{ssh['host']}",
+        remote_cmd,
+    ]
+
+    result = subprocess.run(
+        ssh_cmd,
+        input=stdin_payload,
+        capture_output=True,
+        text=True,
+        timeout=AGENT_TIMEOUT,
+    )
+    return result.returncode, (result.stdout + result.stderr)
 
 
 def _scan_text(content: str):
@@ -497,6 +530,18 @@ def _log_agent_failure(report_id: str, exit_code: int, output: str) -> None:
         "exit_code": exit_code,
         "output": output,
     }
+    # Operator-facing remediation hint for the one failure mode that
+    # has a known one-line fix. The hint goes only into the quarantined
+    # audit record (deny-listed for Read/Grep), so an operator reading
+    # the file from a bare terminal sees what to do. The MCP response
+    # to the caller stays opaque.
+    if "REMOTE HOST IDENTIFICATION HAS CHANGED" in output:
+        record["hint"] = (
+            "Inner microvm SSH host key changed. Recovery: "
+            "`rm ~/.cache/research-agent/known_hosts` then retry the call. "
+            "Most likely cause: /var/lib/research-agent/vm-ssh wiped or "
+            "the microvm regenerated its host keys."
+        )
     try:
         _append_jsonl_via_dirfd(log_path, json.dumps(record, default=str) + "\n")
     except OSError as e:
@@ -671,7 +716,7 @@ def research(prompt: str, depth: str = "normal") -> dict:
             return {"status": "error", "error": f"agent timeout after {AGENT_TIMEOUT}s"}
         except FileNotFoundError as e:
             report_path.unlink(missing_ok=True)
-            return {"status": "error", "error": f"docker not available: {e}"}
+            return {"status": "error", "error": f"ssh not available: {e}"}
         except Exception:
             # Exception message may include attacker-influenced content
             # (tracebacks carry whatever the agent was handling when it
