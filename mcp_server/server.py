@@ -28,10 +28,13 @@ state isolation is enforced by bubblewrap, not by VM restart.
 from __future__ import annotations
 
 import json
+import logging
+import logging.handlers
 import os
 import re
 import shlex
 import shutil
+import signal
 import stat as stat_mod
 import subprocess
 import sys
@@ -42,6 +45,47 @@ from pathlib import Path
 from typing import Literal
 
 REPORT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+
+
+_LOG_PATH = Path(
+    os.environ.get("RESEARCH_AGENT_LOG")
+    or (Path.home() / ".cache" / "research-agent" / "server.log")
+)
+
+
+def _install_file_logger() -> logging.Logger:
+    """Wire a rotating file handler at ~/.cache/research-agent/server.log.
+
+    Boot timing + per-call stage timing land here so disconnect-style
+    failures (CC reports MCP server died) can be triaged after the fact.
+    Stderr already goes to CC's mcp-logs jsonl, but stderr is only
+    captured during the connection window — anything after the server
+    binds is dropped. The file persists across server respawns and is
+    safe to tail from outside any Claude Code session.
+    """
+    log = logging.getLogger("research-agent")
+    if getattr(log, "_ra_handler_installed", False):
+        return log
+    try:
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            _LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        )
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s.%(msecs)03d %(levelname)s pid=%(process)d %(name)s %(message)s",
+                datefmt="%Y-%m-%dT%H:%M:%S",
+            )
+        )
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+        log._ra_handler_installed = True  # type: ignore[attr-defined]
+    except OSError as e:
+        print(f"research-agent: file logger init failed: {e}", file=sys.stderr)
+    return log
+
+
+_LOG = _install_file_logger()
 
 # Timing buckets (ms) — reject responses report timings_ms.scan rounded up
 # to the nearest bucket so callers can't fingerprint which scanner layer
@@ -365,6 +409,11 @@ def _run_agent(prompt: str, report_id: str, depth: Depth) -> tuple[int, str]:
         ]
     )
 
+    _LOG.info(
+        "agent dial id=%s depth=%s host=%s port=%s user=%s",
+        report_id, depth, ssh["host"], ssh["port"], ssh["user"],
+    )
+
     ssh_cmd = [
         "ssh",
         "-i", ssh["key"],
@@ -387,12 +436,25 @@ def _run_agent(prompt: str, report_id: str, depth: Depth) -> tuple[int, str]:
         remote_cmd,
     ]
 
-    result = subprocess.run(
-        ssh_cmd,
-        input=stdin_payload,
-        capture_output=True,
-        text=True,
-        timeout=AGENT_TIMEOUT,
+    t0 = time.monotonic()
+    try:
+        result = subprocess.run(
+            ssh_cmd,
+            input=stdin_payload,
+            capture_output=True,
+            text=True,
+            timeout=AGENT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        _LOG.warning(
+            "agent timeout id=%s after=%dms limit=%ds",
+            report_id, int((time.monotonic() - t0) * 1000), AGENT_TIMEOUT,
+        )
+        raise
+    _LOG.info(
+        "agent return id=%s rc=%d wall_ms=%d out_bytes=%d err_bytes=%d",
+        report_id, result.returncode, int((time.monotonic() - t0) * 1000),
+        len(result.stdout), len(result.stderr),
     )
     return result.returncode, (result.stdout + result.stderr)
 
@@ -693,12 +755,17 @@ def research(prompt: str, depth: str = "normal") -> dict:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     report_id = uuid.uuid4().hex
     report_path = REPORTS_DIR / f"{report_id}.md"
+    _LOG.info("research start id=%s depth=%s prompt_len=%d", report_id, depth, len(prompt))
 
     if depth == "fast":
         # Direct server-side Exa call. No container, no agent. Fastest path.
         ok, body = _direct_exa(prompt)
         t_scan_start = time.monotonic()
         agent_ms = int((t_scan_start - t_received) * 1000)
+        _LOG.info(
+            "research direct-exa id=%s ok=%s agent_ms=%d",
+            report_id, ok, agent_ms,
+        )
         if not ok:
             return {
                 "status": "error",
@@ -712,16 +779,25 @@ def research(prompt: str, depth: str = "normal") -> dict:
         try:
             _code, _output = _run_agent(prompt, report_id, depth)  # type: ignore[arg-type]
         except subprocess.TimeoutExpired:
+            _LOG.warning("research timeout id=%s", report_id)
             report_path.unlink(missing_ok=True)
             return {"status": "error", "error": f"agent timeout after {AGENT_TIMEOUT}s"}
         except FileNotFoundError as e:
+            _LOG.error("research ssh-not-found id=%s err=%s", report_id, e)
             report_path.unlink(missing_ok=True)
             return {"status": "error", "error": f"ssh not available: {e}"}
-        except Exception:
+        except Exception as exc:
             # Exception message may include attacker-influenced content
             # (tracebacks carry whatever the agent was handling when it
             # crashed). Keep the response opaque; detail goes to the
-            # agent-failure log in the quarantine zone.
+            # agent-failure log in the quarantine zone. Only the
+            # exception TYPE name is logged here — never str(exc),
+            # never exc_info=True — same discipline as
+            # _scan_error_verdict at server.py:800.
+            _LOG.error(
+                "research invocation-exception id=%s type=%s",
+                report_id, type(exc).__name__,
+            )
             report_path.unlink(missing_ok=True)
             _log_agent_failure(report_id, -1, f"invocation exception")
             return {
@@ -736,6 +812,10 @@ def research(prompt: str, depth: str = "normal") -> dict:
             # can shape the output to echo payloads on crash. Don't return
             # ANY of it to the caller; log the full tail to the quarantine
             # zone so an operator can diagnose from a bare terminal.
+            _LOG.warning(
+                "research agent-fail id=%s rc=%d agent_ms=%d (see agent_failures.jsonl in quarantine for output)",
+                report_id, _code, agent_ms,
+            )
             _log_agent_failure(report_id, _code, _output)
             report_path.unlink(missing_ok=True)
             total_ms = int((time.monotonic() - t_received) * 1000)
@@ -746,6 +826,7 @@ def research(prompt: str, depth: str = "normal") -> dict:
                 "timings_ms": {"agent": agent_ms, "scan": 0, "total": total_ms},
             }
         if report_path.stat().st_size == 0:
+            _LOG.warning("research empty-output id=%s rc=%d", report_id, _code)
             report_path.unlink(missing_ok=True)
             total_ms = int((time.monotonic() - t_received) * 1000)
             return {
@@ -1019,7 +1100,12 @@ def _maybe_update_scanner() -> None:
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 
+    t_remote = time.monotonic()
     remote_sha = _resolve_scanner_remote_sha(log)
+    _LOG.info(
+        "boot scanner-ls-remote took_ms=%d resolved=%s",
+        int((time.monotonic() - t_remote) * 1000), remote_sha or "none",
+    )
     if remote_sha is None:
         return
 
@@ -1083,11 +1169,17 @@ def _boot_smoke() -> None:
     log = logging.getLogger("research-agent.boot")
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    t0 = time.monotonic()
     try:
         run_smoke(log_info=log.info, log_error=log.error)
     except SmokeFailure as e:
+        _LOG.error(
+            "boot smoke FAILED took_ms=%d reason=%s",
+            int((time.monotonic() - t0) * 1000), e.reason,
+        )
         log.error("research-agent: aborting startup, scanner self-test failed: %s", e.reason)
         raise SystemExit(2) from e
+    _LOG.info("boot smoke ok took_ms=%d", int((time.monotonic() - t0) * 1000))
 
 
 def main() -> None:
