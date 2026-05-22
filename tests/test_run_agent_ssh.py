@@ -132,8 +132,10 @@ def test_run_agent_empty_secrets_still_ships_four_fields(monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
 
     server = _import_server()
-    # Stub keyring lookups to None so no secrets land in the cache.
+    # Stub keyring + claude-credentials lookups so no secrets land in
+    # the cache and the wire-format check sees a true empty payload.
     monkeypatch.setattr(server, "_keyring_lookup", lambda key: None)
+    monkeypatch.setattr(server, "_load_claude_credentials_token", lambda: None)
     server.SECRETS_CACHE.clear()
 
     captured = {}

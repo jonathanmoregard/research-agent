@@ -160,34 +160,126 @@ _SECRET_ENV = {
 }
 
 
-def _secrets() -> dict[str, str]:
-    """Load secrets once per server startup and cache them in-process.
+_CLAUDE_CREDENTIALS_PATH = Path(
+    os.environ.get("CLAUDE_CREDENTIALS_FILE")
+    or (Path.home() / ".claude" / ".credentials.json")
+)
 
-    Tokens are never written to disk. The cache lives only in the MCP server's
-    memory; the server passes them into the container via `docker exec -e`
-    for each call so they are not visible in the container's static env
-    (docker inspect).
 
-    Resolution order: env var first (per `_SECRET_ENV`), GNOME keyring
-    fallback. An empty-string env var falls through to the keyring on
-    purpose — operators who `export X=` likely meant "unset". Lets
-    agenix-driven NixOS deployments populate via wrapper-exported env
-    without touching secret-tool.
+def _load_claude_credentials_token() -> str | None:
+    """Read the OAuth access token from Claude Code's credentials file.
 
-    Scope: this function returns secrets needed by the *agent-side* paths
-    (`claude-token`, `exa-api-key`, `tavily-api-key`). Scanner keys
-    (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) are read directly from
-    `os.environ` inside `injection_scanner.honeypot` and don't pass through
-    here — keep them out of `_SECRET_ENV` to avoid implying parity that
-    isn't enforced at this layer.
+    Path: `$CLAUDE_CREDENTIALS_FILE` or `~/.claude/.credentials.json`.
+    Key:  `.claudeAiOauth.accessToken`.
+
+    The file is owned and rewritten by `claude /login` (Claude Code's own
+    auth flow); reading it lets research-agent inherit token refreshes
+    automatically — no manual `secret-tool store` step. The token still
+    flows through the existing channel (`_secrets()` → ssh stdin) so the
+    agent inside the microvm receives a fresh value on every call.
+
+    Opened O_NOFOLLOW so a planted symlink at the credentials path cannot
+    redirect the read elsewhere; mirrors the discipline used elsewhere in
+    this module (see `_safe_read`). Cap on bytes-read is generous (16 KiB)
+    — a real credentials file is well under 1 KiB.
+
+    Returns the access token (non-empty string) or None on any error.
+    Never logs the file contents, the token, or os errors carrying the
+    path. The MCP layer above turns a missing token into a deliberate
+    agent-side failure (claude -p exits with "Not logged in"), which the
+    file logger captures by category.
     """
-    if SECRETS_CACHE:
-        return SECRETS_CACHE
-    for name, env_var in _SECRET_ENV.items():
-        val = os.environ.get(env_var) or _keyring_lookup(name)
+    try:
+        fd = os.open(
+            _CLAUDE_CREDENTIALS_PATH,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode):
+            return None
+        if st.st_size > 16 * 1024:
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            fd = -1
+            data = f.read(16 * 1024 + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    try:
+        creds = json.loads(data)
+    except json.JSONDecodeError:
+        return None
+    tok = creds.get("claudeAiOauth", {}).get("accessToken") if isinstance(creds, dict) else None
+    if isinstance(tok, str) and tok:
+        return tok
+    return None
+
+
+def _resolve_secret(name: str) -> str | None:
+    """Resolve one secret. Env first; claude-token also checks the
+    credentials file; keyring fallback last.
+
+    Empty-string env var ("") falls through to subsequent sources —
+    operators who `export X=` typically meant "unset", not "force empty".
+    """
+    env_var = _SECRET_ENV.get(name)
+    if env_var:
+        val = os.environ.get(env_var)
+        if val:
+            return val
+    if name == "claude-token":
+        val = _load_claude_credentials_token()
+        if val:
+            return val
+    return _keyring_lookup(name)
+
+
+def _secrets() -> dict[str, str]:
+    """Load secrets per server startup and re-resolve `claude-token`
+    per call so token refreshes by `claude /login` are picked up
+    without a server respawn.
+
+    Cache scope: the long-lived secrets (`exa-api-key`,
+    `tavily-api-key`) are populated once and held in
+    `SECRETS_CACHE`. `claude-token` is re-resolved on each call —
+    Claude Code rewrites `~/.claude/.credentials.json` whenever it
+    refreshes the access token (typically every 8 hours), and a
+    process-lifetime cache would pin research-agent to a token that
+    has since expired.
+
+    Tokens never touch disk inside this process. The values flow
+    straight into the ssh stdin payload to the microvm and from
+    there into the agent's environment via `--setenv`.
+
+    Resolution per secret: env var (per `_SECRET_ENV`) → for
+    `claude-token`, `~/.claude/.credentials.json` → GNOME keyring.
+
+    Scope: this function returns secrets needed by the *agent-side*
+    paths (`claude-token`, `exa-api-key`, `tavily-api-key`).
+    Scanner keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) are read
+    directly from `os.environ` inside `injection_scanner.honeypot`
+    and don't pass through here.
+    """
+    out = dict(SECRETS_CACHE)
+    # Always re-resolve claude-token so a `claude /login` refresh
+    # propagates without a server respawn. Cheap: one file read
+    # (~500 B) on the happy path; one keyring lookup on miss.
+    tok = _resolve_secret("claude-token")
+    if tok:
+        out["claude-token"] = tok
+    elif "claude-token" in out:
+        out.pop("claude-token")
+    for name in ("exa-api-key", "tavily-api-key"):
+        if name in SECRETS_CACHE:
+            continue
+        val = _resolve_secret(name)
         if val:
             SECRETS_CACHE[name] = val
-    return SECRETS_CACHE
+            out[name] = val
+    return out
 
 # Timeout for a single research call (seconds).
 AGENT_TIMEOUT = int(os.environ.get("RESEARCH_AGENT_TIMEOUT", "600"))
