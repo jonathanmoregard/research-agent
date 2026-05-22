@@ -57,14 +57,68 @@ def test_credentials_file_provides_token_when_env_unset(fresh_server, tmp_path, 
     assert out.get("claude-token") == "from-creds-file"
 
 
-def test_env_takes_precedence_over_credentials_file(fresh_server, tmp_path, monkeypatch):
+def test_credentials_file_beats_env_var_for_claude_token(fresh_server, tmp_path, monkeypatch):
+    """For claude-token *only*, the credentials file wins over the env var.
+
+    The home-manager wrapper on dellan exports CLAUDE_CODE_OAUTH_TOKEN
+    from an agenix-decrypted file captured at activation time — that
+    value goes stale the moment Claude Code rotates the OAuth token.
+    Letting the file beat the env restores correctness without needing
+    the wrapper to drop its export. Other secrets (exa, tavily) don't
+    auto-refresh, so env-first remains correct there.
+    """
     creds = tmp_path / ".credentials.json"
     _write_creds(creds, "from-creds-file")
     monkeypatch.setattr(fresh_server, "_CLAUDE_CREDENTIALS_PATH", creds)
-    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "from-env")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "stale-snapshot-from-wrapper")
 
     out = fresh_server._secrets()
-    assert out.get("claude-token") == "from-env"
+    assert out.get("claude-token") == "from-creds-file"
+
+
+def test_env_var_used_when_credentials_file_missing(fresh_server, tmp_path, monkeypatch):
+    """When the credentials file is absent the env var still works —
+    keeps the legacy path operational (and useful for non-dellan
+    deployments that never run `claude /login`)."""
+    missing = tmp_path / "does-not-exist.json"
+    monkeypatch.setattr(fresh_server, "_CLAUDE_CREDENTIALS_PATH", missing)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "from-env-fallback")
+
+    out = fresh_server._secrets()
+    assert out.get("claude-token") == "from-env-fallback"
+
+
+def test_null_claudeai_oauth_does_not_raise(fresh_server, tmp_path, monkeypatch):
+    """Regression: `claudeAiOauth: null` (or any non-dict shape) used to
+    raise AttributeError out of _load_claude_credentials_token because
+    `.get("claudeAiOauth", {}).get("accessToken")` chains a .get() on
+    None. The fix walks each level with `isinstance` before .get().
+    """
+    creds = tmp_path / ".credentials.json"
+    creds.write_text(json.dumps({"claudeAiOauth": None}), encoding="utf-8")
+    creds.chmod(0o600)
+    monkeypatch.setattr(fresh_server, "_CLAUDE_CREDENTIALS_PATH", creds)
+    # Must not raise — must return None and fall through.
+    assert fresh_server._load_claude_credentials_token() is None
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        {"claudeAiOauth": []},
+        {"claudeAiOauth": "scalar"},
+        {"claudeAiOauth": 42},
+        ["not", "a", "dict"],
+        "scalar",
+        None,
+    ],
+)
+def test_non_dict_creds_shapes_do_not_raise(fresh_server, tmp_path, monkeypatch, shape):
+    creds = tmp_path / ".credentials.json"
+    creds.write_text(json.dumps(shape), encoding="utf-8")
+    creds.chmod(0o600)
+    monkeypatch.setattr(fresh_server, "_CLAUDE_CREDENTIALS_PATH", creds)
+    assert fresh_server._load_claude_credentials_token() is None
 
 
 def test_token_reresolved_per_call_picks_up_login_refresh(fresh_server, tmp_path, monkeypatch):

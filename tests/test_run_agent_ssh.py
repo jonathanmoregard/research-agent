@@ -27,6 +27,15 @@ def _env(monkeypatch):
     monkeypatch.setenv("EXA_API_KEY", "exa-test-key")
     monkeypatch.setenv("TAVILY_API_KEY", "tav-test-key")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "ct-test")
+    # Point the credentials-file source at a non-existent path. Without
+    # this the file source wins (file > env for claude-token) and these
+    # wire-format tests would read the developer's real ~/.claude/.credentials.json.
+    from mcp_server import server
+    monkeypatch.setattr(
+        server,
+        "_CLAUDE_CREDENTIALS_PATH",
+        server.Path("/dev/null/does-not-exist-for-tests"),
+    )
     yield
 
 

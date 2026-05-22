@@ -212,26 +212,56 @@ def _load_claude_credentials_token() -> str | None:
         creds = json.loads(data)
     except json.JSONDecodeError:
         return None
-    tok = creds.get("claudeAiOauth", {}).get("accessToken") if isinstance(creds, dict) else None
+    # Strict-shape walk: each level must be a dict before .get(). A
+    # `claudeAiOauth: null` (or list, scalar, etc.) would raise
+    # AttributeError on `.get("accessToken")` if we chained
+    # `.get(..., {}).get(...)`; the outer try doesn't catch that.
+    if not isinstance(creds, dict):
+        return None
+    oauth = creds.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    tok = oauth.get("accessToken")
     if isinstance(tok, str) and tok:
         return tok
     return None
 
 
 def _resolve_secret(name: str) -> str | None:
-    """Resolve one secret. Env first; claude-token also checks the
-    credentials file; keyring fallback last.
+    """Resolve one secret. For `claude-token` the credentials file
+    wins over the env var; for all other secrets, env-first.
 
-    Empty-string env var ("") falls through to subsequent sources —
-    operators who `export X=` typically meant "unset", not "force empty".
+    Why the inversion for `claude-token` only: this is the one secret
+    that *auto-refreshes*. Claude Code rewrites
+    ~/.claude/.credentials.json every time it rotates the access
+    token (~ every 8 h). The agenix-driven home-manager wrapper
+    snapshots the .age file once at activation and exports it as an
+    env var that lives for the lifetime of the wrapper process —
+    going stale immediately after the first refresh. Letting the
+    file beat the env restores correctness without requiring a
+    wrapper change.
+
+    All other secrets (`exa-api-key`, `tavily-api-key`) are
+    operator-managed and don't refresh; env-first is correct.
+
+    Empty-string values ("") fall through to subsequent sources —
+    operators who `export X=` typically meant "unset", not "force
+    empty". Same convention as `_ssh_settings`.
     """
+    if name == "claude-token":
+        val = _load_claude_credentials_token()
+        if val:
+            return val
+        env_var = _SECRET_ENV.get(name)
+        if env_var:
+            val = os.environ.get(env_var)
+            if val:
+                return val
+        return _keyring_lookup(name)
+
     env_var = _SECRET_ENV.get(name)
     if env_var:
         val = os.environ.get(env_var)
-        if val:
-            return val
-    if name == "claude-token":
-        val = _load_claude_credentials_token()
         if val:
             return val
     return _keyring_lookup(name)
@@ -1274,6 +1304,31 @@ def _boot_smoke() -> None:
     _LOG.info("boot smoke ok took_ms=%d", int((time.monotonic() - t0) * 1000))
 
 
+def _log_credentials_state() -> None:
+    """One-shot boot log: is the Claude credentials file present?
+
+    Surfaces the prerequisite "must `claude /login` once on this host"
+    in a way that's discoverable from server.log when a normal-depth
+    call fails with claude-needs-login. Logs the path and whether the
+    file is readable as a regular file — never the contents.
+    """
+    p = _CLAUDE_CREDENTIALS_PATH
+    try:
+        st = os.stat(p, follow_symlinks=False)
+        is_reg = stat_mod.S_ISREG(st.st_mode)
+    except OSError:
+        _LOG.warning(
+            "boot creds-file missing path=%s — claude-token will fall back to env/keyring. "
+            "Run `claude /login` on this host to populate.",
+            p,
+        )
+        return
+    _LOG.info(
+        "boot creds-file present path=%s regular=%s size=%d",
+        p, is_reg, st.st_size,
+    )
+
+
 def main() -> None:
     """Entry point for the `research-agent-mcp` console script.
 
@@ -1283,6 +1338,7 @@ def main() -> None:
     Nix wrapper at `home/research-agent.nix` shell out without having
     to know the project layout.
     """
+    _log_credentials_state()
     _maybe_update_scanner()
     _boot_smoke()
     mcp.run()
