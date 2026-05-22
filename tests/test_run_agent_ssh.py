@@ -27,6 +27,15 @@ def _env(monkeypatch):
     monkeypatch.setenv("EXA_API_KEY", "exa-test-key")
     monkeypatch.setenv("TAVILY_API_KEY", "tav-test-key")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "ct-test")
+    # Point the credentials-file source at a non-existent path. Without
+    # this the file source wins (file > env for claude-token) and these
+    # wire-format tests would read the developer's real ~/.claude/.credentials.json.
+    from mcp_server import server
+    monkeypatch.setattr(
+        server,
+        "_CLAUDE_CREDENTIALS_PATH",
+        server.Path("/dev/null/does-not-exist-for-tests"),
+    )
     yield
 
 
@@ -132,8 +141,10 @@ def test_run_agent_empty_secrets_still_ships_four_fields(monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
 
     server = _import_server()
-    # Stub keyring lookups to None so no secrets land in the cache.
+    # Stub keyring + claude-credentials lookups so no secrets land in
+    # the cache and the wire-format check sees a true empty payload.
     monkeypatch.setattr(server, "_keyring_lookup", lambda key: None)
+    monkeypatch.setattr(server, "_load_claude_credentials_token", lambda: None)
     server.SECRETS_CACHE.clear()
 
     captured = {}
