@@ -164,6 +164,13 @@ _CLAUDE_CREDENTIALS_PATH = Path(
     os.environ.get("CLAUDE_CREDENTIALS_FILE")
     or (Path.home() / ".claude" / ".credentials.json")
 )
+# Read at import-time on purpose. Same convention as `_LOG_PATH`,
+# `REPORTS_DIR`, `AGENT_TIMEOUT` — values that must be stable for the
+# server's lifetime so concurrent callers see a single agreed path.
+# `_ssh_settings()` is the deliberate exception (call-time) because a
+# wrapper may export RESEARCH_SSH_* AFTER the module loads. The
+# credentials path has no such use case: the wrapper sets the env
+# before spawning the MCP, and tests override via monkeypatch.
 
 
 def _load_claude_credentials_token() -> str | None:

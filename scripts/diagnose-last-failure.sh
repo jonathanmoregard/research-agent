@@ -64,9 +64,11 @@ fingerprint() {
   local first_prefix=""
   if [[ -n "$t" ]]; then
     local first
-    first=$(printf '%s\n' "$t" | head -n1)
+    # `|| true` survives a future `set -o pipefail`: head -n1 closes
+    # stdin early and the upstream printf gets SIGPIPE 141.
+    first=$(printf '%s\n' "$t" | { head -n1 || true; })
     # Only ASCII chars + ":" up to first ":" — captures shape like "claude" or "bwrap" or "Error".
-    first_prefix=$(printf '%s' "$first" | sed -E 's/[^a-zA-Z:].*//' | head -c 32)
+    first_prefix=$(printf '%s' "$first" | { sed -E 's/[^a-zA-Z:].*//' | head -c 32 || true; })
   fi
   printf 'lines=%s first_word=%s\n' "$lines" "${first_prefix:-none}"
 }
