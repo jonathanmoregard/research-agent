@@ -125,6 +125,7 @@ bwrap \
   --ro-bind /run/current-system /run/current-system \
   --ro-bind /run/systemd/resolve /run/systemd/resolve \
   --ro-bind /etc /etc \
+  --tmpfs /etc/ssh \
   --ro-bind /bin /bin \
   --ro-bind /usr /usr \
   --proc /proc \
