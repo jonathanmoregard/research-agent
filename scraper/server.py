@@ -21,10 +21,13 @@ authorization and basic input shape.
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import os
+import socket
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import sync_playwright
@@ -43,14 +46,72 @@ MAX_HTML_BYTES = 512 * 1024
 
 
 def _load_token() -> str:
+    """Read the bearer token from disk.
+
+    Re-read on every request rather than cached at import: the host's
+    scraper-bearer-init.service rotates the token on demand
+    (`systemctl restart scraper-bearer-init`), and the agent-side
+    render_shim already re-reads per call (process is spawned per MCP
+    invocation). Caching here would desync the two sides on rotation,
+    silently 403'ing every call until the scraper-http process restarts.
+    Cost: ~microsecond tmpfs read per request — negligible vs the
+    chromium spawn that follows.
+    """
     with open(TOKEN_FILE, "r", encoding="utf-8") as f:
         tok = f.read().strip()
     if not tok:
-        sys.exit(f"scraper: token file {TOKEN_FILE} is empty")
+        raise RuntimeError(f"scraper: token file {TOKEN_FILE} is empty")
     return tok
 
 
-EXPECTED_TOKEN = _load_token()
+# Validate at startup that the token file exists + is non-empty —
+# fail-fast at service boot rather than 500ing the first real request.
+_load_token()
+
+
+# SSRF blocklist. Reject URLs whose hostname resolves into one of these
+# ranges. Defense-in-depth — the prod host has no cloud metadata service
+# and the scraper VM's SLIRP NAT already isolates it from the host LAN,
+# but if the VM is ever migrated to a cloud or someone wires bridged
+# networking, IMDS / link-local exfil becomes possible. Cheap to block
+# at the URL gate.
+_BLOCKED_NETS = [
+    ipaddress.ip_network(n)
+    for n in (
+        "127.0.0.0/8",       # loopback (including 127.0.0.1 — self-recursion)
+        "169.254.0.0/16",    # link-local (AWS/GCP/Azure IMDS, IPv4)
+        "::1/128",           # loopback v6
+        "fe80::/10",         # link-local v6
+        "fc00::/7",          # unique-local v6 (includes IMDSv6)
+    )
+]
+
+
+def _is_blocked_host(host: str) -> bool:
+    """True if host (after DNS) resolves into a blocked range.
+
+    Resolves every A/AAAA so DNS rebinding can't slip a legitimate-looking
+    hostname through that later swaps to 169.254.x. Chromium's own
+    resolver does the second lookup independently — we cannot bind it to
+    our pre-resolved IP — so this is a best-effort gate, not airtight.
+    For airtight: run chromium behind an outbound HTTP proxy that
+    enforces the same blocklist (follow-up).
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        # Let the renderer try; chromium will fail with a clear NXDOMAIN.
+        return False
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr.split("%", 1)[0])
+        except ValueError:
+            continue
+        for net in _BLOCKED_NETS:
+            if ip in net:
+                return True
+    return False
 
 
 def render(url: str, timeout_ms: int) -> dict:
@@ -127,7 +188,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(401, {"status": "error", "error": "missing bearer"})
             return False
         token = auth[len("Bearer ") :].strip()
-        if not hmac.compare_digest(token, EXPECTED_TOKEN):
+        try:
+            expected = _load_token()
+        except (OSError, RuntimeError):
+            self._json(503, {"status": "error", "error": "token unavailable"})
+            return False
+        if not hmac.compare_digest(token, expected):
             self._json(403, {"status": "error", "error": "bad bearer"})
             return False
         return True
@@ -162,6 +228,18 @@ class Handler(BaseHTTPRequestHandler):
         if not (url.startswith("http://") or url.startswith("https://")):
             self._json(400, {"status": "error", "error": "scheme not allowed"})
             return
+        # Host must resolve outside the loopback / link-local / IMDS
+        # ranges — see _BLOCKED_NETS. Best-effort against DNS rebinding;
+        # for airtight enforcement run chromium behind an HTTP proxy.
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            self._json(400, {"status": "error", "error": "bad url"})
+            return
+        host = parsed.hostname or ""
+        if not host or _is_blocked_host(host):
+            self._json(400, {"status": "error", "error": "host not allowed"})
+            return
         timeout_ms = req.get("timeout_ms", DEFAULT_TIMEOUT_MS)
         if (
             not isinstance(timeout_ms, int)
@@ -195,6 +273,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):  # noqa: A002 (stdlib API)
         sys.stderr.write(f"[scraper] {format % args}\n")
+
+
+# Per-connection socket inactivity timeout. Bounds slowloris-style
+# attackers that open the socket then trickle bytes — without this,
+# BaseHTTPRequestHandler has no read deadline and a handful of slow
+# clients can tie up every server thread indefinitely. 15 s is plenty
+# of slack for the headers + ~64 KiB JSON body the API accepts.
+Handler.timeout = 15
 
 
 def main() -> None:
