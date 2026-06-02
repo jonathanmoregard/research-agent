@@ -88,19 +88,46 @@ _BLOCKED_NETS = [
 
 
 def _is_blocked_host(host: str) -> bool:
-    """True if host (after DNS) resolves into a blocked range.
+    """True if host (literal or after DNS) resolves into a blocked range.
 
-    Resolves every A/AAAA so DNS rebinding can't slip a legitimate-looking
-    hostname through that later swaps to 169.254.x. Chromium's own
-    resolver does the second lookup independently — we cannot bind it to
-    our pre-resolved IP — so this is a best-effort gate, not airtight.
-    For airtight: run chromium behind an outbound HTTP proxy that
-    enforces the same blocklist (follow-up).
+    Handles literal IP inputs in all the historic forms inet_aton accepts
+    (dot-quad, integer, hex, octal, mixed) before falling back to DNS, so
+    `http://2130706433/` (= 127.0.0.1) and `http://0x7f000001/` cannot
+    bypass the gate via a form that glibc's getaddrinfo refuses to
+    resolve (EAI_NONAME). Chromium's own URL parser accepts all of these,
+    so we MUST normalize before checking.
+
+    For genuine hostnames: resolves every A/AAAA so DNS rebinding can't
+    slip a legitimate-looking hostname through that later swaps to
+    169.254.x. Chromium does its own second lookup — we cannot bind it
+    to our pre-resolved IP — so this remains best-effort. For airtight
+    enforcement, run chromium behind an outbound HTTP proxy enforcing
+    the same blocklist (follow-up).
     """
+    # Literal IPv4 in any historic form. inet_aton accepts:
+    #   "127.0.0.1", "127.1", "0x7f000001", "017700000001", "2130706433"
+    try:
+        ipv4 = ipaddress.IPv4Address(socket.inet_aton(host))
+    except OSError:
+        ipv4 = None
+    if ipv4 is not None:
+        return any(ipv4 in net for net in _BLOCKED_NETS if net.version == 4)
+
+    # Literal IPv6. Strip zone-id (`fe80::1%eth0`) before inet_pton.
+    try:
+        ipv6 = ipaddress.IPv6Address(
+            socket.inet_pton(socket.AF_INET6, host.split("%", 1)[0])
+        )
+    except OSError:
+        ipv6 = None
+    if ipv6 is not None:
+        return any(ipv6 in net for net in _BLOCKED_NETS if net.version == 6)
+
+    # Hostname — resolve and check every answer.
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
-        # Let the renderer try; chromium will fail with a clear NXDOMAIN.
+        # Unresolvable. Let chromium fail with NXDOMAIN downstream.
         return False
     for info in infos:
         addr = info[4][0]
@@ -108,9 +135,8 @@ def _is_blocked_host(host: str) -> bool:
             ip = ipaddress.ip_address(addr.split("%", 1)[0])
         except ValueError:
             continue
-        for net in _BLOCKED_NETS:
-            if ip in net:
-                return True
+        if any(ip in net for net in _BLOCKED_NETS):
+            return True
     return False
 
 
