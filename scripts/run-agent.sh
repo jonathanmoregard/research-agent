@@ -35,14 +35,18 @@ fi
 EXA_TOOLS="mcp__exa__web_search_exa,mcp__exa__web_fetch_exa"
 TAVILY_SEARCH="mcp__tavily-remote-mcp__tavily_search,mcp__tavily-remote-mcp__tavily_extract"
 TAVILY_DEEP="mcp__tavily-remote-mcp__tavily_research,mcp__tavily-remote-mcp__tavily_crawl"
+# JS-render fallback. Crosses VMs (research-agent -> scraper microvm via
+# HTTP on 10.0.2.2:8123) and is an order of magnitude slower than an
+# extract API; the agent's CLAUDE.md gates calls to the thin-extract case.
+RENDER_TOOLS="mcp__render__render_page"
 
 case "${DEPTH}" in
   normal)
-    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},Write"
+    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},Write"
     MODEL="claude-opus-4-7"
     ;;
   deep)
-    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${TAVILY_DEEP},Write"
+    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${TAVILY_DEEP},${RENDER_TOOLS},Write"
     MODEL="claude-opus-4-7"
     ;;
   *)
@@ -121,6 +125,7 @@ bwrap \
   --ro-bind /run/current-system /run/current-system \
   --ro-bind /run/systemd/resolve /run/systemd/resolve \
   --ro-bind /etc /etc \
+  --tmpfs /etc/ssh \
   --ro-bind /bin /bin \
   --ro-bind /usr /usr \
   --proc /proc \
