@@ -319,7 +319,7 @@ def _secrets() -> dict[str, str]:
     return out
 
 # Timeout for a single research call (seconds).
-AGENT_TIMEOUT = int(os.environ.get("RESEARCH_AGENT_TIMEOUT", "600"))
+AGENT_TIMEOUT = int(os.environ.get("RESEARCH_AGENT_TIMEOUT", "1500"))
 
 
 def _ssh_settings() -> dict[str, str]:
