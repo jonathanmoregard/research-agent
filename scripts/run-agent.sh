@@ -39,14 +39,22 @@ TAVILY_DEEP="mcp__tavily-remote-mcp__tavily_research,mcp__tavily-remote-mcp__tav
 # HTTP on 10.0.2.2:8123) and is an order of magnitude slower than an
 # extract API; the agent's CLAUDE.md gates calls to the thin-extract case.
 RENDER_TOOLS="mcp__render__render_page"
+# EUIPO trademark word-mark search (REST API, OAuth2). Inert unless
+# EUIPO_CLIENT_ID/SECRET are present in the env — the shim errors cleanly
+# on call when creds are absent, so listing it here is always safe.
+TRADEMARK_TOOLS="mcp__trademark__trademark_search"
+# Bolagsverket (Swedish company register) name search via the free CC-BY
+# open-data bulk file. Self-contained — no creds. Builds a SQLite index
+# on first call (~30-90s cold; <100ms subsequent in same jail).
+BOLAGSVERKET_TOOLS="mcp__bolagsverket__bolagsverket_search"
 
 case "${DEPTH}" in
   normal)
-    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},Write"
+    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},Write"
     MODEL="claude-opus-4-7"
     ;;
   deep)
-    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${TAVILY_DEEP},${RENDER_TOOLS},Write"
+    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${TAVILY_DEEP},${RENDER_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},Write"
     MODEL="claude-opus-4-7"
     ;;
   *)
@@ -148,6 +156,8 @@ bwrap \
   --setenv RESEARCH_SCRATCH_PATH "${SCRATCH_FILE}" \
   --setenv EXA_API_KEY "${EXA_API_KEY}" \
   --setenv TAVILY_API_KEY "${TAVILY_API_KEY}" \
+  --setenv EUIPO_CLIENT_ID "${EUIPO_CLIENT_ID:-}" \
+  --setenv EUIPO_CLIENT_SECRET "${EUIPO_CLIENT_SECRET:-}" \
   --setenv CLAUDE_STREAM_IDLE_TIMEOUT_MS "1800000" \
   -- \
   claude -p "${PROMPT_CONTENT}" \

@@ -2,7 +2,7 @@
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "mcp__(exa|tavily-remote-mcp)__.*",
+        "matcher": "mcp__(exa|tavily-remote-mcp|trademark|bolagsverket)__.*",
         "hooks": [
           {
             "type": "command",
