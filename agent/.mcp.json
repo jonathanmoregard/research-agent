@@ -17,6 +17,18 @@
     "render": {
       "command": "python3",
       "args": ["/workspace/agent/shims/render_shim.py"]
+    },
+    "trademark": {
+      "command": "python3",
+      "args": ["/workspace/agent/shims/trademark_shim.py"],
+      "env": {
+        "EUIPO_CLIENT_ID": "${EUIPO_CLIENT_ID}",
+        "EUIPO_CLIENT_SECRET": "${EUIPO_CLIENT_SECRET}"
+      }
+    },
+    "bolagsverket": {
+      "command": "python3",
+      "args": ["/workspace/agent/shims/bolagsverket_shim.py"]
     }
   }
 }
