@@ -157,6 +157,8 @@ _SECRET_ENV = {
     "claude-token": "CLAUDE_CODE_OAUTH_TOKEN",
     "exa-api-key": "EXA_API_KEY",
     "tavily-api-key": "TAVILY_API_KEY",
+    "euipo-client-id": "EUIPO_CLIENT_ID",
+    "euipo-client-secret": "EUIPO_CLIENT_SECRET",
 }
 
 
@@ -309,7 +311,12 @@ def _secrets() -> dict[str, str]:
         out["claude-token"] = tok
     elif "claude-token" in out:
         out.pop("claude-token")
-    for name in ("exa-api-key", "tavily-api-key"):
+    for name in (
+        "exa-api-key",
+        "tavily-api-key",
+        "euipo-client-id",
+        "euipo-client-secret",
+    ):
         if name in SECRETS_CACHE:
             continue
         val = _resolve_secret(name)
@@ -470,22 +477,29 @@ PROMPT_TEMPLATE = (
 )
 
 
-# Guest-side inline bash run by sshd inside the microvm. Reads four
+# Guest-side inline bash run by sshd inside the microvm. Reads six
 # null-terminated fields from stdin (claude_token, exa, tavily,
-# prompt_body), writes the prompt to a tmp file under $HOME, then
-# exec's run-agent.sh with (uuid, prompt_file). The EXIT trap cleans
-# the tmp file even if SSH disconnects mid-call.
+# euipo_client_id, euipo_client_secret, prompt_body), writes the prompt
+# to a tmp file under $HOME, then exec's run-agent.sh with (uuid,
+# prompt_file). The EXIT trap cleans the tmp file even if SSH
+# disconnects mid-call.
+#
+# Field order must match the writer side in `_run_agent` exactly —
+# adding a new secret means BOTH the writer's tuple AND this script's
+# `read` sequence get the new entry in the same position.
 #
 # Script is passed via `bash -c` (argv) so stdin can carry the
-# four binary-safe secret fields without conflicting with the
-# script source.
+# binary-safe secret fields without conflicting with the script source.
 _GUEST_SCRIPT = (
     "set -euo pipefail; "
     "IFS= read -r -d '' CLAUDE_CODE_OAUTH_TOKEN; "
     "IFS= read -r -d '' EXA_API_KEY; "
     "IFS= read -r -d '' TAVILY_API_KEY; "
+    "IFS= read -r -d '' EUIPO_CLIENT_ID; "
+    "IFS= read -r -d '' EUIPO_CLIENT_SECRET; "
     "IFS= read -r -d '' PROMPT_BODY; "
-    "export CLAUDE_CODE_OAUTH_TOKEN EXA_API_KEY TAVILY_API_KEY; "
+    "export CLAUDE_CODE_OAUTH_TOKEN EXA_API_KEY TAVILY_API_KEY"
+    " EUIPO_CLIENT_ID EUIPO_CLIENT_SECRET; "
     'TMP=$(mktemp -p "$HOME" research-prompt.XXXXXX); '
     'chmod 600 "$TMP"; '
     "trap 'rm -f \"$TMP\"' EXIT; "
@@ -511,15 +525,21 @@ def _run_agent(prompt: str, report_id: str, depth: Depth) -> tuple[int, str]:
     )
 
     secrets = _secrets()
-    # Four null-terminated fields. Mirrors the docker-era contract but
-    # carries the prompt body as the fourth field — eliminates the
-    # separate docker-cp step.
+    # Six null-terminated fields. Mirrors the docker-era contract but
+    # carries the prompt body as the last field — eliminates the
+    # separate docker-cp step. Order MUST match the reader in
+    # `_GUEST_SCRIPT` exactly (claude, exa, tavily, euipo-id,
+    # euipo-secret, prompt). Missing secrets are sent as empty strings
+    # so the wire format stays stable; downstream shims fail cleanly
+    # on auth rather than the protocol desynchronising.
     stdin_payload = "".join(
         s + "\0"
         for s in (
             secrets.get("claude-token", ""),
             secrets.get("exa-api-key", ""),
             secrets.get("tavily-api-key", ""),
+            secrets.get("euipo-client-id", ""),
+            secrets.get("euipo-client-secret", ""),
             full_prompt,
         )
     )
