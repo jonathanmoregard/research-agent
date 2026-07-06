@@ -29,6 +29,13 @@
     "bolagsverket": {
       "command": "python3",
       "args": ["/workspace/agent/shims/bolagsverket_shim.py"]
+    },
+    "prv": {
+      "command": "python3",
+      "args": ["/workspace/agent/shims/prv_shim.py"],
+      "env": {
+        "PRV_CACHE_DIR": "${PRV_CACHE_DIR}"
+      }
     }
   }
 }
