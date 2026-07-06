@@ -10,9 +10,12 @@
 #   - Read-only bind of /workspace/agent — CLAUDE.md + .mcp.json.
 #   - Read-only bind of /usr, /etc, /lib* — system libraries.
 #   - Writable bind of /out/<uuid>.md only — final report destination.
+#   - Writable bind of /tool-cache (when present) — persistent PRV +
+#     Bolagsverket SQLite indexes; see CACHE_ARGS below.
 #   - Network: inherited (exa + tavily MCPs need outbound).
 #
-# When the jail exits, tmpfs is reaped. Nothing persists.
+# When the jail exits, tmpfs is reaped. Nothing persists except the
+# report file and the /tool-cache indexes.
 
 set -euo pipefail
 
@@ -48,9 +51,9 @@ TRADEMARK_TOOLS="mcp__trademark__trademark_search"
 # on first call (~30-90s cold; <100ms subsequent in same jail).
 BOLAGSVERKET_TOOLS="mcp__bolagsverket__bolagsverket_search"
 # PRV (Swedish national trademark register) via official open-data FTP.
-# Needs opendata.prv.se in the microvm egress allowlist + a persistent
-# PRV_CACHE_DIR (888 MiB full-extract index; rebuilding per-jail is
-# impractical — see shim header).
+# Needs opendata.prv.se in the microvm egress allowlist + the persistent
+# /tool-cache bind below (888 MiB full-extract index; rebuilding per-jail
+# is impractical — see shim header).
 PRV_TOOLS="mcp__prv__prv_search"
 
 case "${DEPTH}" in
@@ -133,6 +136,25 @@ HOME_DIR="/home/agent"
 # unset is cheap.
 unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
 
+# Persistent tool cache. /tool-cache is a RW virtiofs share backed by
+# /var/lib/research-agent/tool-cache on the host (nixos-config
+# modules/nixos/research-agent-microvm.nix). Binding it into the jail
+# lets the PRV (~888 MiB) and Bolagsverket SQLite indexes survive
+# across calls; building them into the jail's RAM-backed /tmp dies
+# with "database or disk is full". Conditional so the script keeps
+# working on guests that predate the share (falls back to the
+# ephemeral in-jail path) and on dev hosts without the mount.
+CACHE_ARGS=()
+if [ -d /tool-cache ]; then
+  CACHE_ARGS=(
+    --bind /tool-cache /tool-cache
+    --setenv PRV_CACHE_DIR "${PRV_CACHE_DIR:-/tool-cache/prv}"
+    --setenv BOLAGSVERKET_CACHE_DIR "${BOLAGSVERKET_CACHE_DIR:-/tool-cache/bolagsverket}"
+  )
+else
+  CACHE_ARGS=(--setenv PRV_CACHE_DIR "${PRV_CACHE_DIR:-/tmp/prv-cache}")
+fi
+
 bwrap \
   --ro-bind /nix/store /nix/store \
   --ro-bind /run/current-system /run/current-system \
@@ -163,7 +185,7 @@ bwrap \
   --setenv TAVILY_API_KEY "${TAVILY_API_KEY}" \
   --setenv EUIPO_CLIENT_ID "${EUIPO_CLIENT_ID:-}" \
   --setenv EUIPO_CLIENT_SECRET "${EUIPO_CLIENT_SECRET:-}" \
-  --setenv PRV_CACHE_DIR "${PRV_CACHE_DIR:-/tmp/prv-cache}" \
+  "${CACHE_ARGS[@]}" \
   --setenv CLAUDE_STREAM_IDLE_TIMEOUT_MS "1800000" \
   -- \
   claude -p "${PROMPT_CONTENT}" \
