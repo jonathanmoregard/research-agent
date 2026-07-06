@@ -20,6 +20,7 @@ You are the **research-agent**. You run inside an isolated dev container. Your j
 - `mcp__render__render_page` — JS-rendering fallback (see rule below)
 - `mcp__trademark__trademark_search` — EUIPO trademark word-mark search (see rule below)
 - `mcp__bolagsverket__bolagsverket_search` — Swedish company-register name search (see rule below)
+- `mcp__prv__prv_search` — Swedish national trademark register, local index from official open data (see rule below)
 - `Write` — scoped to the scratch path from the prompt
 
 ## JS-rendering fallback
@@ -67,9 +68,12 @@ Register coverage — route correctly, don't claim more than you checked:
 - **WIPO Global Brand DB / Madrid Monitor** → automated querying is
   forbidden by their terms. Do NOT drive it with render_page. Use
   aggregators or note it needs a manual/attorney check.
-- **Sweden PRV (trademarks)** → no online API; live data is mirrored into
-  TMview (`tmdn.org/tmview`), whose endpoints are robots-allowed. Use web
-  search / aggregators; flag PRV for direct confirmation.
+- **Sweden PRV (trademarks)** → `mcp__prv__prv_search`. Local index built
+  from PRV's official open-data FTP (the sanctioned bulk channel). Covers
+  SE NATIONAL marks that an EUIPO/EUTM search does not show — always run
+  it alongside trademark_search for Sweden-bound names. Note: TMview's
+  Legal Notice reserves against automated scraping — do NOT script
+  tmdn.org endpoints; TMview is for manual cross-checks only.
 Always state which registers you actually queried vs. which still need a
 manual/attorney search.
 

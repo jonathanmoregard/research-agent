@@ -47,14 +47,19 @@ TRADEMARK_TOOLS="mcp__trademark__trademark_search"
 # open-data bulk file. Self-contained — no creds. Builds a SQLite index
 # on first call (~30-90s cold; <100ms subsequent in same jail).
 BOLAGSVERKET_TOOLS="mcp__bolagsverket__bolagsverket_search"
+# PRV (Swedish national trademark register) via official open-data FTP.
+# Needs opendata.prv.se in the microvm egress allowlist + a persistent
+# PRV_CACHE_DIR (888 MiB full-extract index; rebuilding per-jail is
+# impractical — see shim header).
+PRV_TOOLS="mcp__prv__prv_search"
 
 case "${DEPTH}" in
   normal)
-    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},Write"
+    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},${PRV_TOOLS},Write"
     MODEL="claude-opus-4-7"
     ;;
   deep)
-    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${TAVILY_DEEP},${RENDER_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},Write"
+    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${TAVILY_DEEP},${RENDER_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},${PRV_TOOLS},Write"
     MODEL="claude-opus-4-7"
     ;;
   *)
@@ -158,6 +163,7 @@ bwrap \
   --setenv TAVILY_API_KEY "${TAVILY_API_KEY}" \
   --setenv EUIPO_CLIENT_ID "${EUIPO_CLIENT_ID:-}" \
   --setenv EUIPO_CLIENT_SECRET "${EUIPO_CLIENT_SECRET:-}" \
+  --setenv PRV_CACHE_DIR "${PRV_CACHE_DIR:-/tmp/prv-cache}" \
   --setenv CLAUDE_STREAM_IDLE_TIMEOUT_MS "1800000" \
   -- \
   claude -p "${PROMPT_CONTENT}" \
