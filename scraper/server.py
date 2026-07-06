@@ -24,6 +24,7 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import socket
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -140,6 +141,195 @@ def _is_blocked_host(host: str) -> bool:
     return False
 
 
+# --- intercept / form-driving config -----------------------------------------
+#
+# Defaults for the /intercept endpoint. Bound the size of any one captured
+# response so a hostile target page can't balloon the agent's context with a
+# multi-megabyte JSON payload; bound the number of actions per call so a
+# poorly-written script can't pin a chromium process indefinitely; bound the
+# capture-pattern list so we don't blow runtime walking a runaway regex set.
+MAX_INTERCEPT_BODY_BYTES = 256 * 1024
+MAX_INTERCEPT_CAPTURED = 16
+MAX_INTERCEPT_ACTIONS = 32
+MAX_INTERCEPT_PATTERNS = 8
+_VALID_ACTION_TYPES = {
+    "wait_for_selector",
+    "wait_for_load_state",
+    "wait_for_timeout_ms",
+    "wait_for_response",
+    "fill",
+    "click",
+    "press",
+}
+
+
+def _validate_intercept_inputs(
+    url: str,
+    actions: list,
+    capture_patterns: list,
+    timeout_ms: int,
+) -> str | None:
+    """Return None if valid, else an error string (no exception leaks)."""
+    if not isinstance(url, str) or not url:
+        return "bad url"
+    if len(url) > MAX_URL_LEN:
+        return "url too long"
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return "scheme not allowed"
+    if not isinstance(actions, list):
+        return "actions must be a list"
+    if len(actions) > MAX_INTERCEPT_ACTIONS:
+        return f"too many actions (max {MAX_INTERCEPT_ACTIONS})"
+    for i, action in enumerate(actions):
+        if not isinstance(action, dict):
+            return f"action {i} is not an object"
+        t = action.get("type")
+        if t not in _VALID_ACTION_TYPES:
+            return f"action {i} has unknown type {t!r}"
+    if not isinstance(capture_patterns, list):
+        return "capture_patterns must be a list"
+    if len(capture_patterns) > MAX_INTERCEPT_PATTERNS:
+        return f"too many capture_patterns (max {MAX_INTERCEPT_PATTERNS})"
+    for i, p in enumerate(capture_patterns):
+        if not isinstance(p, str) or not p:
+            return f"capture_pattern {i} not a non-empty string"
+        try:
+            re.compile(p)
+        except re.error:
+            return f"capture_pattern {i} not a valid regex"
+    if (
+        not isinstance(timeout_ms, int)
+        or timeout_ms <= 0
+        or timeout_ms > MAX_TIMEOUT_MS
+    ):
+        return f"bad timeout_ms (1..{MAX_TIMEOUT_MS})"
+    return None
+
+
+def _do_action(page, action: dict, default_timeout_ms: int) -> None:
+    """Apply one action. Raises Playwright errors on failure — the caller
+    catches them and returns a structured error to the API client.
+    """
+    t = action["type"]
+    timeout = int(action.get("timeout_ms") or default_timeout_ms)
+    if t == "wait_for_selector":
+        page.wait_for_selector(action["selector"], timeout=timeout)
+    elif t == "wait_for_load_state":
+        page.wait_for_load_state(action.get("state", "domcontentloaded"), timeout=timeout)
+    elif t == "wait_for_timeout_ms":
+        page.wait_for_timeout(int(action.get("ms", 1000)))
+    elif t == "wait_for_response":
+        pattern = re.compile(action["url_pattern"])
+        page.wait_for_response(
+            lambda resp: bool(pattern.search(resp.url)),
+            timeout=timeout,
+        )
+    elif t == "fill":
+        page.fill(action["selector"], action.get("text", ""))
+    elif t == "click":
+        page.click(action["selector"])
+    elif t == "press":
+        page.press(action["selector"], action["key"])
+    else:  # pragma: no cover — _validate_intercept_inputs gates this
+        raise ValueError(f"unknown action: {t}")
+
+
+def _truncate_text(body: str, cap: int) -> tuple[str, bool]:
+    enc = body.encode("utf-8", errors="replace")
+    if len(enc) <= cap:
+        return body, False
+    return enc[:cap].decode("utf-8", errors="replace"), True
+
+
+def intercept(
+    url: str,
+    actions: list,
+    capture_patterns: list,
+    timeout_ms: int,
+) -> dict:
+    """Drive a SPA form and capture matching XHR responses.
+
+    Loads `url`, registers a `response` listener that records every XHR whose
+    URL matches any of the `capture_patterns` regexes, runs each action in
+    `actions` in order, then returns the captured (request, response) pairs.
+
+    Bodies are returned as text (errors='replace' on non-UTF-8 bytes) and
+    capped at MAX_INTERCEPT_BODY_BYTES per response. The number of captured
+    pairs is capped at MAX_INTERCEPT_CAPTURED.
+    """
+    captured: list[dict] = []
+    compiled = [re.compile(p) for p in capture_patterns]
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--disable-dev-shm-usage"],
+        )
+        try:
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                accept_downloads=False,
+            )
+            page = ctx.new_page()
+
+            def on_response(response):
+                if len(captured) >= MAX_INTERCEPT_CAPTURED:
+                    return
+                if not any(p.search(response.url) for p in compiled):
+                    return
+                try:
+                    body = response.text()
+                except Exception:
+                    # Binary or otherwise non-text; keep the metadata anyway.
+                    body = ""
+                body_out, body_truncated = _truncate_text(
+                    body, MAX_INTERCEPT_BODY_BYTES
+                )
+                try:
+                    req_post = response.request.post_data or ""
+                except Exception:
+                    req_post = ""
+                req_post_out, req_post_truncated = _truncate_text(
+                    req_post, MAX_INTERCEPT_BODY_BYTES
+                )
+                captured.append({
+                    "request": {
+                        "method": response.request.method,
+                        "url": response.request.url,
+                        "headers": dict(response.request.headers),
+                        "body": req_post_out,
+                        "body_truncated": req_post_truncated,
+                    },
+                    "response": {
+                        "status": response.status,
+                        "url": response.url,
+                        "headers": dict(response.headers),
+                        "body": body_out,
+                        "body_truncated": body_truncated,
+                    },
+                })
+
+            page.on("response", on_response)
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                for action in actions:
+                    _do_action(page, action, timeout_ms)
+                return {
+                    "status": "ok",
+                    "requested_url": url,
+                    "final_url": page.url,
+                    "captured": captured,
+                }
+            finally:
+                ctx.close()
+        finally:
+            browser.close()
+
+
 def render(url: str, timeout_ms: int) -> dict:
     """Launch chromium, navigate, snapshot post-JS HTML, tear down."""
     with sync_playwright() as pw:
@@ -224,28 +414,53 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
-        if self.path != "/render":
-            self._json(404, {"status": "error", "error": "not found"})
-            return
-        if not self._check_auth():
-            return
+    def _read_body(self) -> tuple[int, dict | None, str | None]:
+        """Returns (length, parsed_dict, error_string). Either parsed is set,
+        or error is set. Empties everything else.
+        """
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            self._json(400, {"status": "error", "error": "bad length"})
-            return
+            return 0, None, "bad length"
         if length <= 0 or length > MAX_REQUEST_BYTES:
-            self._json(400, {"status": "error", "error": "bad length"})
-            return
+            return length, None, "bad length"
         raw = self.rfile.read(length)
         try:
             req = json.loads(raw)
         except json.JSONDecodeError:
-            self._json(400, {"status": "error", "error": "bad json"})
-            return
+            return length, None, "bad json"
         if not isinstance(req, dict):
-            self._json(400, {"status": "error", "error": "bad json"})
+            return length, None, "bad json"
+        return length, req, None
+
+    def _check_url_host(self, url: str) -> str | None:
+        """Returns error string or None if the URL host is acceptable."""
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return "scheme not allowed"
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            return "bad url"
+        host = parsed.hostname or ""
+        if not host or _is_blocked_host(host):
+            return "host not allowed"
+        return None
+
+    def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        if self.path == "/render":
+            self._do_render()
+            return
+        if self.path == "/intercept":
+            self._do_intercept()
+            return
+        self._json(404, {"status": "error", "error": "not found"})
+
+    def _do_render(self) -> None:
+        if not self._check_auth():
+            return
+        _length, req, err = self._read_body()
+        if err is not None or req is None:
+            self._json(400, {"status": "error", "error": err or "bad json"})
             return
         url = req.get("url")
         if not isinstance(url, str) or not url or len(url) > MAX_URL_LEN:
@@ -257,14 +472,9 @@ class Handler(BaseHTTPRequestHandler):
         # Host must resolve outside the loopback / link-local / IMDS
         # ranges — see _BLOCKED_NETS. Best-effort against DNS rebinding;
         # for airtight enforcement run chromium behind an HTTP proxy.
-        try:
-            parsed = urlparse(url)
-        except ValueError:
-            self._json(400, {"status": "error", "error": "bad url"})
-            return
-        host = parsed.hostname or ""
-        if not host or _is_blocked_host(host):
-            self._json(400, {"status": "error", "error": "host not allowed"})
+        host_err = self._check_url_host(url)
+        if host_err is not None:
+            self._json(400, {"status": "error", "error": host_err})
             return
         timeout_ms = req.get("timeout_ms", DEFAULT_TIMEOUT_MS)
         if (
@@ -276,11 +486,53 @@ class Handler(BaseHTTPRequestHandler):
         try:
             out = render(url, timeout_ms)
         except PWError as e:
-            # Playwright-level error (timeout, navigation aborted, target
-            # closed, etc.). Don't leak details — type name only.
             self._json(
                 502,
                 {"status": "error", "error": f"render failed: {type(e).__name__}"},
+            )
+            return
+        except Exception as e:  # pragma: no cover — fail-loud catchall
+            self._json(
+                500,
+                {"status": "error", "error": f"internal: {type(e).__name__}"},
+            )
+            return
+        self._json(200, out)
+
+    def _do_intercept(self) -> None:
+        if not self._check_auth():
+            return
+        _length, req, err = self._read_body()
+        if err is not None or req is None:
+            self._json(400, {"status": "error", "error": err or "bad json"})
+            return
+        url = req.get("url") or ""
+        actions = req.get("actions") or []
+        capture_patterns = req.get("capture_patterns") or []
+        timeout_ms = req.get("timeout_ms", DEFAULT_TIMEOUT_MS)
+        if (
+            not isinstance(timeout_ms, int)
+            or timeout_ms <= 0
+            or timeout_ms > MAX_TIMEOUT_MS
+        ):
+            timeout_ms = DEFAULT_TIMEOUT_MS
+        validation_err = _validate_intercept_inputs(
+            url, actions, capture_patterns, timeout_ms
+        )
+        if validation_err is not None:
+            self._json(400, {"status": "error", "error": validation_err})
+            return
+        host_err = self._check_url_host(url)
+        if host_err is not None:
+            self._json(400, {"status": "error", "error": host_err})
+            return
+        try:
+            out = intercept(url, actions, capture_patterns, timeout_ms)
+        except PWError as e:
+            self._json(
+                502,
+                {"status": "error",
+                 "error": f"intercept failed: {type(e).__name__}"},
             )
             return
         except Exception as e:  # pragma: no cover — fail-loud catchall
