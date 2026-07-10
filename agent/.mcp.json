@@ -16,7 +16,10 @@
     },
     "render": {
       "command": "python3",
-      "args": ["/workspace/agent/shims/render_shim.py"]
+      "args": ["/workspace/agent/shims/render_shim.py"],
+      "env": {
+        "RESEARCH_RUN_ID": "${RESEARCH_RUN_ID}"
+      }
     },
     "trademark": {
       "command": "python3",
