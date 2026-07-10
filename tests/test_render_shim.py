@@ -36,10 +36,11 @@ def _assert(cond: bool, msg: str) -> None:
 _captured: dict = {}
 
 
-def _stub_post_scraper(endpoint_url, payload, timeout_ms):
+def _stub_post_scraper(endpoint_url, payload, timeout_ms, max_bytes=None):
     _captured["endpoint_url"] = endpoint_url
     _captured["payload"] = payload
     _captured["timeout_ms"] = timeout_ms
+    _captured["max_bytes"] = max_bytes
     return _captured["return_value"]
 
 
