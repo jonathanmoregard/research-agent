@@ -45,7 +45,9 @@ BEARER = "Bearer stub-token-for-tests"
 class _FakeWorker:
     def __init__(self):
         self.cmds = []
-        self.artifacts = sessions.ArtifactStore()
+        # Shared singleton, mirroring BrowserWorker's default: the artifact
+        # routes read sessions.get_artifact_store(), never the worker.
+        self.artifacts = sessions.get_artifact_store()
         self._raise = False
 
     def submit(self, cmd, timeout_s=120.0):
@@ -310,6 +312,34 @@ def test_artifacts_delete_without_bearer_is_401():
     run_id = "f" * 32
     code, body = _delete(f"/artifacts/{run_id}", auth=None)
     _assert(code == 401, f"expected 401, got {code}: {body}")
+
+
+def test_artifacts_get_does_not_start_worker():
+    """GET /artifacts must go through the artifact-store singleton, never
+    get_worker() — pulling artifacts must not boot Playwright."""
+    run_id = "9" * 32
+    sessions.get_artifact_store().add(run_id, "noworker", b"\x89PNG-fake", "image/png")
+    worker_calls = []
+
+    def _tripwire():
+        worker_calls.append(1)
+        return _fake
+
+    orig_sessions_gw, orig_server_gw = sessions.get_worker, server.get_worker
+    sessions.get_worker = _tripwire
+    server.get_worker = _tripwire
+    try:
+        code, body = _get(f"/artifacts/{run_id}")
+    finally:
+        sessions.get_worker = orig_sessions_gw
+        server.get_worker = orig_server_gw
+    _assert(code == 200, f"expected 200, got {code}: {body}")
+    items = body.get("artifacts", [])
+    _assert(len(items) == 1, f"expected 1 artifact, got {items}")
+    _assert(not worker_calls,
+            "GET /artifacts called get_worker (would boot the browser)")
+    _assert(sessions._worker is None,
+            "a real browser worker was started by the artifact pull")
 
 
 if __name__ == "__main__":

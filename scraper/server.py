@@ -34,6 +34,8 @@ from playwright.sync_api import Error as PWError
 from playwright.sync_api import sync_playwright
 
 from sessions import (
+    ACT_BUDGET_MS,
+    get_artifact_store,
     get_worker,
     validate_actions,
     validate_artifact_name,
@@ -481,10 +483,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(404, {"status": "error", "error": "not found"})
 
-    def _submit(self, cmd: dict) -> None:
-        """Submit to the browser worker; normalize errors like /render does."""
+    def _submit(self, cmd: dict, timeout_s: float = 120.0) -> None:
+        """Submit to the browser worker; normalize errors like /render does.
+
+        timeout_s must exceed the worker-side execution bound for the op
+        (see sessions.ACT_BUDGET_MS hierarchy comment) so the HTTP layer
+        never abandons a command the worker is still executing.
+        """
         try:
-            out = get_worker().submit(cmd)
+            out = get_worker().submit(cmd, timeout_s=timeout_s)
         except RuntimeError as e:
             self._json(502, {"status": "error", "error": str(e)[:300]})
             return
@@ -518,8 +525,12 @@ class Handler(BaseHTTPRequestHandler):
         ):
             self._json(400, {"status": "error", "error": "bad viewport"})
             return
+        timeout_ms = _clamp_timeout(req.get("timeout_ms"))
+        # Browser launch + goto + observe: wait the goto timeout plus 60 s
+        # launch/observe slack so we outlast the worker, never abandon it.
         self._submit({"op": "open", "url": url, "viewport": viewport,
-                      "timeout_ms": _clamp_timeout(req.get("timeout_ms"))})
+                      "timeout_ms": timeout_ms},
+                     timeout_s=timeout_ms / 1000 + 60)
 
     def _do_session_op(self, sid: str, op: str) -> None:
         if not self._check_auth():
@@ -550,8 +561,11 @@ class Handler(BaseHTTPRequestHandler):
                     if host_err is not None:
                         self._json(400, {"status": "error", "error": host_err})
                         return
+            # Worker bounds one act call to ACT_BUDGET_MS; wait that plus
+            # 30 s queue/observe slack so we outlast it (see sessions.py).
             self._submit({"op": "act", "session_id": sid, "actions": actions,
-                          "timeout_ms": _clamp_timeout(req.get("timeout_ms"))})
+                          "timeout_ms": _clamp_timeout(req.get("timeout_ms"))},
+                         timeout_s=ACT_BUDGET_MS / 1000 + 30)
             return
         if op == "screenshot":
             self._submit({"op": "screenshot", "session_id": sid,
@@ -670,7 +684,9 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             if not self._check_auth():
                 return
-            items = get_worker().artifacts.take(m.group(1))
+            # Store singleton, not get_worker(): pulling artifacts must
+            # never lazily boot the browser worker (and Playwright with it).
+            items = get_artifact_store().take(m.group(1))
             self._json(200, {"status": "ok", "artifacts": items})
             return
         self._json(404, {"status": "error", "error": "not found"})
@@ -680,7 +696,7 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             if not self._check_auth():
                 return
-            get_worker().artifacts.take(m.group(1))
+            get_artifact_store().take(m.group(1))
             self._json(200, {"status": "ok", "cleared": True})
             return
         self._json(404, {"status": "error", "error": "not found"})

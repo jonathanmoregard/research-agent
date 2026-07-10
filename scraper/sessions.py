@@ -23,6 +23,14 @@ import uuid
 MAX_SESSIONS = 2
 SESSION_IDLE_TTL_S = 300.0
 MAX_ACTIONS_PER_CALL = 20
+# Worker-side ceiling for one act call. Timeout hierarchy — each layer must
+# outlast the one below it, so a client never gives up while the worker is
+# still executing (an orphaned command would serialize every later command
+# behind this single thread):
+#   shim read timeout (180 s, render_shim.py)
+#   > HTTP submit wait (150 s, server.py act route)
+#   > this budget (+ at most one action's overrun)
+ACT_BUDGET_MS = 120_000
 MAX_SNAPSHOT_BYTES = 64 * 1024
 MAX_SCREENSHOT_BYTES = 1 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
@@ -150,6 +158,15 @@ class ArtifactStore:
                 del self._runs[rid]
 
 
+# Module-level singleton: artifact pulls (GET/DELETE /artifacts) go straight
+# to the store — they must never lazily boot the browser worker.
+_artifact_store = ArtifactStore()
+
+
+def get_artifact_store() -> ArtifactStore:
+    return _artifact_store
+
+
 class _Session:
     __slots__ = ("browser", "context", "page", "last_used", "snapshot_refs_ok")
 
@@ -162,14 +179,19 @@ class _Session:
 class BrowserWorker(threading.Thread):
     """Single thread owning all Playwright state. submit() is thread-safe."""
 
-    def __init__(self, browser_factory=None, idle_ttl_s: float = SESSION_IDLE_TTL_S):
+    def __init__(self, browser_factory=None, idle_ttl_s: float = SESSION_IDLE_TTL_S,
+                 act_budget_ms: int = ACT_BUDGET_MS,
+                 artifacts: ArtifactStore | None = None):
         super().__init__(daemon=True, name="browser-worker")
         self._factory = browser_factory
         self._ttl = idle_ttl_s
+        self._act_budget_ms = act_budget_ms
         self._q: queue.Queue = queue.Queue()
         self._sessions: dict[str, _Session] = {}
         self._pw = None
-        self.artifacts = ArtifactStore()
+        # Shared singleton by default so artifact pulls work without the
+        # worker; injectable for tests.
+        self.artifacts = artifacts if artifacts is not None else get_artifact_store()
 
     # ---- public API (any thread) ----
     def submit(self, cmd: dict, timeout_s: float = 120.0) -> dict:
@@ -290,8 +312,22 @@ class BrowserWorker(threading.Thread):
         return out
 
     def _act(self, s: _Session, cmd: dict) -> dict:
+        # Bound the whole call to the act budget: per-action timeouts and
+        # wait_ms sleeps are clamped to the remaining budget, so worker-side
+        # execution never exceeds ~budget + one action's overrun. Without
+        # this, 20 actions x 60 s each could run long after the HTTP client
+        # gave up, serializing later commands behind the orphan.
+        deadline = time.monotonic() + self._act_budget_ms / 1000.0
+        req_timeout = int(cmd.get("timeout_ms") or 30000)
         for a in cmd.get("actions") or []:
-            self._do(s, a, int(cmd.get("timeout_ms") or 30000))
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                raise RuntimeError(
+                    "act budget exceeded — split actions across browse_act calls"
+                )
+            if a["type"] == "wait_ms":
+                a = dict(a, ms=min(int(a["ms"]), remaining_ms))
+            self._do(s, a, min(req_timeout, remaining_ms))
         return self._observe(s)
 
     def _locator(self, s: _Session, target: dict):
@@ -320,8 +356,7 @@ class BrowserWorker(threading.Thread):
                 loc.click(timeout=timeout)
             else:
                 x, y = self._point(s, a["target"])
-                page.mouse.move(x, y)
-                page.mouse.down(); page.mouse.up()
+                page.mouse.click(x, y)
         elif t == "fill":
             self._locator(s, a["target"]).fill(a["text"], timeout=timeout)
         elif t == "press":

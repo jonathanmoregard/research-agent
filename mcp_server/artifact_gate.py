@@ -332,17 +332,6 @@ def _do_audit(audit_fn, report_id: str, name: str, reason: str, ocr_text: str) -
 
 
 # ---------------------------------------------------------------------------
-# Legacy helpers (kept for any direct callers outside the gate loop)
-# ---------------------------------------------------------------------------
-
-def _write_new(path: Path, data: bytes) -> None:
-    """O_EXCL|O_NOFOLLOW like the report writes — no symlink redirect."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-
-
-# ---------------------------------------------------------------------------
 # Link rewriting
 # ---------------------------------------------------------------------------
 

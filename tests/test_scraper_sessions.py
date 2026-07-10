@@ -267,6 +267,58 @@ def test_browser_leak_on_failed_open():
         w.shutdown()
 
 
+# ----- act budget (review fix: bounded per-call execution) -----
+
+def test_act_budget_exceeded():
+    """An exhausted act budget must fail before running the action."""
+    w = BrowserWorker(browser_factory=_fake_factory, idle_ttl_s=9999,
+                      act_budget_ms=0)
+    w.start()
+    try:
+        sid = w.submit({"op": "open", "url": "https://x.test/"})["session_id"]
+        try:
+            w.submit({"op": "act", "session_id": sid, "actions": [
+                {"type": "click", "target": {"selector": "#b"}},
+            ]})
+            _assert(False, "act with exhausted budget did not raise")
+        except RuntimeError as e:
+            _assert("act budget exceeded" in str(e), f"wrong error: {e}")
+    finally:
+        w.shutdown()
+
+
+def test_act_timeout_clamped_to_remaining_budget():
+    """Per-action timeout passed to _do never exceeds the remaining budget,
+    and wait_ms sleeps are clamped to it too."""
+    budget_ms = 5000
+    w = BrowserWorker(browser_factory=_fake_factory, idle_ttl_s=9999,
+                      act_budget_ms=budget_ms)
+    calls = []
+    orig_do = w._do
+    def _spy_do(s, a, timeout):
+        calls.append((a["type"], a.get("ms"), timeout))
+        orig_do(s, a, timeout)
+    w._do = _spy_do
+    w.start()
+    try:
+        sid = w.submit({"op": "open", "url": "https://x.test/"})["session_id"]
+        out = w.submit({"op": "act", "session_id": sid, "actions": [
+            {"type": "click", "target": {"selector": "#b"}},
+            {"type": "wait_ms", "ms": 30000},
+        ], "timeout_ms": 30000})
+        _assert(out["screenshot_b64"], "act returned no screenshot")
+        _assert(len(calls) == 2, f"expected 2 _do calls, got {calls}")
+        for typ, _ms, timeout in calls:
+            _assert(0 < timeout <= budget_ms,
+                    f"{typ}: per-action timeout {timeout} exceeds "
+                    f"remaining budget ({budget_ms}ms cap)")
+        wait_ms = calls[1][1]
+        _assert(wait_ms is not None and wait_ms <= budget_ms,
+                f"wait_ms sleep {wait_ms} not clamped to remaining budget")
+    finally:
+        w.shutdown()
+
+
 # ----- regression: submit-after-shutdown hangs -----
 
 def test_submit_after_shutdown_raises_fast():

@@ -64,6 +64,20 @@ RUN_ID = os.environ.get("RESEARCH_RUN_ID", "")
 # the 512 KiB HTML ceiling.
 MAX_BROWSE_BODY_BYTES = 4 * 1024 * 1024
 
+# Per-tool waits for the browse_* endpoints. _post_scraper adds 30 s
+# transport slack (read timeout = timeout_ms/1000 + 30), so each derived
+# read timeout strictly exceeds the server-side wait that route can face —
+# the shim must never give up while the worker is still executing, or the
+# orphaned command serializes every later call behind it. Values mirror
+# scraper/sessions.py ACT_BUDGET_MS (120_000) and scraper/server.py's
+# per-route submit waits:
+#   act:  server waits ACT_BUDGET_MS/1000 + 30 = 150 s  -> shim reads 180 s
+#   open: server waits goto timeout (<= 60 s) + 60 s    -> shim reads 120 s
+#   screenshot/save/close: server default wait 120 s    -> shim reads 150 s
+BROWSE_ACT_TIMEOUT_MS = 150_000
+BROWSE_OPEN_TIMEOUT_MS = 90_000
+BROWSE_OP_TIMEOUT_MS = 120_000
+
 _SID_RE = re.compile(r"^[a-f0-9]{16}$")
 
 # Matches the `<` immediately before any opening or closing variant of the
@@ -437,7 +451,8 @@ def _tool_browse_open(args: dict) -> list:
     payload: dict = {"url": url}
     if isinstance(args.get("viewport"), dict):
         payload["viewport"] = args["viewport"]
-    out = _post_scraper(f"{SESSION_BASE}/session/open", payload, 30000,
+    out = _post_scraper(f"{SESSION_BASE}/session/open", payload,
+                        BROWSE_OPEN_TIMEOUT_MS,
                         max_bytes=MAX_BROWSE_BODY_BYTES)
     return _observation_blocks(out)
 
@@ -448,7 +463,7 @@ def _tool_browse_act(args: dict) -> list:
     if not isinstance(actions, list) or not actions:
         raise RuntimeError("actions must be a non-empty list")
     out = _post_scraper(f"{SESSION_BASE}/session/{sid}/act",
-                        {"actions": actions}, 30000,
+                        {"actions": actions}, BROWSE_ACT_TIMEOUT_MS,
                         max_bytes=MAX_BROWSE_BODY_BYTES)
     return _observation_blocks(out)
 
@@ -456,7 +471,8 @@ def _tool_browse_act(args: dict) -> list:
 def _tool_browse_screenshot(args: dict) -> list:
     sid = _check_sid(args)
     out = _post_scraper(f"{SESSION_BASE}/session/{sid}/screenshot",
-                        {"full_page": bool(args.get("full_page"))}, 30000,
+                        {"full_page": bool(args.get("full_page"))},
+                        BROWSE_OP_TIMEOUT_MS,
                         max_bytes=MAX_BROWSE_BODY_BYTES)
     return [_image_block(out)]
 
@@ -471,7 +487,8 @@ def _tool_browse_save_screenshot(args: dict) -> str:
             "RESEARCH_RUN_ID not set — artifact saving unavailable in this jail"
         )
     out = _post_scraper(f"{SESSION_BASE}/session/{sid}/save_artifact",
-                        {"name": name, "run_id": RUN_ID}, 30000)
+                        {"name": name, "run_id": RUN_ID},
+                        BROWSE_OP_TIMEOUT_MS)
     stored = out.get("name") or name
     return (
         f"Saved screenshot as report artifact '{stored}'. Reference it in the "
@@ -481,7 +498,8 @@ def _tool_browse_save_screenshot(args: dict) -> str:
 
 def _tool_browse_close(args: dict) -> str:
     sid = _check_sid(args)
-    _post_scraper(f"{SESSION_BASE}/session/{sid}/close", {}, 30000)
+    _post_scraper(f"{SESSION_BASE}/session/{sid}/close", {},
+                  BROWSE_OP_TIMEOUT_MS)
     return f"Session {sid} closed."
 
 
