@@ -72,10 +72,10 @@ MAX_BROWSE_BODY_BYTES = 4 * 1024 * 1024
 # scraper/sessions.py ACT_BUDGET_MS (120_000) and scraper/server.py's
 # per-route submit waits:
 #   act:  server waits ACT_BUDGET_MS/1000 + 30 = 150 s  -> shim reads 180 s
-#   open: server waits goto timeout (<= 60 s) + 60 s    -> shim reads 120 s
+#   open: server waits goto timeout (<= 60 s) + 60 s    -> shim reads 150 s
 #   screenshot/save/close: server default wait 120 s    -> shim reads 150 s
 BROWSE_ACT_TIMEOUT_MS = 150_000
-BROWSE_OPEN_TIMEOUT_MS = 90_000
+BROWSE_OPEN_TIMEOUT_MS = 120_000
 BROWSE_OP_TIMEOUT_MS = 120_000
 
 _SID_RE = re.compile(r"^[a-f0-9]{16}$")
