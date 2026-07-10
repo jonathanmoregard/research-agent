@@ -54,7 +54,7 @@ MAX_HTML_BYTES = 512 * 1024
 
 
 def _clamp_timeout(v) -> int:
-    if not isinstance(v, int) or v <= 0 or v > MAX_TIMEOUT_MS:
+    if isinstance(v, bool) or not isinstance(v, int) or v <= 0 or v > MAX_TIMEOUT_MS:
         return DEFAULT_TIMEOUT_MS
     return v
 
@@ -510,7 +510,9 @@ class Handler(BaseHTTPRequestHandler):
         if viewport is not None and not (
             isinstance(viewport, dict)
             and isinstance(viewport.get("width"), int)
+            and not isinstance(viewport.get("width"), bool)
             and isinstance(viewport.get("height"), int)
+            and not isinstance(viewport.get("height"), bool)
             and 320 <= viewport["width"] <= 1920
             and 240 <= viewport["height"] <= 1080
         ):
@@ -524,7 +526,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         _length, req, err = self._read_body()
         if err is not None or req is None:
-            # close/screenshot may come with an empty body; tolerate it
+            # close/screenshot may come with an empty body; tolerate it.
+            # act/save_artifact require a valid body — return 400 on error.
+            if op in ("act", "save_artifact"):
+                self._json(400, {"status": "error", "error": err or "bad json"})
+                return
             req = {}
         if op == "act":
             actions = req.get("actions") or []
@@ -537,6 +543,9 @@ class Handler(BaseHTTPRequestHandler):
             # layer (spec parity with /render).
             for a in actions:
                 if a["type"] == "goto":
+                    if len(a["url"]) > MAX_URL_LEN:
+                        self._json(400, {"status": "error", "error": "url too long"})
+                        return
                     host_err = self._check_url_host(a["url"])
                     if host_err is not None:
                         self._json(400, {"status": "error", "error": host_err})

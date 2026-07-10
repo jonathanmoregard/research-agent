@@ -237,6 +237,81 @@ def test_worker_error_is_502():
         _fake._raise = False
 
 
+def test_open_bool_timeout_uses_default():
+    """timeout_ms: true must not reach the worker as True/1 — clamp to default."""
+    _fake.cmds.clear()
+    code, body = _post("/session/open", {"url": "https://example.com/", "timeout_ms": True})
+    _assert(code == 200, f"expected 200, got {code}: {body}")
+    _assert(len(_fake.cmds) == 1, f"no cmd recorded: {_fake.cmds}")
+    got = _fake.cmds[0]["timeout_ms"]
+    _assert(got == server.DEFAULT_TIMEOUT_MS, f"timeout_ms should be default ({server.DEFAULT_TIMEOUT_MS}), got {got!r}")
+
+
+def test_open_bool_viewport_is_400():
+    """viewport with bool width must be rejected with 400."""
+    code, body = _post("/session/open", {"url": "https://example.com/", "viewport": {"width": True, "height": 700}})
+    _assert(code == 400, f"expected 400 for bool viewport width, got {code}: {body}")
+    _assert("viewport" in body.get("error", ""), f"unexpected error: {body}")
+
+
+def test_act_oversized_body_is_400():
+    """A body larger than MAX_REQUEST_BYTES on act must return 400, not 200."""
+    sid = "ab12" * 4
+    url = f"http://127.0.0.1:{_srv_port}/session/{sid}/act"
+    # 70 KiB body — above the 64 KiB cap
+    big_body = b'{"actions":[]}' + b" " * (70 * 1024)
+    req = urllib.request.Request(url, data=big_body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Content-Length", str(len(big_body)))
+    req.add_header("Authorization", BEARER)
+    try:
+        with urllib.request.urlopen(req) as r:
+            code, body = r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        code, body = e.code, json.loads(e.read())
+    _assert(code == 400, f"expected 400 for oversized act body, got {code}: {body}")
+
+
+def test_screenshot_empty_body_still_200():
+    """screenshot with an empty/no body must still return 200."""
+    sid = "ab12" * 4
+    url = f"http://127.0.0.1:{_srv_port}/session/{sid}/screenshot"
+    req = urllib.request.Request(url, data=b"", method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Content-Length", "0")
+    req.add_header("Authorization", BEARER)
+    try:
+        with urllib.request.urlopen(req) as r:
+            code, body = r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        code, body = e.code, json.loads(e.read())
+    _assert(code == 200, f"expected 200 for screenshot with empty body, got {code}: {body}")
+
+
+def test_act_goto_url_too_long_is_400():
+    """goto action with URL > MAX_URL_LEN must return 400."""
+    sid = "ab12" * 4
+    long_url = "https://example.com/" + "a" * (server.MAX_URL_LEN + 1)
+    actions = [{"type": "goto", "url": long_url}]
+    code, body = _post(f"/session/{sid}/act", {"actions": actions})
+    _assert(code == 400, f"expected 400 for overlong goto url, got {code}: {body}")
+    _assert("url too long" in body.get("error", ""), f"unexpected error: {body}")
+
+
+def test_artifacts_get_without_bearer_is_401():
+    """GET /artifacts/{id} without bearer must return 401."""
+    run_id = "e" * 32
+    code, body = _get(f"/artifacts/{run_id}", auth=None)
+    _assert(code == 401, f"expected 401, got {code}: {body}")
+
+
+def test_artifacts_delete_without_bearer_is_401():
+    """DELETE /artifacts/{id} without bearer must return 401."""
+    run_id = "f" * 32
+    code, body = _delete(f"/artifacts/{run_id}", auth=None)
+    _assert(code == 401, f"expected 401, got {code}: {body}")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
