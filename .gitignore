@@ -10,6 +10,9 @@ scratch/
 .env.*
 !.env.example
 
+# Test-runtime byproducts
+tests/_scraper_token_stub
+
 # Python
 __pycache__/
 *.pyc
