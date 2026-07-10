@@ -22,5 +22,8 @@ injection-scanner = { git = "https://github.com/jonathanmoregard/injection-scann
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[dependency-groups]
+dev = ["pillow>=10"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["mcp_server"]
