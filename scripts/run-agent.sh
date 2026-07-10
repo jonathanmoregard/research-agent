@@ -41,7 +41,7 @@ TAVILY_DEEP="mcp__tavily-remote-mcp__tavily_research,mcp__tavily-remote-mcp__tav
 # JS-render fallback. Crosses VMs (research-agent -> scraper microvm via
 # HTTP on 10.0.2.2:8123) and is an order of magnitude slower than an
 # extract API; the agent's CLAUDE.md gates calls to the thin-extract case.
-RENDER_TOOLS="mcp__render__render_page"
+RENDER_TOOLS="mcp__render__render_page,mcp__render__intercept_page"
 # Interactive browser sessions (screenshot -> act loop) on the scraper VM.
 BROWSE_TOOLS="mcp__render__browse_open,mcp__render__browse_act,mcp__render__browse_screenshot,mcp__render__browse_save_screenshot,mcp__render__browse_close"
 # EUIPO trademark word-mark search (REST API, OAuth2). Inert unless
@@ -115,6 +115,9 @@ case "${RENDERED_MCP}" in
   *) echo "run-agent: refusing to render .mcp.json outside /tmp (got ${RENDERED_MCP})" >&2; exit 3 ;;
 esac
 chmod 600 "${RENDERED_MCP}"
+# RESEARCH_RUN_ID follows the same dual path as EXA_API_KEY: baked into the
+# rendered .mcp.json (so shims that read it at startup see it) AND passed via
+# --setenv below (so the running agent process and its children see it too).
 export RESEARCH_RUN_ID="${REPORT_UUID}"
 python3 -c 'import os,sys; sys.stdout.write(os.path.expandvars(sys.stdin.read()))' \
   < "${AGENT_DIR}/.mcp.json" > "${RENDERED_MCP}"

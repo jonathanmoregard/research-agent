@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -63,7 +64,17 @@ RUN_ID = os.environ.get("RESEARCH_RUN_ID", "")
 # the 512 KiB HTML ceiling.
 MAX_BROWSE_BODY_BYTES = 4 * 1024 * 1024
 
-_SID_RE = __import__("re").compile(r"^[a-f0-9]{16}$")
+_SID_RE = re.compile(r"^[a-f0-9]{16}$")
+
+# Matches the `<` immediately before any opening or closing variant of the
+# untrusted_external_content tag — case-insensitive, optional whitespace
+# before the optional `/`, optional whitespace before the tag name. Mirrors
+# mcp_server/server.py's _DANGEROUS_WRAP_RX so both layers defang the same
+# set of escape attempts.
+_WRAP_TAG_RX = re.compile(
+    r"<(?=\s*/?\s*untrusted_external_content\b)",
+    re.IGNORECASE,
+)
 
 _UNTRUSTED_OPEN = (
     '<untrusted_external_content source="scraper-browser">\n'
@@ -76,9 +87,12 @@ _UNTRUSTED_CLOSE = (
 
 
 def _wrap_untrusted(text: str) -> str:
-    # Neutralize embedded closing tags so page content can't escape the wrap.
-    text = text.replace("</untrusted_external_content>",
-                        "&lt;/untrusted_external_content&gt;")
+    # Neutralize any opening or closing untrusted_external_content tag variant
+    # (case-insensitive, optional whitespace before/after the slash) so page
+    # content can't escape the wrap. Replace only the `<` so the rest of the
+    # tag text is preserved for readability and the replacement is idempotent
+    # (&lt; no longer matches the regex).
+    text = _WRAP_TAG_RX.sub("&lt;", text)
     return _UNTRUSTED_OPEN + text + _UNTRUSTED_CLOSE
 
 
@@ -331,8 +345,10 @@ def _post_scraper(endpoint_url: str, payload: dict, timeout_ms: int,
         raise RuntimeError(f"scraper HTTP {e.code}: {err_body[:200]}")
     except urllib.error.URLError as e:
         raise RuntimeError(f"scraper unreachable: {type(e).__name__}")
+    if len(body) > max_bytes:
+        raise RuntimeError("scraper response too large")
     try:
-        out = json.loads(body[:max_bytes].decode("utf-8", errors="replace"))
+        out = json.loads(body.decode("utf-8", errors="replace"))
     except json.JSONDecodeError:
         raise RuntimeError("scraper returned non-json")
     if not isinstance(out, dict) or out.get("status") != "ok":
