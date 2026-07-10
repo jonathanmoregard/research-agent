@@ -209,6 +209,84 @@ def test_artifact_dedup_name():
         pass
 
 
+# ----- regression: browser leak on failed open -----
+
+class _FailingPage(_FakePage):
+    """Page whose goto always raises."""
+    def goto(self, url, **kw):
+        raise RuntimeError("simulated goto failure")
+
+
+class _FailingContext:
+    def new_page(self): return _FailingPage()
+    def close(self): pass
+
+
+class _FailingBrowser(_FakeBrowser):
+    def new_context(self, **kw): return _FailingContext()
+
+
+_failing_made = []
+_ok_made = []
+
+def _mixed_factory():
+    """First call returns a failing browser; subsequent calls return normal ones."""
+    if not _failing_made:
+        b = _FailingBrowser(); _failing_made.append(b); return b
+    b = _FakeBrowser(); _ok_made.append(b); return b
+
+
+def test_browser_leak_on_failed_open():
+    """goto failure must not leak the session slot or the browser."""
+    w = BrowserWorker(browser_factory=_mixed_factory, idle_ttl_s=9999)
+    _failing_made.clear(); _ok_made.clear()
+    w.start()
+    try:
+        # First open must raise
+        raised = False
+        try:
+            w.submit({"op": "open", "url": "https://x.test/"})
+        except RuntimeError as e:
+            raised = True
+            _assert("simulated goto failure" in str(e), f"unexpected error: {e}")
+        _assert(raised, "_open did not raise on goto failure")
+
+        # The failing browser must have been closed
+        _assert(len(_failing_made) == 1, "failing browser not created")
+        _assert(_failing_made[0].closed, "failing browser not closed after error")
+
+        # Both session slots must be free: open MAX_SESSIONS more successfully
+        sids = []
+        for _ in range(MAX_SESSIONS):
+            out = w.submit({"op": "open", "url": "https://x.test/"})
+            sids.append(out["session_id"])
+        _assert(len(sids) == MAX_SESSIONS, "could not open sessions after failed open")
+        for sid in sids:
+            w.submit({"op": "close", "session_id": sid})
+    finally:
+        w.shutdown()
+
+
+# ----- regression: submit-after-shutdown hangs -----
+
+def test_submit_after_shutdown_raises_fast():
+    """submit() after shutdown must raise RuntimeError promptly (< 2 s)."""
+    w = BrowserWorker(browser_factory=_fake_factory, idle_ttl_s=9999)
+    w.start()
+    w.shutdown()
+    _assert(not w.is_alive(), "worker still alive after shutdown")
+    t0 = time.monotonic()
+    raised = False
+    try:
+        w.submit({"op": "open", "url": "https://x.test/"}, timeout_s=120.0)
+    except RuntimeError as e:
+        raised = True
+        _assert("not running" in str(e), f"unexpected error: {e}")
+    elapsed = time.monotonic() - t0
+    _assert(raised, "submit after shutdown did not raise")
+    _assert(elapsed < 2.0, f"submit after shutdown took {elapsed:.2f}s (expected < 2s)")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

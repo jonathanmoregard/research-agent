@@ -173,6 +173,8 @@ class BrowserWorker(threading.Thread):
 
     # ---- public API (any thread) ----
     def submit(self, cmd: dict, timeout_s: float = 120.0) -> dict:
+        if not self.is_alive():
+            raise RuntimeError("browser worker not running")
         done = threading.Event()
         slot: dict = {}
         self._q.put((cmd, slot, done))
@@ -220,6 +222,16 @@ class BrowserWorker(threading.Thread):
                 self._close(sid)
             if self._pw is not None:
                 self._pw.stop()
+            # Drain any items that raced past the is_alive() check in submit()
+            while True:
+                try:
+                    item = self._q.get_nowait()
+                except queue.Empty:
+                    break
+                _, slot, done = item
+                if slot is not None and done is not None:
+                    slot["error"] = "browser worker shut down"
+                    done.set()
 
     def _dispatch(self, cmd: dict) -> dict:
         op = cmd["op"]
@@ -267,9 +279,13 @@ class BrowserWorker(threading.Thread):
         s = _Session(browser, context, page)
         sid = uuid.uuid4().hex[:16]
         self._sessions[sid] = s
-        page.goto(cmd["url"], wait_until="domcontentloaded",
-                  timeout=int(cmd.get("timeout_ms") or 30000))
-        out = self._observe(s)
+        try:
+            page.goto(cmd["url"], wait_until="domcontentloaded",
+                      timeout=int(cmd.get("timeout_ms") or 30000))
+            out = self._observe(s)
+        except Exception:
+            self._close(sid)
+            raise
         out["session_id"] = sid
         return out
 
