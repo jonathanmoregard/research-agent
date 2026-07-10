@@ -29,7 +29,8 @@ SCRAPER_HOST_TOKEN_FILE = os.environ.get(
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 MAX_ARTIFACTS = 10
 _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\.(png|jpg)$")
-_FETCH_CAP = 40 * 1024 * 1024  # 10 x 2 MiB payload, b64-inflated + JSON slack
+# 10 x 2 MiB b64-inflated (~27 MiB) + JSON slack
+_FETCH_CAP = 40 * 1024 * 1024
 
 
 def _token() -> str:
@@ -57,7 +58,7 @@ def fetch_artifacts(run_id: str) -> list[dict]:
 
 
 def discard_artifacts(run_id: str) -> None:
-    """Best-effort clear (report-quarantined path)."""
+    """Best-effort clear (report-isolated path)."""
     req = urllib.request.Request(
         f"{SCRAPER_HOST_API}/artifacts/{run_id}",
         headers={"Authorization": f"Bearer {_token()}"},
@@ -80,6 +81,86 @@ def ocr_image(path: Path) -> str:
     return out.stdout
 
 
+# ---------------------------------------------------------------------------
+# Dir-fd walk helpers — defeat symlink-planted-at-component attacks.
+# Never import from server.py (circular). Keep all fds in finally blocks.
+# ---------------------------------------------------------------------------
+
+def _open_dir_nofollow(parent_fd: int, name: str) -> int:
+    """Open directory `name` relative to `parent_fd`, refusing to follow
+    symlinks (raises OSError / ELOOP / ENOTDIR if `name` is a symlink).
+    """
+    return os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=parent_fd,
+    )
+
+
+def _ensure_dir_nofollow(parent_fd: int, name: str) -> int:
+    """mkdir `name` under `parent_fd` (ignoring EEXIST), then open it with
+    O_NOFOLLOW.  Returns the new dir fd.  Raises if `name` is a symlink.
+    """
+    try:
+        os.mkdir(name, 0o755, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    return _open_dir_nofollow(parent_fd, name)
+
+
+def _write_nofollow_excl(leaf_fd: int, fname: str, data: bytes) -> None:
+    """Write `data` to `fname` relative to `leaf_fd`, O_EXCL | O_NOFOLLOW."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(fname, flags, 0o644, dir_fd=leaf_fd)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            fd = -1
+            f.write(data)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _make_art_dir_fd(reports_dir: Path, report_id: str) -> int:
+    """Open/create reports/<report_id>/artifacts/ via dir-fd walk.
+
+    Each component is opened with O_NOFOLLOW so a pre-planted symlink at
+    any intermediate path cannot redirect writes.  Returns leaf dir fd.
+    """
+    root_fd = os.open(str(reports_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        rid_fd = _ensure_dir_nofollow(root_fd, report_id)
+    finally:
+        os.close(root_fd)
+    try:
+        art_fd = _ensure_dir_nofollow(rid_fd, "artifacts")
+    finally:
+        os.close(rid_fd)
+    return art_fd
+
+
+def _make_q_art_dir_fd(reports_dir: Path, report_id: str) -> int:
+    """Open/create reports/_quarantine/<report_id>/artifacts/ via dir-fd walk."""
+    root_fd = os.open(str(reports_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        q_fd = _ensure_dir_nofollow(root_fd, "_quarantine")
+    finally:
+        os.close(root_fd)
+    try:
+        rid_fd = _ensure_dir_nofollow(q_fd, report_id)
+    finally:
+        os.close(q_fd)
+    try:
+        art_fd = _ensure_dir_nofollow(rid_fd, "artifacts")
+    finally:
+        os.close(rid_fd)
+    return art_fd
+
+
+# ---------------------------------------------------------------------------
+# Public gate
+# ---------------------------------------------------------------------------
+
 def gate_artifacts(
     report_id: str,
     reports_dir: Path,
@@ -91,60 +172,168 @@ def gate_artifacts(
     """Returns (saved_names, quarantined_names). Never raises."""
     saved: list[str] = []
     quarantined: list[str] = []
-    items = fetcher(report_id)
-    if not items:
-        return saved, quarantined
-    art_dir = reports_dir / report_id / "artifacts"
-    q_dir = reports_dir / "_quarantine" / report_id / "artifacts"
+    try:
+        items = fetcher(report_id)
+        if not items:
+            return saved, quarantined
 
-    for item in items[:MAX_ARTIFACTS]:
-        name = item.get("name") or ""
-        if not _NAME_RE.match(name):
-            name = "unsafe-" + hashlib.sha256(name.encode()).hexdigest()[:12] + ".png"
-            reason = "unsafe_name"
-            data = b""
+        for item in items[:MAX_ARTIFACTS]:
             try:
-                data = base64.b64decode(item.get("data_b64") or "", validate=True)
-            except Exception:
-                pass
-            _quarantine(q_dir, name, data, reason, "", report_id, audit_fn)
-            quarantined.append(name)
-            continue
+                _process_item(
+                    item, report_id, reports_dir,
+                    scan_fn, audit_fn, ocr_fn,
+                    saved, quarantined,
+                )
+            except Exception as exc:
+                # Per-item fallback: best-effort audit and continue.
+                try:
+                    name = (item.get("name") or "unknown") if isinstance(item, dict) else "unknown"
+                    print(f"research-agent: item processing error {report_id}/{name}: "
+                          f"{type(exc).__name__}: {exc}", file=sys.stderr)
+                    if audit_fn is not None:
+                        try:
+                            audit_fn(report_id, name, f"item_error:{type(exc).__name__}", "")
+                        except Exception:
+                            pass
+                    if name not in quarantined and name not in saved:
+                        quarantined.append(name)
+                except Exception:
+                    pass
+
+    except Exception as exc:
+        # Final fallback — gate must never propagate.
+        print(f"research-agent: gate_artifacts fatal error {report_id}: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+
+    return saved, quarantined
+
+
+def _process_item(
+    item,
+    report_id: str,
+    reports_dir: Path,
+    scan_fn,
+    audit_fn,
+    ocr_fn,
+    saved: list[str],
+    quarantined: list[str],
+) -> None:
+    """Process one fetched artifact item. May raise — caller handles."""
+    # Non-dict item: skip with audit.
+    if not isinstance(item, dict):
+        reason = "non_dict_item"
+        name = f"unsafe-{hashlib.sha256(repr(item).encode('utf-8', 'replace')).hexdigest()[:12]}.png"
+        _do_audit(audit_fn, report_id, name, reason, "")
+        quarantined.append(name)
+        return
+
+    name = item.get("name") or ""
+    # Validate name with fullmatch to reject trailing newlines and partial matches.
+    if not _NAME_RE.fullmatch(name):
+        safe_name = "unsafe-" + hashlib.sha256(
+            name.encode("utf-8", "replace")
+        ).hexdigest()[:12] + ".png"
+        data = b""
         try:
             data = base64.b64decode(item.get("data_b64") or "", validate=True)
         except Exception:
-            _quarantine(q_dir, name, b"", "bad_base64", "", report_id, audit_fn)
-            quarantined.append(name)
-            continue
-        if not data or len(data) > MAX_ARTIFACT_BYTES:
-            _quarantine(q_dir, name, data[:MAX_ARTIFACT_BYTES], "bad_size", "",
-                        report_id, audit_fn)
-            quarantined.append(name)
-            continue
-        # OCR -> scan. Any exception on either => fail closed.
-        try:
-            with tempfile.NamedTemporaryFile(
-                suffix=Path(name).suffix, delete=False
-            ) as tf:
-                tf.write(data)
-                tmp = Path(tf.name)
-            try:
-                text = ocr_fn(tmp)
-            finally:
-                tmp.unlink(missing_ok=True)
-            verdict = scan_fn(text)
-            ok, reason = bool(verdict.ok), getattr(verdict, "reason", "")
-        except Exception as e:
-            ok, reason, text = False, f"ocr_error:{type(e).__name__}", ""
-        if ok:
-            art_dir.mkdir(parents=True, exist_ok=True)
-            _write_new(art_dir / name, data)
-            saved.append(name)
-        else:
-            _quarantine(q_dir, name, data, reason, text, report_id, audit_fn)
-            quarantined.append(name)
-    return saved, quarantined
+            pass
+        _do_quarantine_fd(reports_dir, report_id, safe_name, data, "unsafe_name", "", audit_fn)
+        quarantined.append(safe_name)
+        return
 
+    try:
+        data = base64.b64decode(item.get("data_b64") or "", validate=True)
+    except Exception:
+        _do_quarantine_fd(reports_dir, report_id, name, b"", "bad_base64", "", audit_fn)
+        quarantined.append(name)
+        return
+
+    if not data or len(data) > MAX_ARTIFACT_BYTES:
+        _do_quarantine_fd(reports_dir, report_id, name, data[:MAX_ARTIFACT_BYTES],
+                          "bad_size", "", audit_fn)
+        quarantined.append(name)
+        return
+
+    # OCR -> scan. Any exception => fail closed.
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=Path(name).suffix, delete=False
+        ) as tf:
+            tf.write(data)
+            tmp = Path(tf.name)
+        try:
+            text = ocr_fn(tmp)
+        finally:
+            tmp.unlink(missing_ok=True)
+        verdict = scan_fn(text)
+        ok, reason = bool(verdict.ok), getattr(verdict, "reason", "")
+    except Exception as e:
+        ok, reason, text = False, f"ocr_error:{type(e).__name__}", ""
+
+    if ok:
+        # Write via dir-fd walk — defeats symlink planted at reports/<id>.
+        try:
+            art_fd = _make_art_dir_fd(reports_dir, report_id)
+            try:
+                _write_nofollow_excl(art_fd, name, data)
+            finally:
+                os.close(art_fd)
+            saved.append(name)
+        except FileExistsError:
+            # Duplicate name / benign retry — treat as write error, fall through.
+            _do_quarantine_fd(reports_dir, report_id, name, data,
+                              "write_error:FileExistsError", "", audit_fn)
+            quarantined.append(name)
+        except OSError as exc:
+            # Symlink planted or other write failure — isolate, don't save.
+            _do_quarantine_fd(reports_dir, report_id, name, data,
+                              f"write_error:{type(exc).__name__}", "", audit_fn)
+            quarantined.append(name)
+    else:
+        _do_quarantine_fd(reports_dir, report_id, name, data, reason,
+                          text if isinstance(text, str) else "", audit_fn)
+        quarantined.append(name)
+
+
+def _do_quarantine_fd(
+    reports_dir: Path,
+    report_id: str,
+    name: str,
+    data: bytes,
+    reason: str,
+    ocr_text: str,
+    audit_fn,
+) -> None:
+    """Write to _quarantine via dir-fd walk, then fire audit. Never raises."""
+    try:
+        q_fd = _make_q_art_dir_fd(reports_dir, report_id)
+        try:
+            try:
+                _write_nofollow_excl(q_fd, name, data)
+            except FileExistsError:
+                pass  # already written (retry) — audit still fires
+        finally:
+            os.close(q_fd)
+    except Exception as exc:
+        print(f"research-agent: artifact isolation write failed "
+              f"{report_id}/{name}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    _do_audit(audit_fn, report_id, name, reason, ocr_text)
+
+
+def _do_audit(audit_fn, report_id: str, name: str, reason: str, ocr_text: str) -> None:
+    """Fire audit_fn, swallowing any exception."""
+    if audit_fn is not None:
+        try:
+            audit_fn(report_id, name, reason, ocr_text[:2000])
+        except Exception as exc:
+            print(f"research-agent: audit_fn failed {report_id}/{name}: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Legacy helpers (kept for any direct callers outside the gate loop)
+# ---------------------------------------------------------------------------
 
 def _write_new(path: Path, data: bytes) -> None:
     """O_EXCL|O_NOFOLLOW like the report writes — no symlink redirect."""
@@ -153,18 +342,14 @@ def _write_new(path: Path, data: bytes) -> None:
         f.write(data)
 
 
-def _quarantine(q_dir, name, data, reason, ocr_text, report_id, audit_fn) -> None:
-    try:
-        q_dir.mkdir(parents=True, exist_ok=True)
-        _write_new(q_dir / name, data)
-    except OSError as e:
-        print(f"research-agent: artifact quarantine write failed "
-              f"{report_id}/{name}: {e}", file=sys.stderr)
-    if audit_fn is not None:
-        audit_fn(report_id, name, reason, ocr_text[:2000])
-
+# ---------------------------------------------------------------------------
+# Link rewriting
+# ---------------------------------------------------------------------------
 
 _ARTIFACT_LINK = re.compile(r"\]\(artifacts/([a-zA-Z0-9._-]+)\)")
+# Matches any remaining artifacts/ reference after first rewrite pass —
+# catches traversal attempts like ](artifacts/../x.png).
+_RESIDUAL_ARTIFACT_LINK = re.compile(r"\]\(artifacts/[^)]*\)")
 
 
 def rewrite_artifact_links(
@@ -177,4 +362,8 @@ def rewrite_artifact_links(
         if name in saved:
             return f"]({report_id}/artifacts/{name})"
         return f"] (artifact quarantined: {name})"
-    return _ARTIFACT_LINK.sub(_sub, text)
+
+    result = _ARTIFACT_LINK.sub(_sub, text)
+    # Neutralize any residual artifacts/ links (traversal attempts, unknown names).
+    result = _RESIDUAL_ARTIFACT_LINK.sub("] (unresolved artifact link)", result)
+    return result

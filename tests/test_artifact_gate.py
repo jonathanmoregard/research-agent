@@ -9,6 +9,7 @@ Use:
 from __future__ import annotations
 
 import base64
+import os
 import shutil
 import sys
 import tempfile
@@ -56,7 +57,7 @@ def _artifact(name: str, data: bytes = _PNG_BYTES) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Original tests
 # ---------------------------------------------------------------------------
 
 def test_no_artifacts_noop():
@@ -112,7 +113,7 @@ def test_fail_quarantines():
         _assert(saved == [], f"expected no saved, got {saved}")
         _assert(quarantined == ["shot.png"], f"expected quarantined=['shot.png'], got {quarantined}")
         _assert(not art_path.exists(), "artifact written to report dir despite scan failure")
-        _assert(q_path.exists(), f"artifact not written to quarantine: {q_path}")
+        _assert(q_path.exists(), f"artifact not written to isolation dir: {q_path}")
         _assert(len(audit_calls) == 1, f"expected 1 audit call, got {len(audit_calls)}")
         _assert(audit_calls[0][0] == report_id, "audit report_id mismatch")
         _assert(audit_calls[0][2] == "injection_detected", f"audit reason mismatch: {audit_calls[0][2]}")
@@ -227,6 +228,151 @@ def test_ocr_real():
         _assert("MARKER" in text, f"OCR output missing 'MARKER': {text!r}")
     finally:
         tmp.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for reviewed defects
+# ---------------------------------------------------------------------------
+
+def test_preexisting_file_no_raise():
+    """Pre-existing target file -> gate returns without raising; item is isolated
+    with a write_error reason; audit fires."""
+    report_id = "aa" * 16
+    audit_calls: list = []
+    with tempfile.TemporaryDirectory() as td:
+        reports = Path(td)
+        # Pre-create the destination file so the gate sees FileExistsError.
+        art_dir = reports / report_id / "artifacts"
+        art_dir.mkdir(parents=True)
+        (art_dir / "shot.png").write_bytes(b"old")
+
+        # Must not raise.
+        saved, quarantined = gate_artifacts(
+            report_id,
+            reports,
+            _ok_scan,
+            audit_fn=lambda *a: audit_calls.append(a),
+            fetcher=lambda rid: [_artifact("shot.png")],
+            ocr_fn=lambda p: "clean",
+        )
+        _assert("shot.png" not in saved, f"should not be in saved, got {saved}")
+        _assert("shot.png" in quarantined, f"should be in quarantined, got {quarantined}")
+        _assert(len(audit_calls) == 1, f"expected 1 audit call, got {len(audit_calls)}")
+        reason = audit_calls[0][2]
+        _assert("write_error" in reason, f"expected 'write_error' in reason, got {reason!r}")
+
+
+def test_symlink_at_report_id_blocked():
+    """Symlink planted at reports/<id> -> vetted artifact does NOT land through it;
+    gate returns without raising; target dir stays empty."""
+    report_id = "bb" * 16
+    with tempfile.TemporaryDirectory() as td:
+        reports = Path(td)
+        # Plant a symlink at reports/<report_id> pointing to a separate dir.
+        target_dir = Path(td) / "attacker_controlled"
+        target_dir.mkdir()
+        symlink_path = reports / report_id
+        symlink_path.symlink_to(target_dir)
+
+        saved, quarantined = gate_artifacts(
+            report_id,
+            reports,
+            _ok_scan,
+            audit_fn=None,
+            fetcher=lambda rid: [_artifact("shot.png")],
+            ocr_fn=lambda p: "clean",
+        )
+        # Nothing should have been written through the symlink.
+        files_in_target = list(target_dir.rglob("*"))
+        _assert(len(files_in_target) == 0,
+                f"artifact was written through symlink: {files_in_target}")
+        # Gate must not raise (already returned).
+        _assert(saved == [], f"expected no saved (symlink should block), got {saved}")
+
+
+def test_non_dict_item_skipped_audited():
+    """Non-dict item in fetched list -> skipped with audit record, gate completes."""
+    report_id = "cc" * 16
+    audit_calls: list = []
+    with tempfile.TemporaryDirectory() as td:
+        reports = Path(td)
+        # Mix a non-dict with a valid item.
+        saved, quarantined = gate_artifacts(
+            report_id,
+            reports,
+            _ok_scan,
+            audit_fn=lambda *a: audit_calls.append(a),
+            fetcher=lambda rid: ["not-a-dict", _artifact("good.png")],
+            ocr_fn=lambda p: "clean",
+        )
+        # The string item should have been skipped/isolated with an audit call.
+        _assert(len(audit_calls) >= 1, f"expected audit call for non-dict item, got {audit_calls}")
+        # The valid item should have been saved.
+        _assert("good.png" in saved, f"expected good.png saved, got {saved}")
+
+
+def test_trailing_newline_name_rejected():
+    """Name 'shot.png\\n' from fetcher -> rejected by fullmatch, not saved."""
+    report_id = "dd" * 16
+    audit_calls: list = []
+    with tempfile.TemporaryDirectory() as td:
+        reports = Path(td)
+        bad_item = {"name": "shot.png\n", "mime": "image/png", "data_b64": _b64(_PNG_BYTES)}
+        saved, quarantined = gate_artifacts(
+            report_id,
+            reports,
+            _ok_scan,
+            audit_fn=lambda *a: audit_calls.append(a),
+            fetcher=lambda rid: [bad_item],
+            ocr_fn=lambda p: "clean",
+        )
+        _assert(saved == [], f"expected no saved, got {saved}")
+        _assert(len(quarantined) == 1, f"expected 1 quarantined, got {quarantined}")
+        _assert(len(audit_calls) == 1, f"expected 1 audit call, got {len(audit_calls)}")
+        reason = audit_calls[0][2]
+        _assert("unsafe_name" in reason, f"expected 'unsafe_name' in reason, got {reason!r}")
+
+
+def test_traversal_link_neutralized():
+    """Traversal link ](artifacts/../evil.png) is neutralized in rewrite output."""
+    report_id = "ee" * 16
+    saved = ["shot.png"]
+    quarantined: list = []
+
+    text = "![x](artifacts/../evil.png) and ![y](artifacts/shot.png)"
+    result = rewrite_artifact_links(text, report_id, saved, quarantined)
+
+    _assert("](artifacts/../evil.png)" not in result,
+            f"traversal link not neutralized: {result!r}")
+    _assert("unresolved artifact link" in result,
+            f"traversal link not replaced with inert text: {result!r}")
+    # The good link should still be rewritten.
+    _assert(f"]({report_id}/artifacts/shot.png)" in result,
+            f"saved link not rewritten: {result!r}")
+
+
+def test_sabotage_gate_never_raises():
+    """ocr_fn raises, fetcher returns garbage types -> gate never raises."""
+    report_id = "ff" * 16
+
+    def chaos_ocr(path):
+        raise RuntimeError("chaos")
+
+    def chaos_fetcher(rid):
+        return [None, 42, "string", _artifact("ok.png"), {"name": None, "data_b64": "!!!"}]
+
+    # Must not raise regardless of the chaos.
+    saved, quarantined = gate_artifacts(
+        report_id,
+        Path("/tmp"),
+        _ok_scan,
+        audit_fn=None,
+        fetcher=chaos_fetcher,
+        ocr_fn=chaos_ocr,
+    )
+    # We don't assert specific saved/quarantined counts here — just that it returned.
+    _assert(isinstance(saved, list), "saved is not a list")
+    _assert(isinstance(quarantined, list), "quarantined is not a list")
 
 
 # ---------------------------------------------------------------------------
