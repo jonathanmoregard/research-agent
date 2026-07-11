@@ -412,10 +412,32 @@ async def forecast_results(task_id: str) -> dict:
             sanitized_text="",
         )
     else:
+        # Offload to a worker thread: async FastMCP tools run ON the
+        # event loop (only sync tools are threadpooled), and the scan's
+        # honeypot layer is a synchronous multi-second HTTP call that
+        # would block every other in-flight tool call. `_scan` resolves
+        # from module globals here, so the test monkeypatch seam still
+        # works. The remaining sync calls in this tool (credential
+        # read, quarantine writes) are millisecond-scale — the scan was
+        # the only loop-hostile call.
+        import anyio
         try:
-            verdict = _scan(raw)
+            verdict = await anyio.to_thread.run_sync(_scan, raw)
         except Exception as exc:
             verdict = _scan_error_verdict(exc)
+
+    if verdict.ok and not isinstance(verdict.sanitized_text, str):
+        # Scanner contract violation (sanitized_text must be a str on
+        # pass). Fail closed through the normal reject flow instead of
+        # TypeError-ing on the happy path.
+        from injection_scanner.intercept import Verdict as _V
+        verdict = _V(
+            ok=False,
+            reason="scanner_contract:sanitized_text_type",
+            layers={"scanner_contract": "sanitized_text_type"},
+            sanitize_stats={},
+            sanitized_text="",
+        )
 
     # Verdict outcome to the durable log. Reason CODE only (prefix
     # before the first ':'): the full reason can embed a snippet of the

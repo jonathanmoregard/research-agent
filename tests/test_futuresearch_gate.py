@@ -320,6 +320,27 @@ def test_nonjson_payload_scanned_as_text(gate_env, monkeypatch):
     assert "benign" in res["text"]
 
 
+def test_scanner_contract_violation_fails_closed(gate_env, monkeypatch):
+    # A passing verdict whose sanitized_text is not a str is a scanner
+    # contract violation — must route through the quarantined path, not
+    # TypeError on the happy path, and leak nothing.
+    async def fake_fetch(task_id, token):
+        return json.dumps([{"probability": 5, "rationale": CANARY}])
+
+    def bad_scan(content):
+        return Verdict(ok=True, reason="pass", layers={},
+                       sanitize_stats={}, sanitized_text=None)
+
+    monkeypatch.setattr(gate, "_fetch_results", fake_fetch)
+    monkeypatch.setattr(gate, "_scan", bad_scan)
+    res = _run(gate.forecast_results("task-8"))
+    assert res["status"] == "quarantined"
+    assert "text" not in res  # nothing delivered
+    blob = json.dumps(res)
+    assert CANARY not in blob
+    assert "sanitized_text" not in blob  # reason stays out of the response
+
+
 # ---------------------------------------------------------------------------
 # _assemble_content (CallToolResult -> one untrusted string)
 # ---------------------------------------------------------------------------
