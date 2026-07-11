@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 research-agent-mcp = "mcp_server.server:main"
+futuresearch-gate-mcp = "mcp_server.futuresearch_gate:main"
 
 [tool.uv.sources]
 injection-scanner = { git = "https://github.com/jonathanmoregard/injection-scanner", rev = "main" }
