@@ -774,7 +774,8 @@ def _bucket_scan_ms(raw_ms: int) -> int:
 
 
 def _write_quarantine_audit(
-    report_id: str, prompt: str, verdict, content: str
+    report_id: str, prompt: str, verdict, content: str,
+    reports_dir: Path | None = None,
 ) -> None:
     """Append a one-line JSON audit record when a report is quarantined.
 
@@ -785,9 +786,15 @@ def _write_quarantine_audit(
     scanner's in-memory snapshot — it is NEVER read back by any LLM. The
     file lives in the quarantine zone (deny-listed for Read/Edit/Grep/Glob
     in .claude/settings.local.json) so a CC tool call cannot load it.
+
+    `reports_dir` defaults to this module's REPORTS_DIR; sibling MCP
+    servers (futuresearch_gate) that keep their own reports-dir global
+    pass it explicitly so their tests can monkeypatch at their scope.
     """
     import datetime
-    quarantine_dir = REPORTS_DIR / "_quarantine"
+    quarantine_dir = (
+        reports_dir if reports_dir is not None else REPORTS_DIR
+    ) / "_quarantine"
     try:
         quarantine_dir.mkdir(exist_ok=True)
     except OSError as e:

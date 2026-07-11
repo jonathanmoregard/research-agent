@@ -168,3 +168,148 @@ def test_skeleton_top_level_leaf_returns_none():
     skel, dropped = gate._typed_skeleton("just free text")
     assert skel is None
     assert dropped == 1
+
+
+def test_skeleton_drops_nonfinite_floats():
+    skel, dropped = gate._typed_skeleton([{"p": float("inf"), "q": 1}])
+    assert skel == [{"q": 1}]
+    assert dropped == 1
+
+
+# ---------------------------------------------------------------------------
+# forecast_results (fetch -> skeleton -> scan -> wrap/quarantine)
+# ---------------------------------------------------------------------------
+
+import asyncio
+
+from injection_scanner.intercept import Verdict
+
+
+CANARY = "CANARY-fsgate-7f3a1"
+# AKIA + 16 uppercase/digit chars = AWS access key shape; trips the
+# deterministic secret_shapes layer (which short-circuits BEFORE the
+# honeypot in injection_scanner.intercept.scan_text), so reject-path
+# tests need no network and no API key. This is AWS's own documented
+# example key, not a real credential.
+SECRET_SHAPED = "AKIAIOSFODNN7EXAMPLE"  # gitleaks:allow
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _fake_pass_scan(content):
+    """Passing Verdict without the honeypot's live Anthropic call."""
+    return Verdict(
+        ok=True, reason="pass", layers={}, sanitize_stats={},
+        sanitized_text=content,
+    )
+
+
+@pytest.fixture()
+def gate_env(tmp_path, monkeypatch):
+    p = _write_creds(tmp_path)
+    monkeypatch.setattr(gate, "_CREDENTIALS_PATH", p)
+    monkeypatch.setattr(gate, "REPORTS_DIR", tmp_path / "reports")
+    monkeypatch.delenv("FUTURESEARCH_OAUTH_TOKEN", raising=False)
+    return tmp_path
+
+
+def test_pass_path_wraps_text(gate_env, monkeypatch):
+    raw = json.dumps([{"probability": 62, "rationale": "Benign reasoning."}])
+
+    async def fake_fetch(task_id, token):
+        return raw
+
+    monkeypatch.setattr(gate, "_fetch_results", fake_fetch)
+    monkeypatch.setattr(gate, "_scan", _fake_pass_scan)
+    res = _run(gate.forecast_results("task-1"))
+    assert res["status"] == "done"
+    assert res["data"] == [{"probability": 62}]
+    assert "<untrusted_external_content" in res["text"]
+    assert 'source="futuresearch-gate/' in res["text"]
+    assert "Benign reasoning." in res["text"]
+
+
+def test_reject_path_no_leak(gate_env, monkeypatch):
+    raw = json.dumps([{
+        "probability": 62,
+        "rationale": f"{CANARY} here is a key {SECRET_SHAPED}",
+    }])
+
+    async def fake_fetch(task_id, token):
+        return raw
+
+    monkeypatch.setattr(gate, "_fetch_results", fake_fetch)
+    res = _run(gate.forecast_results("task-2"))
+    blob = json.dumps(res)
+    assert res["status"] == "quarantined"
+    assert CANARY not in blob
+    assert SECRET_SHAPED not in blob
+    # typed numerics still delivered
+    assert res["data"] == [{"probability": 62}]
+    # quarantine artifacts written
+    q = gate_env / "reports" / "_quarantine"
+    files = list(q.glob("*.md"))
+    assert len(files) == 1 and CANARY in files[0].read_text()
+    audit = (q / "audit.jsonl").read_text()
+    assert res["gate_id"] in audit
+    # timing bucketized
+    assert res["timings_ms"]["scan"] % 5000 == 0
+
+
+def test_scanner_exception_fails_closed(gate_env, monkeypatch):
+    async def fake_fetch(task_id, token):
+        return json.dumps([{"probability": 1, "rationale": CANARY}])
+
+    def boom(content):
+        raise RuntimeError(CANARY)
+
+    monkeypatch.setattr(gate, "_fetch_results", fake_fetch)
+    monkeypatch.setattr(gate, "_scan", boom)
+    res = _run(gate.forecast_results("task-3"))
+    assert res["status"] == "quarantined"
+    assert CANARY not in json.dumps(res)
+
+
+def test_fetch_failure_is_opaque(gate_env, monkeypatch):
+    async def fake_fetch(task_id, token):
+        raise ConnectionError(f"secret url with {CANARY}")
+
+    monkeypatch.setattr(gate, "_fetch_results", fake_fetch)
+    res = _run(gate.forecast_results("task-4"))
+    assert res["status"] == "error"
+    assert CANARY not in json.dumps(res)
+
+
+def test_no_token_gives_reauth_hint(gate_env, monkeypatch, tmp_path):
+    monkeypatch.setattr(gate, "_CREDENTIALS_PATH", tmp_path / "absent.json")
+    res = _run(gate.forecast_results("task-5"))
+    assert res["status"] == "error"
+    assert "re-auth" in res["error"] or "/mcp" in res["error"]
+
+
+def test_oversized_rejected_without_quarantine_body(gate_env, monkeypatch):
+    big = json.dumps([{"rationale": "x" * (gate._MAX_CONTENT_BYTES + 100)}])
+
+    async def fake_fetch(task_id, token):
+        return big
+
+    monkeypatch.setattr(gate, "_fetch_results", fake_fetch)
+    res = _run(gate.forecast_results("task-6"))
+    assert res["status"] == "quarantined"
+    assert res["data"] is None  # amendment 1: no skeleton from oversized content
+    q = gate_env / "reports" / "_quarantine"
+    assert list(q.glob("*.md")) == []  # no disk-exhaust primitive
+
+
+def test_nonjson_payload_scanned_as_text(gate_env, monkeypatch):
+    async def fake_fetch(task_id, token):
+        return "plain text result, not json, benign"
+
+    monkeypatch.setattr(gate, "_fetch_results", fake_fetch)
+    monkeypatch.setattr(gate, "_scan", _fake_pass_scan)
+    res = _run(gate.forecast_results("task-7"))
+    assert res["status"] == "done"
+    assert res["data"] is None
+    assert "benign" in res["text"]
