@@ -813,6 +813,41 @@ def _write_quarantine_audit(
         )
 
 
+def _write_artifact_audit(
+    report_id: str, artifact: str, reason: str, ocr_excerpt: str
+) -> None:
+    """Append a one-line JSON audit record when an artifact is quarantined.
+
+    Mirrors _write_quarantine_audit's append-a-record pattern.
+    Lives in the same quarantine zone (deny-listed for Read/Edit/Grep).
+    """
+    import datetime
+    quarantine_dir = REPORTS_DIR / "_quarantine"
+    try:
+        quarantine_dir.mkdir(exist_ok=True)
+    except OSError as e:
+        print(
+            f"research-agent: artifact audit mkdir failed for {report_id}: {e}",
+            file=sys.stderr,
+        )
+        return
+    audit_path = quarantine_dir / "artifact_audit.jsonl"
+    record = {
+        "ts": datetime.datetime.utcnow().isoformat() + "Z",
+        "report_id": report_id,
+        "artifact": artifact,
+        "reason": reason,
+        "ocr_excerpt": ocr_excerpt,
+    }
+    try:
+        _append_jsonl_via_dirfd(audit_path, json.dumps(record, default=str) + "\n")
+    except OSError as e:
+        print(
+            f"research-agent: artifact audit write failed for {report_id}: {e}",
+            file=sys.stderr,
+        )
+
+
 # Wrap-escape protection — see _encode_wrap_tags(). This used to live as
 # a regex rule in injection-scanner (`wrap_escape`) but false-positived on
 # legitimate research output that quoted these tag names. Moved to the
@@ -1127,20 +1162,33 @@ def _scan_and_deliver(
         else:
             audit_content = f"<oversized:{content_len} bytes, not stored>"
         _write_quarantine_audit(report_id, prompt, verdict, audit_content)
+        from mcp_server.artifact_gate import discard_artifacts
+        discard_artifacts(report_id)
         return _reject_response(report_id, agent_ms, t_received, t_scan_start)
 
     dst = REPORTS_DIR / f"{report_id}.md"
     dst.unlink(missing_ok=True)
-    wrapped = _wrap_content(report_id, verdict.sanitized_text)
+    from mcp_server.artifact_gate import gate_artifacts, rewrite_artifact_links
+    t_art = time.monotonic()
+    saved, quarantined = gate_artifacts(
+        report_id, REPORTS_DIR, _scan_text, audit_fn=_write_artifact_audit
+    )
+    artifacts_ms = int((time.monotonic() - t_art) * 1000)
+    text = rewrite_artifact_links(
+        verdict.sanitized_text, report_id, saved, quarantined
+    )
+    wrapped = _wrap_content(report_id, text)
     _atomic_write_excl(dst, wrapped)
     t_done = time.monotonic()
     return {
         "status": "done",
         "report_path": str(dst),
         "report": wrapped,
+        "artifacts": {"saved": saved, "quarantined": quarantined},
         "timings_ms": {
             "agent": agent_ms,
             "scan": int((t_done - t_scan_start) * 1000),
+            "artifacts": artifacts_ms,
             "total": int((t_done - t_received) * 1000),
         },
     }

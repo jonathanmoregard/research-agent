@@ -33,6 +33,15 @@ from urllib.parse import urlparse
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import sync_playwright
 
+from sessions import (
+    ACT_BUDGET_MS,
+    get_artifact_store,
+    get_worker,
+    validate_actions,
+    validate_artifact_name,
+    validate_run_id,
+)
+
 PORT = int(os.environ.get("SCRAPER_PORT", "8000"))
 TOKEN_FILE = os.environ.get("SCRAPER_TOKEN_FILE", "/etc/scraper/token")
 
@@ -44,6 +53,18 @@ DEFAULT_TIMEOUT_MS = 30_000
 # context. Truncation marker appended when hit; the agent gets a clear
 # signal rather than silent loss.
 MAX_HTML_BYTES = 512 * 1024
+
+
+def _clamp_timeout(v) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or v <= 0 or v > MAX_TIMEOUT_MS:
+        return DEFAULT_TIMEOUT_MS
+    return v
+
+
+_SESSION_PATH = re.compile(
+    r"^/session/([a-f0-9]{16})/(act|screenshot|save_artifact|close)$"
+)
+_ARTIFACTS_PATH = re.compile(r"^/artifacts/([a-f0-9]{32})$")
 
 
 def _load_token() -> str:
@@ -453,6 +474,118 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/intercept":
             self._do_intercept()
             return
+        if self.path == "/session/open":
+            self._do_session_open()
+            return
+        m = _SESSION_PATH.match(self.path)
+        if m:
+            self._do_session_op(m.group(1), m.group(2))
+            return
+        self._json(404, {"status": "error", "error": "not found"})
+
+    def _submit(self, cmd: dict, timeout_s: float = 120.0) -> None:
+        """Submit to the browser worker; normalize errors like /render does.
+
+        timeout_s must exceed the worker-side execution bound for the op
+        (see sessions.ACT_BUDGET_MS hierarchy comment) so the HTTP layer
+        never abandons a command the worker is still executing.
+        """
+        try:
+            out = get_worker().submit(cmd, timeout_s=timeout_s)
+        except RuntimeError as e:
+            self._json(502, {"status": "error", "error": str(e)[:300]})
+            return
+        out["status"] = "ok"
+        self._json(200, out)
+
+    def _do_session_open(self) -> None:
+        if not self._check_auth():
+            return
+        _length, req, err = self._read_body()
+        if err is not None or req is None:
+            self._json(400, {"status": "error", "error": err or "bad json"})
+            return
+        url = req.get("url")
+        if not isinstance(url, str) or not url or len(url) > MAX_URL_LEN:
+            self._json(400, {"status": "error", "error": "bad url"})
+            return
+        host_err = self._check_url_host(url)
+        if host_err is not None:
+            self._json(400, {"status": "error", "error": host_err})
+            return
+        viewport = req.get("viewport")
+        if viewport is not None and not (
+            isinstance(viewport, dict)
+            and isinstance(viewport.get("width"), int)
+            and not isinstance(viewport.get("width"), bool)
+            and isinstance(viewport.get("height"), int)
+            and not isinstance(viewport.get("height"), bool)
+            and 320 <= viewport["width"] <= 1920
+            and 240 <= viewport["height"] <= 1080
+        ):
+            self._json(400, {"status": "error", "error": "bad viewport"})
+            return
+        timeout_ms = _clamp_timeout(req.get("timeout_ms"))
+        # Browser launch + goto + observe: wait the goto timeout plus 60 s
+        # launch/observe slack so we outlast the worker, never abandon it.
+        self._submit({"op": "open", "url": url, "viewport": viewport,
+                      "timeout_ms": timeout_ms},
+                     timeout_s=timeout_ms / 1000 + 60)
+
+    def _do_session_op(self, sid: str, op: str) -> None:
+        if not self._check_auth():
+            return
+        _length, req, err = self._read_body()
+        if err is not None or req is None:
+            # close/screenshot may come with an empty body; tolerate it.
+            # act/save_artifact require a valid body — return 400 on error.
+            if op in ("act", "save_artifact"):
+                self._json(400, {"status": "error", "error": err or "bad json"})
+                return
+            req = {}
+        if op == "act":
+            actions = req.get("actions") or []
+            verr = validate_actions(actions)
+            if verr is not None:
+                self._json(400, {"status": "error", "error": verr})
+                return
+            # URL gate on every goto — the ONLY navigation entry points are
+            # /session/open and goto actions, both checked here at the HTTP
+            # layer (spec parity with /render).
+            for a in actions:
+                if a["type"] == "goto":
+                    if len(a["url"]) > MAX_URL_LEN:
+                        self._json(400, {"status": "error", "error": "url too long"})
+                        return
+                    host_err = self._check_url_host(a["url"])
+                    if host_err is not None:
+                        self._json(400, {"status": "error", "error": host_err})
+                        return
+            # Worker bounds one act call to ACT_BUDGET_MS; wait that plus
+            # 30 s queue/observe slack so we outlast it (see sessions.py).
+            self._submit({"op": "act", "session_id": sid, "actions": actions,
+                          "timeout_ms": _clamp_timeout(req.get("timeout_ms"))},
+                         timeout_s=ACT_BUDGET_MS / 1000 + 30)
+            return
+        if op == "screenshot":
+            self._submit({"op": "screenshot", "session_id": sid,
+                          "full_page": bool(req.get("full_page"))})
+            return
+        if op == "save_artifact":
+            name = req.get("name")
+            run_id = req.get("run_id")
+            if not validate_artifact_name(name):
+                self._json(400, {"status": "error", "error": "bad artifact name"})
+                return
+            if not validate_run_id(run_id):
+                self._json(400, {"status": "error", "error": "bad run_id"})
+                return
+            self._submit({"op": "save_artifact", "session_id": sid,
+                          "name": name, "run_id": run_id})
+            return
+        if op == "close":
+            self._submit({"op": "close", "session_id": sid})
+            return
         self._json(404, {"status": "error", "error": "not found"})
 
     def _do_render(self) -> None:
@@ -546,6 +679,25 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
             self._json(200, {"status": "ok"})
+            return
+        m = _ARTIFACTS_PATH.match(self.path)
+        if m:
+            if not self._check_auth():
+                return
+            # Store singleton, not get_worker(): pulling artifacts must
+            # never lazily boot the browser worker (and Playwright with it).
+            items = get_artifact_store().take(m.group(1))
+            self._json(200, {"status": "ok", "artifacts": items})
+            return
+        self._json(404, {"status": "error", "error": "not found"})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        m = _ARTIFACTS_PATH.match(self.path)
+        if m:
+            if not self._check_auth():
+                return
+            get_artifact_store().take(m.group(1))
+            self._json(200, {"status": "ok", "cleared": True})
             return
         self._json(404, {"status": "error", "error": "not found"})
 
