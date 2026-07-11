@@ -218,7 +218,7 @@ def gate_env(tmp_path, monkeypatch):
 def test_pass_path_wraps_text(gate_env, monkeypatch):
     raw = json.dumps([{"probability": 62, "rationale": "Benign reasoning."}])
 
-    async def fake_fetch(task_id, token):
+    async def fake_fetch(task_id, token, page_size=10, offset=0):
         return raw
 
     monkeypatch.setattr(gate, "_fetch_results", fake_fetch)
@@ -237,7 +237,7 @@ def test_reject_path_no_leak(gate_env, monkeypatch):
         "rationale": f"{CANARY} here is a key {SECRET_SHAPED}",
     }])
 
-    async def fake_fetch(task_id, token):
+    async def fake_fetch(task_id, token, page_size=10, offset=0):
         return raw
 
     monkeypatch.setattr(gate, "_fetch_results", fake_fetch)
@@ -264,7 +264,7 @@ def test_reject_path_no_leak(gate_env, monkeypatch):
 
 
 def test_scanner_exception_fails_closed(gate_env, monkeypatch):
-    async def fake_fetch(task_id, token):
+    async def fake_fetch(task_id, token, page_size=10, offset=0):
         return json.dumps([{"probability": 1, "rationale": CANARY}])
 
     def boom(content):
@@ -278,7 +278,7 @@ def test_scanner_exception_fails_closed(gate_env, monkeypatch):
 
 
 def test_fetch_failure_is_opaque(gate_env, monkeypatch):
-    async def fake_fetch(task_id, token):
+    async def fake_fetch(task_id, token, page_size=10, offset=0):
         raise ConnectionError(f"secret url with {CANARY}")
 
     monkeypatch.setattr(gate, "_fetch_results", fake_fetch)
@@ -297,7 +297,7 @@ def test_no_token_gives_reauth_hint(gate_env, monkeypatch, tmp_path):
 def test_oversized_rejected_without_quarantine_body(gate_env, monkeypatch):
     big = json.dumps([{"rationale": "x" * (gate._MAX_CONTENT_BYTES + 100)}])
 
-    async def fake_fetch(task_id, token):
+    async def fake_fetch(task_id, token, page_size=10, offset=0):
         return big
 
     monkeypatch.setattr(gate, "_fetch_results", fake_fetch)
@@ -309,7 +309,7 @@ def test_oversized_rejected_without_quarantine_body(gate_env, monkeypatch):
 
 
 def test_nonjson_payload_scanned_as_text(gate_env, monkeypatch):
-    async def fake_fetch(task_id, token):
+    async def fake_fetch(task_id, token, page_size=10, offset=0):
         return "plain text result, not json, benign"
 
     monkeypatch.setattr(gate, "_fetch_results", fake_fetch)
@@ -324,7 +324,7 @@ def test_scanner_contract_violation_fails_closed(gate_env, monkeypatch):
     # A passing verdict whose sanitized_text is not a str is a scanner
     # contract violation — must route through the quarantined path, not
     # TypeError on the happy path, and leak nothing.
-    async def fake_fetch(task_id, token):
+    async def fake_fetch(task_id, token, page_size=10, offset=0):
         return json.dumps([{"probability": 5, "rationale": CANARY}])
 
     def bad_scan(content):
@@ -379,3 +379,89 @@ def test_assemble_content_text_fallback_joins_blocks():
 
 def test_assemble_content_empty_result():
     assert gate._assemble_content(_StubResult()) == ""
+
+
+# ---------------------------------------------------------------------------
+# _extract_json (whole-string JSON, or embedded JSON after a preamble —
+# the live futuresearch_results shape) + pagination passthrough
+# ---------------------------------------------------------------------------
+
+# Mirrors the real payload observed against the live server: a short
+# human preamble, then a JSON array starting mid-string.
+_REAL_SHAPE_PAYLOAD = (
+    "Results for task abc123 (1 row):\n"
+    "Use offset/page_size to paginate.\n"
+    "\n"
+    "Rows:\n"
+    + json.dumps([{
+        "question": "Will X happen?",
+        "resolution_date": "2027-03-01",
+        "rationale": "Long free-form reasoning " * 20,
+        "probability": 62,
+        "consistency_note": "free text",
+        "research": {"sources_used": 14},
+    }])
+)
+
+
+def test_extract_json_whole_string():
+    obj = gate._extract_json(json.dumps({"probability": 62}))
+    assert obj == {"probability": 62}
+
+
+def test_extract_json_embedded_after_preamble():
+    obj = gate._extract_json(_REAL_SHAPE_PAYLOAD)
+    assert isinstance(obj, list) and obj[0]["probability"] == 62
+
+
+def test_extract_json_garbage_returns_none():
+    assert gate._extract_json("no braces here at all") is None
+    assert gate._extract_json("preamble then { not json ][") is None
+
+
+def test_real_shape_payload_yields_typed_skeleton():
+    parsed = gate._extract_json(_REAL_SHAPE_PAYLOAD)
+    skel, dropped = gate._typed_skeleton(parsed)
+    assert skel == [{
+        "resolution_date": "2027-03-01",
+        "probability": 62,
+        "research": {"sources_used": 14},
+    }]
+    # question, rationale, consistency_note dropped
+    assert dropped == 3
+
+
+def test_forecast_results_passes_pagination_through(gate_env, monkeypatch):
+    seen = {}
+
+    async def fake_fetch(task_id, token, page_size=10, offset=0):
+        seen["page_size"] = page_size
+        seen["offset"] = offset
+        return json.dumps([{"probability": 1}])
+
+    monkeypatch.setattr(gate, "_fetch_results", fake_fetch)
+    monkeypatch.setattr(gate, "_scan", _fake_pass_scan)
+    res = _run(gate.forecast_results("task-p", page_size=250, offset=500))
+    assert res["status"] == "done"
+    assert seen == {"page_size": 250, "offset": 500}
+
+
+def test_forecast_results_rejects_bad_pagination_without_fetch(
+    gate_env, monkeypatch
+):
+    calls = []
+
+    async def fake_fetch(task_id, token, page_size=10, offset=0):
+        calls.append(task_id)
+        return "{}"
+
+    monkeypatch.setattr(gate, "_fetch_results", fake_fetch)
+    for kwargs in (
+        {"page_size": 0},
+        {"page_size": 100001},
+        {"page_size": True},
+        {"offset": -1},
+    ):
+        res = _run(gate.forecast_results("task-bad", **kwargs))
+        assert res["status"] == "error"
+    assert calls == []  # no fetch happened for any invalid input

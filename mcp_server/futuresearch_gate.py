@@ -281,13 +281,45 @@ def _assemble_content(result) -> str:
     return "\n".join(parts)
 
 
-async def _fetch_results(task_id: str, token: str) -> str:
+def _extract_json(raw: str):
+    """Best-effort JSON extraction for the typed skeleton. Pure helper.
+
+    The live futuresearch_results tool returns one text block: a short
+    human preamble followed by an embedded JSON array mid-string, so a
+    whole-string json.loads always fails. Try the whole string first;
+    on failure, raw_decode from the FIRST '[' or '{' only (single
+    attempt — the size gate already bounds the input, and a payload
+    whose first brace is garbage just yields None / no skeleton).
+    Returns the parsed object or None. Never raises on bad input from
+    the decode paths themselves (callers still wrap defensively).
+    """
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    candidates = [i for i in (raw.find("["), raw.find("{")) if i != -1]
+    if not candidates:
+        return None
+    idx = min(candidates)
+    try:
+        obj, _end = json.JSONDecoder().raw_decode(raw[idx:])
+    except Exception:
+        return None
+    return obj
+
+
+async def _fetch_results(
+    task_id: str, token: str, page_size: int = 10, offset: int = 0
+) -> str:
     """Call futuresearch_results on the hosted MCP, server-side.
 
-    Returns `structuredContent` (as JSON) when the server provides it,
-    else the joined text blocks — see `_assemble_content`. The bytes
-    this returns are UNTRUSTED — no caller may place them in a response
-    without passing them through the scan path.
+    The hosted tool requires its arguments nested under "params"
+    (verified against the live server — a bare {"task_id": ...} gets a
+    validation-error text back). Returns `structuredContent` (as JSON)
+    when the server provides it, else the joined text blocks — see
+    `_assemble_content`. The bytes this returns are UNTRUSTED — no
+    caller may place them in a response without passing them through
+    the scan path.
     """
     import anyio
     from mcp import ClientSession
@@ -301,7 +333,14 @@ async def _fetch_results(task_id: str, token: str) -> str:
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(
-                    "futuresearch_results", {"task_id": task_id}
+                    "futuresearch_results",
+                    {
+                        "params": {
+                            "task_id": task_id,
+                            "page_size": page_size,
+                            "offset": offset,
+                        }
+                    },
                 )
     return _assemble_content(result)
 
@@ -310,7 +349,9 @@ mcp = FastMCP("futuresearch-gate")
 
 
 @mcp.tool()
-async def forecast_results(task_id: str) -> dict:
+async def forecast_results(
+    task_id: str, page_size: int = 10, offset: int = 0
+) -> dict:
     """Fetch FutureSearch task results with injection screening.
 
     Typed numeric fields (percentiles, probabilities, dates) are
@@ -323,6 +364,9 @@ async def forecast_results(task_id: str) -> dict:
     Args:
         task_id: The FutureSearch task id from a futuresearch_* submit
             tool (e.g. futuresearch_forecast).
+        page_size: Rows per page (1..10000), passed through to the
+            hosted futuresearch_results tool.
+        offset: Pagination offset (>= 0), passed through likewise.
 
     Returns:
         On pass:   {"status": "done", "gate_id", "data", "fields_withheld",
@@ -341,6 +385,19 @@ async def forecast_results(task_id: str) -> dict:
     # log truncated.
     _LOG.info("gate call id=%s task_id=%s", gate_id, task_id[:64])
 
+    # Validate pagination before any network I/O. bool is an int
+    # subclass — exclude it explicitly.
+    if (
+        isinstance(page_size, bool) or not isinstance(page_size, int)
+        or not 1 <= page_size <= 10000
+    ):
+        return {"status": "error", "error": "page_size must be an int in 1..10000"}
+    if (
+        isinstance(offset, bool) or not isinstance(offset, int)
+        or offset < 0
+    ):
+        return {"status": "error", "error": "offset must be an int >= 0"}
+
     token = _resolve_token()
     if not token:
         return {
@@ -353,7 +410,7 @@ async def forecast_results(task_id: str) -> dict:
         }
 
     try:
-        raw = await _fetch_results(task_id, token)
+        raw = await _fetch_results(task_id, token, page_size, offset)
     except BaseException as exc:  # noqa: BLE001 — timeout/cancel included
         # Exception text can embed response fragments; type name only.
         _LOG.warning(
@@ -379,11 +436,13 @@ async def forecast_results(task_id: str) -> dict:
     if not oversized:
         # Best-effort typed skeleton: a non-JSON payload just means no
         # structured data — everything then rides the scanned-text path.
-        # Broad except is belt-and-braces (json.loads can RecursionError
-        # on adversarially deep input); the depth/budget guards inside
+        # _extract_json also handles the live server's real shape
+        # (human preamble + embedded JSON array mid-string). Broad
+        # except is belt-and-braces (json parsing can RecursionError on
+        # adversarially deep input); the depth/budget guards inside
         # _typed_skeleton make its own exceptions structurally unlikely.
         try:
-            parsed = json.loads(raw)
+            parsed = _extract_json(raw)
         except Exception:
             parsed = None
         if parsed is not None:
