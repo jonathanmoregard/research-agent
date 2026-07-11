@@ -95,6 +95,16 @@ def test_wrap_content_no_premature_close():
     _assert(sysrem_close_count == 2, f"expected 2 wrap-emitted </system-reminder>, got {sysrem_close_count}")
 
 
+def test_wrap_content_custom_source():
+    from mcp_server.server import _wrap_content
+
+    out = _wrap_content("deadbeef" * 4, "hello", source="futuresearch-gate")
+    assert 'source="futuresearch-gate/' in out
+    # default unchanged
+    out_default = _wrap_content("deadbeef" * 4, "hello")
+    assert 'source="research-agent/' in out_default
+
+
 def main() -> int:
     tests = [
         test_encodes_close_untrusted,
@@ -105,6 +115,7 @@ def main() -> int:
         test_case_insensitive,
         test_idempotent,
         test_wrap_content_no_premature_close,
+        test_wrap_content_custom_source,
     ]
     for t in tests:
         t()
