@@ -21,7 +21,10 @@ Flow per call:
   4. Scan pass: return skeleton + the sanitized text wrapped in
      untrusted-content tags. Scan reject: quarantine the raw bytes in
      reports/_quarantine/, return skeleton + a generic error. Caller
-     never sees the rejected text, a reason, or a layer name.
+     never sees the rejected text, a reason, or a layer name. Oversized
+     responses are rejected without any raw bytes touching disk (no
+     disk-exhaust primitive) — the audit row carries a length marker
+     only.
 
 Why this exists: FutureSearch's `rationale` is synthesized from web
 pages its agents autonomously crawl — indirect prompt injection surface
@@ -46,6 +49,7 @@ from mcp.server.fastmcp import FastMCP
 
 import mcp_server.server as _server_mod
 from mcp_server.server import (
+    _LOG,
     _MAX_CONTENT_BYTES,
     _atomic_write_excl,
     _bucket_scan_ms,
@@ -257,11 +261,32 @@ def _scan(content: str):
     return _scan_text(content)
 
 
+def _assemble_content(result) -> str:
+    """Reduce a CallToolResult-shaped object to one untrusted string.
+
+    `structuredContent` wins outright when present: MCP spec-compliant
+    servers that send it also duplicate it as a text block for
+    backward compatibility, and concatenating both would produce
+    unparseable JSON (silently costing the caller the typed skeleton).
+    Only when it is absent do we fall back to joining the text blocks.
+    """
+    structured = getattr(result, "structuredContent", None)
+    if structured:
+        return json.dumps(structured)
+    parts: list[str] = []
+    for block in getattr(result, "content", None) or []:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
+
+
 async def _fetch_results(task_id: str, token: str) -> str:
     """Call futuresearch_results on the hosted MCP, server-side.
 
-    Returns the concatenated text of all content blocks. The bytes this
-    returns are UNTRUSTED — no caller may place them in a response
+    Returns `structuredContent` (as JSON) when the server provides it,
+    else the joined text blocks — see `_assemble_content`. The bytes
+    this returns are UNTRUSTED — no caller may place them in a response
     without passing them through the scan path.
     """
     import anyio
@@ -278,14 +303,7 @@ async def _fetch_results(task_id: str, token: str) -> str:
                 result = await session.call_tool(
                     "futuresearch_results", {"task_id": task_id}
                 )
-    parts: list[str] = []
-    if getattr(result, "structuredContent", None):
-        parts.append(json.dumps(result.structuredContent))
-    for block in result.content or []:
-        text = getattr(block, "text", None)
-        if isinstance(text, str):
-            parts.append(text)
-    return "\n".join(parts)
+    return _assemble_content(result)
 
 
 mcp = FastMCP("futuresearch-gate")
@@ -316,6 +334,12 @@ async def forecast_results(task_id: str) -> dict:
     """
     t0 = time.monotonic()
     gate_id = uuid.uuid4().hex
+    # Durable file log (~/.cache/research-agent/server.log): stderr from
+    # an MCP server is only captured during the connection window, so
+    # per-call triage info must go through server.py's rotating logger.
+    # task_id is caller-supplied (not attacker web content) — safe to
+    # log truncated.
+    _LOG.info("gate call id=%s task_id=%s", gate_id, task_id[:64])
 
     token = _resolve_token()
     if not token:
@@ -332,6 +356,9 @@ async def forecast_results(task_id: str) -> dict:
         raw = await _fetch_results(task_id, token)
     except BaseException as exc:  # noqa: BLE001 — timeout/cancel included
         # Exception text can embed response fragments; type name only.
+        _LOG.warning(
+            "gate fetch failed id=%s type=%s", gate_id, type(exc).__name__
+        )
         print(
             f"futuresearch-gate: fetch failed id={gate_id} "
             f"type={type(exc).__name__}",
@@ -363,6 +390,10 @@ async def forecast_results(task_id: str) -> dict:
             try:
                 data, fields_withheld = _typed_skeleton(parsed)
             except Exception as exc:
+                _LOG.warning(
+                    "gate skeleton failed id=%s type=%s",
+                    gate_id, type(exc).__name__,
+                )
                 print(
                     f"futuresearch-gate: skeleton failed id={gate_id} "
                     f"type={type(exc).__name__}",
@@ -386,11 +417,25 @@ async def forecast_results(task_id: str) -> dict:
         except Exception as exc:
             verdict = _scan_error_verdict(exc)
 
+    # Verdict outcome to the durable log. Reason CODE only (prefix
+    # before the first ':'): the full reason can embed a snippet of the
+    # scanned bytes (e.g. secret_shape rejects), and server.log is NOT
+    # in the deny-listed quarantine zone — full verdicts belong only in
+    # audit.jsonl. The code still tells the operator which layer fired.
+    _LOG.info(
+        "gate scan id=%s ok=%s reason_code=%s",
+        gate_id, verdict.ok, verdict.reason.split(":", 1)[0],
+    )
+
     if not verdict.ok:
         quarantine = REPORTS_DIR / "_quarantine"
         try:
             quarantine.mkdir(parents=True, exist_ok=True)
         except OSError as e:
+            _LOG.error(
+                "gate quarantine mkdir failed id=%s type=%s",
+                gate_id, type(e).__name__,
+            )
             print(
                 f"futuresearch-gate: quarantine mkdir failed {gate_id}: {e}",
                 file=sys.stderr,
@@ -402,6 +447,10 @@ async def forecast_results(task_id: str) -> dict:
                 try:
                     _atomic_write_excl(quarantine / f"{gate_id}.md", raw)
                 except OSError as e:
+                    _LOG.error(
+                        "gate quarantine write failed id=%s type=%s",
+                        gate_id, type(e).__name__,
+                    )
                     print(
                         f"futuresearch-gate: quarantine write failed "
                         f"{gate_id}: {e}",

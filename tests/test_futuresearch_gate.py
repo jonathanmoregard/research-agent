@@ -318,3 +318,43 @@ def test_nonjson_payload_scanned_as_text(gate_env, monkeypatch):
     assert res["status"] == "done"
     assert res["data"] is None
     assert "benign" in res["text"]
+
+
+# ---------------------------------------------------------------------------
+# _assemble_content (CallToolResult -> one untrusted string)
+# ---------------------------------------------------------------------------
+
+class _StubBlock:
+    def __init__(self, text):
+        self.text = text
+
+
+class _StubResult:
+    def __init__(self, structured=None, content=None):
+        self.structuredContent = structured
+        self.content = content
+
+
+def test_assemble_content_prefers_structured():
+    # Spec-compliant servers duplicate structuredContent as a text
+    # block; concatenating both would be unparseable JSON. Structured
+    # must win alone.
+    structured = {"result": [{"probability": 62}]}
+    r = _StubResult(
+        structured=structured,
+        content=[_StubBlock(json.dumps(structured))],
+    )
+    out = gate._assemble_content(r)
+    assert json.loads(out) == structured
+
+
+def test_assemble_content_text_fallback_joins_blocks():
+    r = _StubResult(
+        structured=None,
+        content=[_StubBlock("part one"), object(), _StubBlock("part two")],
+    )
+    assert gate._assemble_content(r) == "part one\npart two"
+
+
+def test_assemble_content_empty_result():
+    assert gate._assemble_content(_StubResult()) == ""
