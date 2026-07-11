@@ -137,3 +137,64 @@ def _resolve_token() -> str | None:
             continue
         return tok
     return None
+
+
+# Reject-path survivors. Keys: strict identifier-ish charset, length-capped
+# — a snake_case key with a numeric value is not a usable injection
+# vehicle, but free-charset keys would be. Values: only types that cannot
+# carry instructions. Date strings and the literal "never" are FutureSearch's
+# documented date-percentile vocabulary.
+_KEY_RX = re.compile(r"^[A-Za-z0-9_.\-]{1,48}$")
+_DATE_RX = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SKELETON_MAX_KEYS = 1024
+
+
+class _Drop:
+    __slots__ = ()
+
+
+_DROP = _Drop()
+
+
+def _typed_skeleton(node, _budget: list[int] | None = None):
+    """Walk parsed JSON; keep only injection-proof leaves.
+
+    Returns (skeleton, dropped_count). `dropped_count` counts leaves and
+    keys removed — reported to the caller as a number so the response
+    can say "N fields withheld" without echoing any of them.
+    """
+    if _budget is None:
+        _budget = [_SKELETON_MAX_KEYS]
+    dropped = 0
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            if not isinstance(k, str) or not _KEY_RX.fullmatch(k):
+                dropped += 1
+                continue
+            if _budget[0] <= 0:
+                dropped += 1
+                continue
+            sub, sub_dropped = _typed_skeleton(v, _budget)
+            dropped += sub_dropped
+            if sub is _DROP:
+                dropped += 1
+                continue
+            _budget[0] -= 1
+            out[k] = sub
+        return out, dropped
+    if isinstance(node, list):
+        out = []
+        for v in node:
+            sub, sub_dropped = _typed_skeleton(v, _budget)
+            dropped += sub_dropped
+            if sub is _DROP:
+                dropped += 1
+                continue
+            out.append(sub)
+        return out, dropped
+    if node is None or isinstance(node, (bool, int, float)):
+        return node, 0
+    if isinstance(node, str) and (_DATE_RX.fullmatch(node) or node == "never"):
+        return node, 0
+    return _DROP, 0
