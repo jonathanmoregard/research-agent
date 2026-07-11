@@ -254,8 +254,13 @@ def test_reject_path_no_leak(gate_env, monkeypatch):
     assert len(files) == 1 and CANARY in files[0].read_text()
     audit = (q / "audit.jsonl").read_text()
     assert res["gate_id"] in audit
-    # timing bucketized
+    # timing bucketized; total derived (fetch + bucketized scan), so
+    # total - fetch can't recover the precise scan duration
     assert res["timings_ms"]["scan"] % 5000 == 0
+    assert (
+        res["timings_ms"]["total"]
+        == res["timings_ms"]["fetch"] + res["timings_ms"]["scan"]
+    )
 
 
 def test_scanner_exception_fails_closed(gate_env, monkeypatch):

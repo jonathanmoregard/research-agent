@@ -415,6 +415,12 @@ async def forecast_results(task_id: str) -> dict:
                 reports_dir=REPORTS_DIR,
             )
         t_done = time.monotonic()
+        # Reject-path timing: `scan` is bucketized, and `total` is
+        # DERIVED (fetch + bucketized scan), not measured — a precise
+        # total would let a caller recover the exact scan duration via
+        # total - fetch, defeating _bucket_scan_ms. `fetch` is pre-scan
+        # and carries no layer-fingerprint signal, so it stays precise.
+        scan_ms = _bucket_scan_ms(int((t_done - t_fetch) * 1000))
         return {
             "status": "quarantined",
             "gate_id": gate_id,
@@ -424,8 +430,8 @@ async def forecast_results(task_id: str) -> dict:
                      "typed fields in `data` are still valid",
             "timings_ms": {
                 "fetch": fetch_ms,
-                "scan": _bucket_scan_ms(int((t_done - t_fetch) * 1000)),
-                "total": int((t_done - t0) * 1000),
+                "scan": scan_ms,
+                "total": fetch_ms + scan_ms,
             },
         }
 
