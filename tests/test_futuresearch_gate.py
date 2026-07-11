@@ -126,3 +126,45 @@ def test_skeleton_caps_size():
     skel, dropped = gate._typed_skeleton(rows)
     total = sum(len(r) for r in skel)
     assert total <= gate._SKELETON_MAX_KEYS
+
+
+def test_skeleton_list_items_consume_budget():
+    rows = [{"nums": list(range(5000))}]
+    skel, dropped = gate._typed_skeleton(rows)
+    kept = len(skel[0].get("nums", []))
+    assert kept <= gate._SKELETON_MAX_KEYS
+    assert dropped >= 5000 - gate._SKELETON_MAX_KEYS
+
+
+def test_skeleton_hard_cap_under_nesting():
+    node = cur = {}
+    for i in range(30):
+        nxt = {}
+        cur[f"level{i}"] = nxt
+        cur = nxt
+    for i in range(2000):
+        cur[f"k{i}"] = i
+
+    def count(n):
+        if isinstance(n, dict):
+            return sum(1 + count(v) for v in n.values())
+        if isinstance(n, list):
+            return sum(1 + count(v) for v in n)
+        return 0
+
+    skel, dropped = gate._typed_skeleton(node)
+    assert count(skel) <= gate._SKELETON_MAX_KEYS
+
+
+def test_skeleton_depth_guard_no_recursion_error():
+    deep = 42
+    for _ in range(5000):
+        deep = [deep]
+    skel, dropped = gate._typed_skeleton(deep)  # must not raise
+    assert dropped >= 1
+
+
+def test_skeleton_top_level_leaf_returns_none():
+    skel, dropped = gate._typed_skeleton("just free text")
+    assert skel is None
+    assert dropped == 1

@@ -147,6 +147,7 @@ def _resolve_token() -> str | None:
 _KEY_RX = re.compile(r"^[A-Za-z0-9_.\-]{1,48}$")
 _DATE_RX = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _SKELETON_MAX_KEYS = 1024
+_SKELETON_MAX_DEPTH = 32
 
 
 class _Drop:
@@ -156,17 +157,34 @@ class _Drop:
 _DROP = _Drop()
 
 
-def _typed_skeleton(node, _budget: list[int] | None = None):
+def _typed_skeleton(node, _budget: list[int] | None = None, _depth: int = 0):
     """Walk parsed JSON; keep only injection-proof leaves.
 
     Returns (skeleton, dropped_count). `dropped_count` counts leaves and
     keys removed — reported to the caller as a number so the response
     can say "N fields withheld" without echoing any of them.
+
+    Bounds, enforced structurally rather than by trusting upstream:
+      * Budget: `_budget` is one shared counter for the whole walk,
+        consumed by every KEPT entry — dict keys AND list items alike.
+        A slot is reserved (decremented) BEFORE recursing into the
+        entry's value, so total kept entries can never exceed
+        `_SKELETON_MAX_KEYS` even under nesting; the slot is refunded
+        only when the entry turns out to be a dropped leaf.
+      * Depth: containers deeper than `_SKELETON_MAX_DEPTH` are dropped
+        wholesale (counted as one drop at the parent), so adversarially
+        deep JSON cannot raise RecursionError.
+      * Sentinel containment: the internal `_DROP` marker never escapes
+        to callers — a top-level value that would drop (e.g. the whole
+        document is one free string) is normalized to (None, 1).
     """
-    if _budget is None:
+    top = _budget is None
+    if top:
         _budget = [_SKELETON_MAX_KEYS]
     dropped = 0
     if isinstance(node, dict):
+        if _depth > _SKELETON_MAX_DEPTH:
+            return (None, 1) if top else (_DROP, 0)
         out = {}
         for k, v in node.items():
             if not isinstance(k, str) or not _KEY_RX.fullmatch(k):
@@ -175,20 +193,28 @@ def _typed_skeleton(node, _budget: list[int] | None = None):
             if _budget[0] <= 0:
                 dropped += 1
                 continue
-            sub, sub_dropped = _typed_skeleton(v, _budget)
+            _budget[0] -= 1  # reserve this entry's slot before recursing
+            sub, sub_dropped = _typed_skeleton(v, _budget, _depth + 1)
             dropped += sub_dropped
             if sub is _DROP:
+                _budget[0] += 1  # slot unused: dropped entries are free
                 dropped += 1
                 continue
-            _budget[0] -= 1
             out[k] = sub
         return out, dropped
     if isinstance(node, list):
+        if _depth > _SKELETON_MAX_DEPTH:
+            return (None, 1) if top else (_DROP, 0)
         out = []
         for v in node:
-            sub, sub_dropped = _typed_skeleton(v, _budget)
+            if _budget[0] <= 0:
+                dropped += 1
+                continue
+            _budget[0] -= 1  # reserve this item's slot before recursing
+            sub, sub_dropped = _typed_skeleton(v, _budget, _depth + 1)
             dropped += sub_dropped
             if sub is _DROP:
+                _budget[0] += 1  # slot unused: dropped items are free
                 dropped += 1
                 continue
             out.append(sub)
@@ -197,4 +223,4 @@ def _typed_skeleton(node, _budget: list[int] | None = None):
         return node, 0
     if isinstance(node, str) and (_DATE_RX.fullmatch(node) or node == "never"):
         return node, 0
-    return _DROP, 0
+    return (None, 1) if top else (_DROP, 0)
