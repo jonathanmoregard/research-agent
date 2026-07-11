@@ -46,6 +46,11 @@ FUTURESEARCH_MCP_URL = os.environ.get(
     "FUTURESEARCH_MCP_URL", "https://mcp.futuresearch.ai/mcp"
 )
 
+# Read at import-time on purpose — same convention as server.py's
+# _CLAUDE_CREDENTIALS_PATH: the path must be stable for the server's
+# lifetime so concurrent callers see a single agreed value. The wrapper
+# sets CLAUDE_CREDENTIALS_FILE before spawning the MCP; tests override
+# by monkeypatching this module attribute.
 _CREDENTIALS_PATH = Path(
     os.environ.get("CLAUDE_CREDENTIALS_FILE")
     or (Path.home() / ".claude" / ".credentials.json")
@@ -74,6 +79,10 @@ def _read_credentials_json() -> dict | None:
         st = os.fstat(fd)
         if not stat_mod.S_ISREG(st.st_mode):
             return None
+        # 64 KiB cap (vs server.py's 16 KiB): server.py reads only the
+        # claudeAiOauth block, but this file also carries one mcpOAuth
+        # entry per connected MCP server. Real files are still well
+        # under this; anything larger is not a credentials file.
         if st.st_size > 64 * 1024:
             return None
         with os.fdopen(fd, "r", encoding="utf-8") as f:
@@ -119,7 +128,12 @@ def _resolve_token() -> str | None:
         expires_at = entry.get("expiresAt")
         if not isinstance(tok, str) or not tok:
             continue
-        if isinstance(expires_at, (int, float)) and expires_at / 1000 <= time.time():
+        # Fail closed: only a real, in-the-future epoch-millis expiry is
+        # acceptable. Missing/None/string/bool expiresAt -> treat as
+        # expired rather than immortal.
+        if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+            continue
+        if expires_at / 1000 <= time.time():
             continue
         return tok
     return None
