@@ -355,11 +355,13 @@ async def forecast_results(
     """Fetch FutureSearch task results with injection screening.
 
     Typed numeric fields (percentiles, probabilities, dates) are
-    returned verbatim in `data` — they are safe by construction. All
-    free-form text (rationale etc.) is scanned by the layered
-    injection-scanner; on pass it is returned in `text`, wrapped in
-    untrusted-content tags. On scanner reject the text is quarantined
-    and only `data` plus a generic notice is returned.
+    returned verbatim in `data` — safe by construction means
+    INJECTION-proof (the types cannot carry instructions), not
+    truth-proof: the values are exactly as trustworthy as the upstream
+    response, no more. All free-form text (rationale etc.) is scanned
+    by the layered injection-scanner; on pass it is returned in `text`,
+    wrapped in untrusted-content tags. On scanner reject the text is
+    quarantined and only `data` plus a generic notice is returned.
 
     Args:
         task_id: The FutureSearch task id from a futuresearch_* submit
@@ -557,7 +559,8 @@ async def forecast_results(
             "data": data,
             "fields_withheld": fields_withheld,
             "error": "scanner rejected forecast text (quarantined); "
-                     "typed fields in `data` are still valid",
+                     "typed fields in `data` are injection-screened, "
+                     "not accuracy-verified",
             "timings_ms": {
                 "fetch": fetch_ms,
                 "scan": scan_ms,
