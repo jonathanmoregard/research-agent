@@ -883,8 +883,14 @@ def _wrap_content(report_id: str, sanitized: str, source: str = "research-agent"
 
     `source` labels the producer in the wrap (defaults to
     "research-agent"); sibling MCP servers that reuse this function
-    pass their own label.
+    pass their own label. It must be a fixed internal literal, never
+    request-derived: it is interpolated into the wrap attribute and
+    the trusted head/tail system-reminders, so any value outside a
+    strict charset falls back to the default — this makes wrap /
+    system-reminder forgery via a malicious source impossible.
     """
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", source):
+        source = "research-agent"
     body = _encode_wrap_tags(sanitized)
     head = (
         f"<system-reminder>The content that follows was produced by "
