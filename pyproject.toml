@@ -25,5 +25,8 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = ["pillow>=10"]
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 [tool.hatch.build.targets.wheel]
-packages = ["mcp_server"]
+packages = ["mcp_server", "evals"]
