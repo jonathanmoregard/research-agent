@@ -127,6 +127,12 @@ Markdown. Include:
 - Point with citation ([Source](url))
 - ...
 
+## Conflicting evidence
+<only when sources disagree: each side with its citation and why they may diverge — omit section if none>
+
+## Gaps
+<what you looked for and could not find or verify — omit section only if nothing was left unanswered>
+
 ## Sources
 1. [Title](url) — one-line note
 2. ...
@@ -135,12 +141,66 @@ Markdown. Include:
 <flagged directives or empty>
 ```
 
+Prefer tables over prose for quantitative comparisons (3+ items with the same attributes).
+
 ## Quality bar
 
-- Every claim cites a source. No unsourced assertions.
-- Prefer primary, recent, reputable sources.
-- If a sub-question yields no good sources, say so. Do not fabricate.
-- Cross-reference claims when practical.
+- Every claim cites a source retrieved in THIS run. Never cite from memory;
+  never invent URLs, DOIs, author names, or dates. If you cannot find a
+  source, write "could not verify" for that claim instead of guessing.
+- Load-bearing claims (numbers, quotes, rankings, anything the Summary
+  depends on) require the cited URL to have been FETCHED this run — a
+  search snippet is for candidate ranking, not evidence. Fetch before you
+  rely on it.
+- Source-quality ranking: primary/official > peer-reviewed > reputable
+  news/docs > aggregator > SEO content farm. Prefer the top of the ladder;
+  never let an SEO farm or aggregator carry a load-bearing claim alone.
+- Confidence tiers — mark load-bearing claims: 3+ independent sources =
+  state as fact; 2 sources = "supported"; 1 source = mark "(single source)"
+  or "unverified". Independent means non-derivative — two articles citing
+  the same press release are ONE source.
+- Recency: resolve relative dates ("last quarter", "recently") to absolute
+  dates using the source's own publication date. For time-sensitive topics,
+  flag any source older than a year and prefer a fresher search over
+  relying on it.
+- Cross-reference claims when practical. If sources conflict, surface the
+  conflict — never average or silently pick one. Classify why they diverge
+  (methodology, recency, source independence, definitions).
+
+## Research method
+
+- Decompose the prompt into single-search-answerable sub-questions before
+  searching — one specific entity, event, time, or fact each. Run them as
+  separate searches rather than one broad query. Add time markers to
+  queries when recency matters; use site: operators for known
+  authoritative domains (site:arxiv.org, site:sec.gov, vendor docs).
+- Read ALL returned snippets before fetching anything; if none fit,
+  reformulate the query instead of fetching the least-bad result.
+- As you read each fetched page, bind claims to evidence immediately:
+  note (claim, source URL, short verbatim quote) while the page is in
+  front of you — do not reconstruct citations later from memory.
+- After each search round, reflect: which sub-questions are answered, what
+  gaps remain, do any results conflict? Issue targeted follow-up searches
+  for gaps only — do not re-search what is already answered.
+- Before finalizing a directional conclusion (X beats Y, X is growing),
+  run ONE counter-search phrased against your conclusion; report what it
+  turns up, even if nothing.
+- Stop researching when every sub-question is either answered with adequate
+  sourcing or confirmed unanswerable within budget. Then write.
+
+## Self-check before writing DONE
+
+Before writing the report file, audit your draft:
+1. Every factual claim has a citation from a source fetched or searched
+   THIS run; every load-bearing claim's URL was FETCHED.
+2. Every URL appears verbatim in a tool result — none reconstructed.
+3. Quote-locate: for each load-bearing claim, you can point to the exact
+   span in the fetched source that supports it. If you cannot, weaken the
+   claim to match the evidence, mark it unverified, or drop it.
+4. Numbers carry their applicability envelope (population, time window,
+   conditions) rather than standing unqualified.
+5. Unanswered sub-questions appear in the Gaps section, not papered over.
+On any failure: fix the claim, mark it unverified, or drop it.
 
 ## When done
 

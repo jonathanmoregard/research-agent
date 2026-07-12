@@ -448,27 +448,33 @@ DEPTH_GUIDANCE: dict[Depth, str] = {
         "individual URLs. Produce a short report (<15 lines) from snippets."
     ),
     "normal": (
-        "Research depth: NORMAL. Up to 3 `mcp__exa__web_search_exa` calls "
-        "with `type='auto'`, `numResults=8`, `livecrawl='fallback'`. Fetch "
+        "Research depth: NORMAL. Decompose the prompt into 2-3 "
+        "single-search-answerable sub-questions. Up to 3 "
+        "`mcp__exa__web_search_exa` calls (one per sub-question) with "
+        "`type='auto'`, `numResults=8`, `livecrawl='fallback'`. Fetch "
         "the top 2 most relevant URLs via `mcp__exa__web_fetch_exa` for "
-        "fuller context. Cross-reference."
+        "fuller context — load-bearing claims need a fetched source, "
+        "not a snippet. Cross-reference. Stop as soon as every "
+        "sub-question is answered or confirmed unanswerable."
     ),
     "deep": (
-        "Research depth: DEEP. Call `mcp__exa__web_search_exa` with "
-        "`type='deep'` (Exa's built-in deep-research mode), "
-        "`numResults=15`, `livecrawl='always'` for freshness. Fan out "
-        "to 2-3 sub-questions. Fetch the top 5 URLs via "
-        "`mcp__exa__web_fetch_exa`. If available, also use "
-        "`mcp__tavily-remote-mcp__tavily_research` to run a cross-provider "
-        "synthesis over one sub-question. Aim for broad coverage and "
-        "explicit cross-referencing."
+        "Research depth: DEEP. Decompose into sub-questions and call "
+        "`mcp__exa__web_search_exa` with `type='deep'` (Exa's built-in "
+        "deep-research mode), `numResults=15`, `livecrawl='always'` for "
+        "freshness. Fan out to 2-3 sub-questions. Fetch the top 5 URLs "
+        "via `mcp__exa__web_fetch_exa`. After each round, reflect on "
+        "remaining gaps and conflicts; search only the gaps. If "
+        "available, also use `mcp__tavily-remote-mcp__tavily_research` "
+        "to run a cross-provider synthesis over one sub-question. Aim "
+        "for broad coverage and explicit cross-referencing. Stop when "
+        "gaps are closed or the call budget is spent."
     ),
 }
 
 PROMPT_TEMPLATE = (
-    "You are the research-agent. Investigate the following prompt using the "
-    "available web MCPs (exa, tavily), then write a cited markdown report to "
-    "exactly this path:\n\n"
+    "You are the research-agent. Today's date is {today}. Investigate the "
+    "following prompt using the available web MCPs (exa, tavily), then "
+    "write a cited markdown report to exactly this path:\n\n"
     "    {scratch_path}\n\n"
     "{depth_guidance}\n\n"
     "Do not write to any other location. Do not print the report to stdout. "
@@ -519,6 +525,7 @@ def _run_agent(prompt: str, report_id: str, depth: Depth) -> tuple[int, str]:
     """
     scratch_path = f"/scratch/{report_id}.md"
     full_prompt = PROMPT_TEMPLATE.format(
+        today=time.strftime("%Y-%m-%d"),
         scratch_path=scratch_path,
         depth_guidance=DEPTH_GUIDANCE[depth],
         prompt=prompt,
