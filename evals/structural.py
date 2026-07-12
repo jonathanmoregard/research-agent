@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field
 
 REQUIRED_SECTIONS = ["## Summary", "## Findings", "## Sources", "## Suspicious content"]
-_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+_LINK = re.compile(r"\[([^\]]+)\]\(((?:https?://)(?:[^()\s]|\([^()\s]*\))+)\)")
 
 
 @dataclass
@@ -25,13 +25,23 @@ def check_report(text: str) -> StructuralResult:
     sources = _section_body(text, "## Sources")
     source_urls = {url for _, url in _LINK.findall(sources)}
 
+    # Join hard-wrapped bullets: lines not starting with "-" append to current bullet.
+    bullets: list[str] = []
     for line in findings.splitlines():
-        line = line.strip()
-        if not line.startswith("-"):
+        stripped = line.strip()
+        if not stripped:
             continue
-        urls = [url for _, url in _LINK.findall(line)]
-        if not urls and not _is_marked_unverified(line):
-            failures.append(f"uncited finding: {line[:80]}")
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith("-"):
+            bullets.append(stripped)
+        elif bullets:
+            bullets[-1] = bullets[-1] + " " + stripped
+
+    for bullet in bullets:
+        urls = [url for _, url in _LINK.findall(bullet)]
+        if not urls and not _is_marked_unverified(bullet):
+            failures.append(f"uncited finding: {bullet[:80]}")
         for url in urls:
             if url not in source_urls:
                 failures.append(f"cited URL not in Sources: {url}")

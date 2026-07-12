@@ -26,3 +26,20 @@ def test_cited_urls_must_appear_in_sources():
     )
     result = check_report(text)
     assert not result.ok
+
+
+def test_url_with_parentheses():
+    text = (FIXTURES / "report_good.md").read_text().replace(
+        "https://example.com/a", "https://en.wikipedia.org/wiki/Foo_(bar)"
+    )
+    result = check_report(text)
+    assert result.ok, result.failures
+
+
+def test_wrapped_bullet_citation_counts():
+    text = (FIXTURES / "report_good.md").read_text().replace(
+        "- First claim with citation ([Example Source](https://example.com/a))",
+        "- First claim with citation that wraps\n  onto a second line ([Example Source](https://example.com/a))",
+    )
+    result = check_report(text)
+    assert result.ok, result.failures
