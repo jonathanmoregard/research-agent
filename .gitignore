@@ -27,3 +27,6 @@ venv/
 
 # OS
 .DS_Store
+
+# Eval runtime output
+evals/results/
