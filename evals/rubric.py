@@ -43,6 +43,7 @@ Also set:
 
 Respond with ONLY a JSON object with exactly these keys:
 factual_accuracy, citation_accuracy, completeness, source_quality, instruction_following, expectation_met, overall, notes
+No prose, no markdown fences.
 """
 
 
