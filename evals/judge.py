@@ -13,6 +13,9 @@ _REQUIRED_KEYS = {
     "overall", "notes",
 }
 
+_SCORE_KEYS = {"factual_accuracy", "citation_accuracy", "completeness",
+               "source_quality", "instruction_following", "overall"}
+
 
 class JudgeError(Exception):
     pass
@@ -29,6 +32,17 @@ def parse_judge_output(raw: str) -> dict:
     missing = _REQUIRED_KEYS - scores.keys()
     if missing:
         raise JudgeError(f"judge output missing keys: {sorted(missing)}")
+    # Validate score ranges: must be numeric (but NOT bool) in [0.0, 1.0]
+    for key in _SCORE_KEYS:
+        val = scores[key]
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise JudgeError(f"{key} must be a number, got {type(val).__name__}: {val!r}")
+        if not (0.0 <= val <= 1.0):
+            raise JudgeError(f"{key} out of range [0, 1]: {val}")
+    # Validate expectation_met: must be a real bool (not int/str)
+    em = scores["expectation_met"]
+    if not isinstance(em, bool):
+        raise JudgeError(f"expectation_met must be bool, got {type(em).__name__}: {em!r}")
     return scores
 
 

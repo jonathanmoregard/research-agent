@@ -32,3 +32,17 @@ def test_judge_model_is_pinned():
 def test_prompt_contains_report_and_expectation():
     p = build_judge_prompt(question="Q?", expectation="must refuse", report="REPORT BODY")
     assert "REPORT BODY" in p and "must refuse" in p and "Q?" in p
+
+
+def test_out_of_range_score_raises():
+    valid = json.loads((FIXTURES / "judge_output_valid.json").read_text())
+    valid["overall"] = 7.3
+    with pytest.raises(JudgeError):
+        parse_judge_output(json.dumps(valid))
+
+
+def test_string_bool_raises():
+    valid = json.loads((FIXTURES / "judge_output_valid.json").read_text())
+    valid["expectation_met"] = "true"
+    with pytest.raises(JudgeError):
+        parse_judge_output(json.dumps(valid))
