@@ -45,3 +45,23 @@ def test_regression_ok_within_tolerance():
     cur = {"mean_overall": 0.78, "expectation_pass_rate": 0.9,
            "by_category": {"trap": {"mean_overall": 0.85}}}
     assert compare_to_baseline(cur, base).ok
+
+
+def test_agenix_env_reads_secret_files(tmp_path, monkeypatch):
+    from evals.run_eval import _agenix_env
+    for fname in ("anthropic-api-key", "openai-api-key", "exa-api-key",
+                  "tavily-api-key", "claude-token"):
+        (tmp_path / fname).write_text(f"value-{fname}\n")
+    monkeypatch.setenv("RESEARCH_EVAL_AGENIX_DIR", str(tmp_path))
+    env = _agenix_env()
+    assert env["ANTHROPIC_API_KEY"] == "value-anthropic-api-key"
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "value-claude-token"
+
+
+def test_agenix_env_missing_raises(tmp_path, monkeypatch):
+    import pytest as _pytest
+    from evals.run_eval import _agenix_env
+    monkeypatch.setenv("RESEARCH_EVAL_AGENIX_DIR", str(tmp_path))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with _pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+        _agenix_env()

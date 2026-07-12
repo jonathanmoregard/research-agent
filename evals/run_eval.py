@@ -12,12 +12,40 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+_SECRET_FILES = {
+    "ANTHROPIC_API_KEY": "anthropic-api-key",
+    "OPENAI_API_KEY": "openai-api-key",
+    "EXA_API_KEY": "exa-api-key",
+    "TAVILY_API_KEY": "tavily-api-key",
+    "CLAUDE_CODE_OAUTH_TOKEN": "claude-token",
+}
+
+
+def _agenix_dir() -> Path:
+    return Path(os.environ.get("RESEARCH_EVAL_AGENIX_DIR", "/run/agenix"))
+
+
+def _agenix_env() -> dict[str, str]:
+    env = dict(os.environ)
+    agenix = _agenix_dir()
+    missing = []
+    for var, fname in _SECRET_FILES.items():
+        path = agenix / fname
+        if path.exists():
+            env[var] = path.read_text().rstrip("\n")
+        elif var not in env:
+            missing.append(f"{var} ({path})")
+    if missing:
+        raise RuntimeError(f"missing secrets for eval server spawn: {', '.join(missing)}")
+    return env
 
 MEAN_DROP_TOLERANCE = 0.05
 CATEGORY_DROP_TOLERANCE = 0.10
@@ -76,6 +104,7 @@ async def _research_once(prompt: str, depth: str) -> dict:
         command="uv",
         args=["run", "--project", str(REPO_ROOT),
               "python3", str(REPO_ROOT / "mcp_server" / "server.py")],
+        env=_agenix_env(),
     )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
