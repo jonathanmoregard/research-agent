@@ -45,6 +45,10 @@ def _agenix_env() -> dict[str, str]:
             missing.append(f"{var} ({path})")
     if missing:
         raise RuntimeError(f"missing secrets for eval server spawn: {', '.join(missing)}")
+    # The microvm's /out share is bound to the deployed checkout's reports
+    # dir (nixos research-agent-microvm.nix), not this checkout's. A
+    # worktree-spawned server must read reports where the guest writes them.
+    env.setdefault("RESEARCH_REPORTS_DIR", "/home/jonathan/Repos/research-agent/reports")
     return env
 
 MEAN_DROP_TOLERANCE = 0.05

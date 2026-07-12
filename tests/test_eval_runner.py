@@ -65,3 +65,17 @@ def test_agenix_env_missing_raises(tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     with _pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
         _agenix_env()
+
+
+def test_agenix_env_sets_deployed_reports_dir(tmp_path, monkeypatch):
+    from evals.run_eval import _agenix_env
+    for fname in ("anthropic-api-key", "openai-api-key", "exa-api-key",
+                  "tavily-api-key", "claude-token"):
+        (tmp_path / fname).write_text("v\n")
+    monkeypatch.setenv("RESEARCH_EVAL_AGENIX_DIR", str(tmp_path))
+    monkeypatch.delenv("RESEARCH_REPORTS_DIR", raising=False)
+    env = _agenix_env()
+    assert env["RESEARCH_REPORTS_DIR"] == "/home/jonathan/Repos/research-agent/reports"
+
+    monkeypatch.setenv("RESEARCH_REPORTS_DIR", "/custom")
+    assert _agenix_env()["RESEARCH_REPORTS_DIR"] == "/custom"
