@@ -29,6 +29,16 @@ def test_regression_flags_drop():
     assert any("mean_overall" in r for r in verdict.regressions)
 
 
+def test_regression_flags_incomplete_run():
+    base = {"n": 4, "n_done": 4, "mean_overall": 0.80, "expectation_pass_rate": 1.0,
+            "by_category": {}}
+    cur = {"n": 4, "n_done": 1, "mean_overall": 0.85, "expectation_pass_rate": 1.0,
+           "by_category": {}}
+    verdict = compare_to_baseline(cur, base)
+    assert not verdict.ok
+    assert any("incomplete" in r for r in verdict.regressions)
+
+
 def test_regression_ok_within_tolerance():
     base = {"mean_overall": 0.80, "expectation_pass_rate": 0.9,
             "by_category": {"trap": {"mean_overall": 0.9}}}

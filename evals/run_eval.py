@@ -51,6 +51,9 @@ def summarize(results: list[dict]) -> dict:
 
 def compare_to_baseline(current: dict, baseline: dict) -> RegressionVerdict:
     regressions = []
+    n, n_done = current.get("n"), current.get("n_done")
+    if n is not None and n_done is not None and n_done < n:
+        regressions.append(f"incomplete run: only {n_done}/{n} questions completed")
     if current["mean_overall"] < baseline["mean_overall"] - MEAN_DROP_TOLERANCE:
         regressions.append(
             f"mean_overall dropped {baseline['mean_overall']:.2f} -> {current['mean_overall']:.2f}")
