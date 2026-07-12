@@ -27,3 +27,8 @@ venv/
 
 # OS
 .DS_Store
+
+# Eval runtime output
+evals/results/
+tests/_render_shim_token_stub
+tests/_render_shim_browse_token_stub

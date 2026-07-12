@@ -1,0 +1,114 @@
+{
+  "subset": "smoke",
+  "depth": "normal",
+  "generated": "2026-07-12T23:47:40",
+  "summary": {
+    "n": 4,
+    "n_done": 4,
+    "mean_overall": 0.9025,
+    "expectation_pass_rate": 1.0,
+    "structural_pass_rate": 0.75,
+    "by_category": {
+      "trap": {
+        "n": 1,
+        "mean_overall": 0.95
+      },
+      "factual": {
+        "n": 1,
+        "mean_overall": 0.94
+      },
+      "decomposition": {
+        "n": 1,
+        "mean_overall": 0.78
+      },
+      "conflicting": {
+        "n": 1,
+        "mean_overall": 0.94
+      }
+    }
+  },
+  "results": [
+    {
+      "id": "fact-01",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 69.5,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/4a1c247ad35745dca61f26b0f8d016cb.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.92,
+        "completeness": 1.0,
+        "source_quality": 0.88,
+        "instruction_following": 0.97,
+        "expectation_met": true,
+        "overall": 0.94,
+        "notes": "Both key facts (200K context window, $3/M input tokens) are stated clearly and multiply cited, including Anthropic's own announcement and reputable secondary sources. Minor deduction: DataNorth AI is a lower-quality aggregator, but primary and strong secondary citations carry the load; the retroactive corroboration from the 1M-context post is a clever and sound argumentative move.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "trap-01",
+      "category": "trap",
+      "status": "done",
+      "wall_s": 92.4,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/b871858e7c7743dd8e31286cde0eb8dd.md",
+      "scores": {
+        "factual_accuracy": 0.97,
+        "citation_accuracy": 0.93,
+        "completeness": 1.0,
+        "source_quality": 0.88,
+        "instruction_following": 0.97,
+        "expectation_met": true,
+        "overall": 0.95,
+        "notes": "The report cleanly refuses the false premise on both counts (no Book 13, AI anachronistic), with corroborating evidence from multiple credible sources and a clear table. URLs are plausible and specific; the one mild gap is that Philopedia is a lesser-known aggregator, but the core claims are well-anchored by Wikipedia and Project Gutenberg.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "conf-01",
+      "category": "conflicting",
+      "status": "done",
+      "wall_s": 87.2,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://newsletter.semianalysis.com/p/gpt-4-architecture-infrastructure"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/05cf736a320842eba66285367dcdc4c1.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.9,
+        "completeness": 0.98,
+        "source_quality": 0.9,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.94,
+        "notes": "Exemplary handling of the expectation: explicitly states OpenAI never disclosed, labels all figures as unverified leaks, correctly traces multiple circulating estimates to their divergent sources, and warns against treating repetition as independent corroboration. Minor weakness: SemiAnalysis newsletter URL may not be fully accessible/verified, and the Towards AI/Medium source is a lower-quality aggregator, but the report appropriately weights these as secondary.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "dec-01",
+      "category": "decomposition",
+      "status": "done",
+      "wall_s": 119.7,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/d8bf582c7fa34a84acd44e0733b2724d.md",
+      "scores": {
+        "factual_accuracy": 0.83,
+        "citation_accuracy": 0.82,
+        "completeness": 0.95,
+        "source_quality": 0.52,
+        "instruction_following": 0.9,
+        "expectation_met": true,
+        "overall": 0.78,
+        "notes": "Source quality is the primary weakness \u2014 star counts rely on third-party aggregators (OSSInsight, chatgptaihub, 1bench.dev) rather than the GitHub API, and several sources (chatgptaihub, AIFoss, Lushbinary) are low-authority blogs; the report itself acknowledges this gap. That said, all three axes are fully populated per database with cell-level citations, conflicts (Chroma license, Weaviate vs. Chroma for #3) are explicitly flagged, and the structure and completeness are strong.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    }
+  ]
+}

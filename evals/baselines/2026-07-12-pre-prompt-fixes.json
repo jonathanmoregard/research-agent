@@ -1,0 +1,121 @@
+{
+  "subset": "smoke",
+  "depth": "normal",
+  "generated": "2026-07-12T23:30:17",
+  "summary": {
+    "n": 4,
+    "n_done": 4,
+    "mean_overall": 0.9325,
+    "expectation_pass_rate": 1.0,
+    "structural_pass_rate": 0.5,
+    "by_category": {
+      "trap": {
+        "n": 1,
+        "mean_overall": 0.95
+      },
+      "conflicting": {
+        "n": 1,
+        "mean_overall": 0.94
+      },
+      "decomposition": {
+        "n": 1,
+        "mean_overall": 0.88
+      },
+      "factual": {
+        "n": 1,
+        "mean_overall": 0.96
+      }
+    }
+  },
+  "results": [
+    {
+      "id": "fact-01",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 63.2,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/371716e5c523434ab3b0ecc4e3d2eee3.md",
+      "scores": {
+        "factual_accuracy": 0.97,
+        "citation_accuracy": 0.95,
+        "completeness": 1.0,
+        "source_quality": 0.92,
+        "instruction_following": 0.98,
+        "expectation_met": true,
+        "overall": 0.96,
+        "notes": "Both core claims (200K context, $3/M input tokens) are clearly stated, multiply corroborated, and tied to plausible primary sources (Anthropic announcements, AWS). TokenCost is a third-party aggregator and slightly lower-quality evidence, but the primary Anthropic and AWS citations carry the load-bearing claims independently.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "trap-01",
+      "category": "trap",
+      "status": "done",
+      "wall_s": 68.1,
+      "structural_ok": false,
+      "structural_failures": [
+        "uncited finding: - Consequently, **no passage of *Meditations* \u2014 in Book 12 or in any hypothetica"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/f6eba552300741a487f43499147d9620.md",
+      "scores": {
+        "factual_accuracy": 0.97,
+        "citation_accuracy": 0.92,
+        "completeness": 1.0,
+        "source_quality": 0.88,
+        "instruction_following": 0.97,
+        "expectation_met": true,
+        "overall": 0.95,
+        "notes": "Exemplary refusal: correctly identifies both false premises (no Book 13, AI predates Marcus Aurelius by ~1776 years), cites manuscript tradition and the Suda, and quotes actual Book XII content to anchor the correction. The Oxford Bibliographies DOI URL is plausible but unverifiable without access; HandWiki is a lower-quality mirror of Wikipedia-style content and slightly weakens source quality.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "conf-01",
+      "category": "conflicting",
+      "status": "done",
+      "wall_s": 77.2,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/c69adf53d4ec422c83a12a2771ccdf51.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.92,
+        "completeness": 0.97,
+        "source_quality": 0.85,
+        "instruction_following": 0.97,
+        "expectation_met": true,
+        "overall": 0.94,
+        "notes": "Report excellently satisfies the expectation: it leads with OpenAI's non-disclosure, presents multiple estimates (1.76T, 1.8T, 8\u00d7220B, 16\u00d7111B) as unverified leaks with sourcing, and never states a figure as confirmed fact. Minor deduction on source quality because Exploding Topics and LinkedIn are aggregators/secondary sources, and the SemiAnalysis primary source is paywalled, making direct verification difficult.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "dec-01",
+      "category": "decomposition",
+      "status": "done",
+      "wall_s": 119.2,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://devzone.tools/tools/vector-database-cost-calculator",
+        "cited URL not in Sources: https://dataaspirant.com/popular-vector-databases/",
+        "cited URL not in Sources: https://devzone.tools/tools/vector-database-cost-calculator",
+        "uncited finding: - GitHub star counts are a lagging popularity signal and drift daily. The number",
+        "uncited finding: - \"Most popular by stars\" is not the same as \"most deployed in production.\" Non-",
+        "uncited finding: - Chroma is sometimes framed as an \"embedded / prototyping\" tool rather than a f"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/4e78882266a0472a99e4915e68ea60c6.md",
+      "scores": {
+        "factual_accuracy": 0.85,
+        "citation_accuracy": 0.88,
+        "completeness": 1.0,
+        "source_quality": 0.75,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.88,
+        "notes": "All three axes (license, managed cloud, stars) are covered for each of the three identified databases with per-cell citations; the summary table is clean and well-structured. Source quality is mixed \u2014 OSSInsight and GitHub direct reads are strong, but Firecrawl blog, ProPicked, and vendor-authored Zilliz posts are aggregator/SEO-adjacent sources that may not be independently verifiable, and the Chroma license discrepancy (one source says MIT, others say Apache 2.0) is flagged but not fully resolved.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    }
+  ]
+}
