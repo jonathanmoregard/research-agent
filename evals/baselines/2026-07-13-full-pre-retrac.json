@@ -1,0 +1,580 @@
+{
+  "subset": "full",
+  "depth": "normal",
+  "generated": "2026-07-13T09:01:41",
+  "summary": {
+    "n": 24,
+    "n_done": 24,
+    "mean_overall": 0.9054166666666666,
+    "expectation_pass_rate": 1.0,
+    "structural_pass_rate": 0.375,
+    "by_category": {
+      "conflicting": {
+        "n": 4,
+        "mean_overall": 0.8775
+      },
+      "trap": {
+        "n": 6,
+        "mean_overall": 0.9266666666666667
+      },
+      "decomposition": {
+        "n": 3,
+        "mean_overall": 0.8966666666666666
+      },
+      "recency": {
+        "n": 3,
+        "mean_overall": 0.9
+      },
+      "factual": {
+        "n": 8,
+        "mean_overall": 0.90875
+      }
+    }
+  },
+  "results": [
+    {
+      "id": "fact-01",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 101.6,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/b705143890e74960884278ec6e81d352.md",
+      "scores": {
+        "factual_accuracy": 0.92,
+        "citation_accuracy": 0.88,
+        "completeness": 0.95,
+        "source_quality": 0.8,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.9,
+        "notes": "Report correctly states 200K context and $3/MTok input with citations to Anthropic's official launch post and corroborating sources; the 200K figure is inferred rather than directly quoted from a primary source, which the report honestly flags as a gap. Source quality is slightly diluted by two third-party aggregators (pricepertoken.com, cloudprice.net), but the primary Anthropic citation for pricing is solid.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "fact-02",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 150.5,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://www.datanyze.com/companies/eyetech-digital-systems/24331894"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/a06e358c0def4c848a51af3303ad95b1.md",
+      "scores": {
+        "factual_accuracy": 0.82,
+        "citation_accuracy": 0.8,
+        "completeness": 0.92,
+        "source_quality": 0.65,
+        "instruction_following": 0.9,
+        "expectation_met": true,
+        "overall": 0.82,
+        "notes": "Core ownership claim is well-supported by two independent primary sources (EyeTech's own privacy policy and LinkedIn page naming EverPower.AI LLC as parent); supporting details rely heavily on aggregators (Tracxn, LeadIQ, Datanyze). Report correctly flags the question's false premise, does not invent a Swedish acquisition, and explicitly acknowledges that the acquisition date and deal terms could not be found.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "fact-03",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 68.0,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://ziglang.org/news/announcing-zig-software-foundation/",
+        "cited URL not in Sources: https://ziggit.dev/t/distributing-compiled-executables/13680"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/74b07b9612064acca878523a8a43c4f6.md",
+      "scores": {
+        "factual_accuracy": 0.98,
+        "citation_accuracy": 0.97,
+        "completeness": 1.0,
+        "source_quality": 0.95,
+        "instruction_following": 0.97,
+        "expectation_met": true,
+        "overall": 0.97,
+        "notes": "Report correctly identifies MIT license and Zig Software Foundation with citations to the authoritative LICENSE file and official ZSF page. Appropriately flags single-source details and ancillary components note.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "fact-04",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 113.4,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/e56c57c79dec49f9aba1e78dc0c17d88.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.95,
+        "completeness": 1.0,
+        "source_quality": 0.95,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.95,
+        "notes": "Report clearly names PostgreSQL 18 as current stable major version with release date (2025-09-25), multiple well-cited headline features from postgresql.org press kit and official release notes. Minor deduction: release announcement URL cites '14 May 2026' in text but the source URL references 'May 2026' without exact day confirmation, a trivial inconsistency.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "fact-05",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 199.9,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/f9e261c1ec404e44a79c21c417454610.md",
+      "scores": {
+        "factual_accuracy": 0.82,
+        "citation_accuracy": 0.87,
+        "completeness": 0.93,
+        "source_quality": 0.65,
+        "instruction_following": 0.91,
+        "expectation_met": true,
+        "overall": 0.82,
+        "notes": "The report clearly satisfies the expectation: concrete VRAM/RTF figures are present throughout and the distinction between primary sources (whisper.cpp and faster-whisper READMEs) versus community benchmark blogs (gigagpu.com, llmhardware.io) is explicit and well-maintained. The main weakness is that nearly all quantitative RTF/TTFW data traces back to a single commercial publisher (gigagpu.com), which the report itself flags but cannot remedy \u2014 no independent peer-reviewed or Anthropic/OpenAI official benchmark set exists for these figures, leaving load-bearing numbers unverified across runtimes.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "fact-06",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 187.2,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://euai.app/blog/gpai-obligations-article-53-55-guide"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/e98d3854ccae44dfb4564dfdf882ebb7.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.93,
+        "completeness": 0.97,
+        "source_quality": 0.92,
+        "instruction_following": 0.96,
+        "expectation_met": true,
+        "overall": 0.95,
+        "notes": "Obligations and dates are accurately cited to Commission primary sources (Art. 53/55 text, official press releases, Commission Q&A) and major law firms (Cleary Gottlieb, Baker McKenzie); no invented article numbers detected. Minor gap: the Guidelines PDF itself was not directly fetched, so a few interpretive claims rely on secondary summaries rather than the primary document.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "fact-07",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 92.4,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/29826d4e54e342dfb47d04453f047265.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.9,
+        "completeness": 1.0,
+        "source_quality": 0.85,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.93,
+        "notes": "All load-bearing claims are cited to plausible, specific URLs including nixos.org domains (discourse.nixos.org for the 26.05 announcement, nixos.org/manual for release notes); the cadence, versioning convention, and current stable are all correctly stated. Minor deduction on source quality for leaning on endoflife.date and Wikipedia alongside the primary Discourse announcement rather than the nixos.org download/about page directly.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "fact-08",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 112.1,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/e79607b3ad8443ca814bdc2b10bb19ea.md",
+      "scores": {
+        "factual_accuracy": 0.92,
+        "citation_accuracy": 0.9,
+        "completeness": 0.97,
+        "source_quality": 0.91,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.93,
+        "notes": "Report thoroughly covers maintainers (smcv, alexlarsson, containers org) and Flatpak relationship with strong primary citations including the canonical README, Larsson's blog, and Flatpak wiki. Minor caveat: contributor commit counts sourced from a downstream fork rather than the canonical repo, and the report correctly flags this limitation.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "trap-01",
+      "category": "trap",
+      "status": "done",
+      "wall_s": 99.2,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://medium.com/@rioweber/in-depth-explanation-of-the-manuscript-history-of-marcus-aurelius-meditations-0edbdb577523",
+        "cited URL not in Sources: https://classics.mit.edu/Antoninus/meditations.12.twelve.html",
+        "cited URL not in Sources: https://en.wikisource.org/wiki/The_Meditations_of_the_Emperor_Marcus_Antoninus/Commentary_on_Book_12",
+        "cited URL not in Sources: https://www.livius.org/articles/person/marcus-aurelius",
+        "uncited finding: - The term \"artificial intelligence\" was coined for the 1956 Dartmouth Summer Re"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/bdb6a92a847841358ecb6671da1988fe.md",
+      "scores": {
+        "factual_accuracy": 0.97,
+        "citation_accuracy": 0.93,
+        "completeness": 0.98,
+        "source_quality": 0.88,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.94,
+        "notes": "Report correctly refuses the false premise on two independent grounds (no Book 13, AI predates Marcus by ~1800 years) with solid citations. Minor deduction: Medium blog used for manuscript history is a lower-quality source, and the partial Book 12 chapter table (skipping chapters 6-11, 13, 15-20, 22, 24-31, 33-35) is slightly misleading though not inaccurate.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "trap-02",
+      "category": "trap",
+      "status": "done",
+      "wall_s": 124.3,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://data.riksdagen.se/fil/874D566D-F260-4040-8199-447D128E8AE1",
+        "cited URL not in Sources: https://www.riksdagen.se/sv/dokument-och-lagar/dokument/motion/upphandling-av-samhallsviktig-teknik-och-mjukvara_hd02597/"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/62ecffdd6fdc405297b327a550110230.md",
+      "scores": {
+        "factual_accuracy": 0.92,
+        "citation_accuracy": 0.88,
+        "completeness": 0.95,
+        "source_quality": 0.9,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.92,
+        "notes": "The report correctly identifies no such ban exists, explicitly marks the claim as not found, and provides strong corroborating evidence including active Swedish government Rust usage. The satirical 'rost' project as a possible confusion source is a particularly valuable addition; minor concern is that cited URLs cannot be verified as live but are plausible official domains.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "trap-03",
+      "category": "trap",
+      "status": "done",
+      "wall_s": 116.0,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/8f96e0b0309a43e681172e6f6916c6b7.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.9,
+        "completeness": 0.95,
+        "source_quality": 0.9,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.93,
+        "notes": "Report correctly identifies the premise failure on both counts (private company in 2019, foreign private issuer status post-IPO) and cites the SEC 424B4 prospectus as primary evidence. The additional context about what Klarna did publish (EU MAR interim report) is accurate and useful without inventing any figures.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "trap-04",
+      "category": "trap",
+      "status": "done",
+      "wall_s": 93.6,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://www.nature.com/articles/s41598-024-66159-x",
+        "cited URL not in Sources: https://preview-www.nature.com/articles/s41534-024-00824-x",
+        "uncited finding: - No preprint, press release, retraction notice, or citing article surfaced for "
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/237a9310328c432987154fb5dbc279ad.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.85,
+        "completeness": 0.95,
+        "source_quality": 0.8,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.92,
+        "notes": "Report correctly reports the paper does not exist with no fabricated summary, authors, or DOI \u2014 the core expectation is fully met. Citations are plausible and specific, though source 1 links to techexplorist.com (an aggregator) rather than a primary index, slightly reducing source quality.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "trap-05",
+      "category": "trap",
+      "status": "done",
+      "wall_s": 108.9,
+      "structural_ok": false,
+      "structural_failures": [
+        "uncited finding: - **No Python 4.0 release exists as of 2026-07-13.** The official Python devguid",
+        "uncited finding: - **Current release schedule stops well short of 4.0.** PEP 745 covers 3.14 (fin",
+        "uncited finding: - **Latest stable releases at report time:** Python 3.14.6 and Python 3.13.14, b",
+        "uncited finding: - **Core-developer stance: 4.0 may never happen.** Built In (post-transition ret",
+        "uncited finding: - **The intended trajectory is incremental, not a 4.0 break.** Nick Coghlan (CPy",
+        "uncited finding: - **\"Will be removed in 4.0\" strings in CPython docs are placeholders, not a pla",
+        "uncited finding: - **Third-party \"Python 4.0\" proposals are not official.** A tdcommons.org defen",
+        "uncited finding: - **PEP 2026 (calendar versioning) was rejected.** A separate proposal to jump f"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/55574f041fee481f918acf62c55ad31f.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.92,
+        "completeness": 0.98,
+        "source_quality": 0.9,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.94,
+        "notes": "Report correctly states Python 4.0 does not exist, cites core-developer statements, and invents no changelog. All major claims are well-sourced with plausible, specific URLs from official sources (devguide, PEPs, bugs.python.org).",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "trap-06",
+      "category": "trap",
+      "status": "done",
+      "wall_s": 74.6,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/f78ee0694230450f8a12cdd6765ceb11.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.92,
+        "completeness": 0.95,
+        "source_quality": 0.8,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.91,
+        "notes": "Report correctly and clearly states Valve is private with no NASDAQ listing, no ticker, and no fabricated price. Source quality is somewhat mixed (ts2.tech, UpMarket are secondary aggregators), but Wikipedia, Forbes, and Market Realist anchor the core claims adequately.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "conf-01",
+      "category": "conflicting",
+      "status": "done",
+      "wall_s": 114.3,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://www.thealgorithmicbridge.com/p/gpt-4s-secret-has-been-revealed",
+        "uncited finding: - **Agree:** GPT-4 is a sparse Mixture-of-Experts model, ~1.76-1.8 T parameters ",
+        "uncited finding: - **Disagree:** Hotz said 8 experts \u00d7 220B; SemiAnalysis said 16 experts \u00d7 ~111B"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/04883ceb8baa4adf8ee67889c1cce412.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.9,
+        "completeness": 0.98,
+        "source_quality": 0.85,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.93,
+        "notes": "Exemplary handling of the expectation: clearly states OpenAI never disclosed the figure, presents all estimates as estimates with sources, and explicitly flags conflicts between the Hotz and SemiAnalysis leaks. Minor concern: the Pastebin mirror is a low-quality source, and the openai.com PDF URL is plausible but unverifiable without fetch access.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "conf-02",
+      "category": "conflicting",
+      "status": "done",
+      "wall_s": 177.2,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://preview-www.nature.com/articles/s41366-020-0525-7",
+        "uncited finding: - Short-term (<3 months) compliance is ~80% for both IF and CCR (multi-source me",
+        "cited URL not in Sources: https://www.nature.com/articles/s41366-025-01968-2"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/9d4e234a9a5b4c80ae0e15677c15326e.md",
+      "scores": {
+        "factual_accuracy": 0.82,
+        "citation_accuracy": 0.84,
+        "completeness": 0.95,
+        "source_quality": 0.88,
+        "instruction_following": 0.9,
+        "expectation_met": true,
+        "overall": 0.87,
+        "notes": "Report presents both sides with a genuine conflicting-evidence section (Catenacci 2025 clearly called out as a counterpoint), but the executive summary anchors to an equivalence verdict rather than foregrounding uncertainty; source quality is discussed contextually (meta-analyses > single trials noted) but not formally ranked. One URL (preview-www.nature.com for Headland 2020) is non-canonical and slightly suspicious.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "conf-03",
+      "category": "conflicting",
+      "status": "done",
+      "wall_s": 147.6,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/9be3d6f344b14a7ebfa5a42c656fa10d.md",
+      "scores": {
+        "factual_accuracy": 0.88,
+        "citation_accuracy": 0.9,
+        "completeness": 0.93,
+        "source_quality": 0.72,
+        "instruction_following": 0.93,
+        "expectation_met": true,
+        "overall": 0.87,
+        "notes": "Report fully satisfies the expectation: it cites both directions (uBO/Brave reduce RAM, ABP historically increased it), explains the divergence (blocker choice, CSS sharing in Firefox 41+, workload type), and cross-references methodologically distinct studies across 2014\u20132026. Source quality is the main weakness \u2014 no peer-reviewed studies, heavy reliance on vendor benchmarks (Brave) and author-published figures (gorhill), though the Mozilla engineer (Nethercote) primary source and the report's transparent fetched/snippet-only labeling partially offset this.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "conf-04",
+      "category": "conflicting",
+      "status": "done",
+      "wall_s": 130.7,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://xtom.com/blog/linux-market-share-statistics/",
+        "cited URL not in Sources: https://itsfoss.com/linux-market-share/"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/789436b810b8455f984a29734a38e804.md",
+      "scores": {
+        "factual_accuracy": 0.85,
+        "citation_accuracy": 0.82,
+        "completeness": 0.9,
+        "source_quality": 0.7,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.84,
+        "notes": "Expectation fully met: report explicitly presents StatCounter raw vs normalized divergence (4.36%/4.39% vs 5.59%), methodology explanation, Steam and developer-survey alternatives, and flags the fosspost outlier. Source quality is moderate \u2014 primary StatCounter data accessed directly, but Steam figure is single-source via aggregator and Stack Overflow figures are snippet-only from secondary summaries rather than primary survey pages.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "rec-01",
+      "category": "recency",
+      "status": "done",
+      "wall_s": 95.7,
+      "structural_ok": false,
+      "structural_failures": [
+        "uncited finding: - **Auto mode is now available without `CLAUDE_CODE_ENABLE_AUTO_MODE` opt-in on ",
+        "uncited finding: - Fixed the terminal freezing and keystrokes lagging while streaming responses c",
+        "uncited finding: - Fixed remote managed settings from a non-interactive run (`claude -p`, the SDK",
+        "uncited finding: - Fixed spurious prompt-injection warnings triggered by benign system-generated ",
+        "uncited finding: - Fixed the auto-updater overwriting a custom launcher script or symlink at `~/.",
+        "uncited finding: - Fixed compound commands with `cd` prompting for permission when the only outpu",
+        "uncited finding: - Fixed the transcript jumping above the start of the answer when a response fin",
+        "uncited finding: - Fixed `extensions.worktreeConfig` being left in the repo's `.git/config` (brea",
+        "uncited finding: - Fixed malformed bracket patterns in rules globs, skill paths, `.ignore`, and `",
+        "uncited finding: - Fixed a crash loop in agent teams where a malformed teammate mailbox message c",
+        "uncited finding: - Fixed background sessions auto-named by accepting a plan not showing that name"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/aaeca89ce85d46baa320bda8da621c7b.md",
+      "scores": {
+        "factual_accuracy": 0.9,
+        "citation_accuracy": 0.92,
+        "completeness": 0.95,
+        "source_quality": 0.95,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.93,
+        "notes": "Report identifies v2.1.207 published 2026-07-11 with detailed changelog, citing GitHub Releases and CHANGELOG.md as authoritative sources \u2014 genuinely recent (2 days before report date). Minor deduction for acknowledging truncated bullet list and npm dist-tag uncertainty, but the report correctly flags these gaps rather than overstating confidence.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "rec-02",
+      "category": "recency",
+      "status": "done",
+      "wall_s": 119.1,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://www.openwall.com/lists/oss-security/2026/04/07/11"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/e4917bda1264403d834f35dc9aeb77ce.md",
+      "scores": {
+        "factual_accuracy": 0.78,
+        "citation_accuracy": 0.88,
+        "completeness": 0.92,
+        "source_quality": 0.95,
+        "instruction_following": 0.9,
+        "expectation_met": true,
+        "overall": 0.87,
+        "notes": "Report provides a well-sourced, dated account of the June 2026 Nixpkgs OpenSSL security update (PR #530955, merged 2026-06-13) with clear distinction from the prior April 2026 advisory; specific CVE technical details (CVE-2026-45447, CVE-2026-45445) are internally consistent and technically plausible but cannot be independently verified, and the gaps section honestly acknowledges truncated advisory text and unconfirmed backport status.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "rec-03",
+      "category": "recency",
+      "status": "done",
+      "wall_s": 232.5,
+      "structural_ok": false,
+      "structural_failures": [
+        "uncited finding: - **11 May 2026 \u2013 31 May 2026**: dual-acceptance window; submissions accepted un",
+        "uncited finding: - **By 1 June 2026**: full migration to GPT-5.5. Scores in the tables above are "
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/e3fc3ecac09d4c9aa8e4913579a28dfc.md",
+      "scores": {
+        "factual_accuracy": 0.88,
+        "citation_accuracy": 0.87,
+        "completeness": 0.95,
+        "source_quality": 0.82,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.9,
+        "notes": "Report clearly names DuMate-DeepResearch as current leader with specific scores (58.03 DRB, 61.95 DRB II), cites arxiv:2606.07299 (June 2026) and multiple corroborating GitHub snapshots, and explicitly acknowledges data age and post-migration uncertainty. Minor concern: the Hugging Face live leaderboard was inaccessible so all top-10 data relies on third-party snapshots rather than the canonical source, and the post-June-2026 GPT-5.5-judge rankings remain unverified.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "dec-01",
+      "category": "decomposition",
+      "status": "done",
+      "wall_s": 140.1,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://redis.io/blog/best-open-source-vector-databases-comparison/"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/f4b2b5aee23c4fe280180266aa9f05d4.md",
+      "scores": {
+        "factual_accuracy": 0.88,
+        "citation_accuracy": 0.85,
+        "completeness": 0.95,
+        "source_quality": 0.7,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.87,
+        "notes": "Expectation fully met: three databases identified with all three axes (license, managed cloud, stars) covered per entry with citations. Source quality is moderate \u2014 relies heavily on aggregators/blogs (AltexSoft, AgentDeals, aifoss.dev) rather than official docs or GitHub API; the Chroma Cloud pricing conflict is appropriately flagged rather than papered over.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "dec-02",
+      "category": "decomposition",
+      "status": "done",
+      "wall_s": 109.5,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/490313a366bb489b829e210c1c27192e.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.95,
+        "completeness": 1.0,
+        "source_quality": 0.95,
+        "instruction_following": 1.0,
+        "expectation_met": true,
+        "overall": 0.96,
+        "notes": "All six data points are present and individually cited to official or highly reputable sources (PwC Worldwide Tax Summaries, EMTA official page, GTAI). The report correctly handles Estonia's distribution-based CIT structure and flags the conflicting EY source with a well-reasoned resolution.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "dec-03",
+      "category": "decomposition",
+      "status": "done",
+      "wall_s": 136.8,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://d-central.tech/ai/model/llama-4/",
+        "uncited finding: - Knowledge cutoff: August 2024. Pretraining: ~40T tokens (Scout), ~22T tokens (",
+        "uncited finding: - Both accept a 256K context window and support text + vision input. | Model | P",
+        "uncited finding: - Alibaba also ships a closed-weights **Qwen3.7-Max** (May 20, 2026) at 1M conte"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/af50891c012c478fa36bb3aebeb5e36e.md",
+      "scores": {
+        "factual_accuracy": 0.82,
+        "citation_accuracy": 0.87,
+        "completeness": 0.95,
+        "source_quality": 0.78,
+        "instruction_following": 0.92,
+        "expectation_met": true,
+        "overall": 0.86,
+        "notes": "Report fully satisfies the expectation \u2014 all three vendors are named with context windows and primary-source citations, and 'current' uncertainty is explicitly flagged for each (Muse Spark vs Llama 4, Large 3 vs Medium 3.5, Qwen3.5 vs 3.6). Minor concern: Mistral Large 3 as a 675B MoE is a dramatic size jump from prior Large 2 (123B) and the claim rests solely on a HuggingFace model card URL that cannot be live-verified; Alibaba context-window specs for Qwen3.5/3.6 rely heavily on secondary aggregators (AI/TLDR, TPS Report) rather than the Qwen team's own official model cards or GitHub.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    }
+  ]
+}
