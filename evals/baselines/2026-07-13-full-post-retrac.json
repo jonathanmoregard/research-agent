@@ -1,0 +1,574 @@
+{
+  "subset": "full",
+  "depth": "normal",
+  "generated": "2026-07-13T10:08:27",
+  "summary": {
+    "n": 24,
+    "n_done": 24,
+    "mean_overall": 0.9141666666666667,
+    "expectation_pass_rate": 1.0,
+    "structural_pass_rate": 0.4166666666666667,
+    "by_category": {
+      "decomposition": {
+        "n": 3,
+        "mean_overall": 0.9133333333333334
+      },
+      "trap": {
+        "n": 6,
+        "mean_overall": 0.9283333333333333
+      },
+      "conflicting": {
+        "n": 4,
+        "mean_overall": 0.9075
+      },
+      "factual": {
+        "n": 8,
+        "mean_overall": 0.94
+      },
+      "recency": {
+        "n": 3,
+        "mean_overall": 0.8266666666666667
+      }
+    }
+  },
+  "results": [
+    {
+      "id": "fact-01",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 100.2,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://platform.claude.com/docs/en/about-claude/pricing?hsLang=en"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/defed6bac5e14f4d9d6a40dfbb6b3631.md",
+      "scores": {
+        "factual_accuracy": 0.97,
+        "citation_accuracy": 0.95,
+        "completeness": 1.0,
+        "source_quality": 0.95,
+        "instruction_following": 0.98,
+        "expectation_met": true,
+        "overall": 0.97,
+        "notes": "Report correctly states 200K context and $3/M input tokens with multiple credible citations including Anthropic's own announcement, TechCrunch, and Simon Willison. The minor gap noted (launch blog doesn't directly state token count) is handled transparently via triangulation from the 1M '5x increase' announcement.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "fact-02",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 137.0,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://linkedin.com/in/rylynn-trader"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/7feabf48bffb416c87c06ca9d42612bb.md",
+      "scores": {
+        "factual_accuracy": 0.87,
+        "citation_accuracy": 0.86,
+        "completeness": 0.91,
+        "source_quality": 0.85,
+        "instruction_following": 0.92,
+        "expectation_met": true,
+        "overall": 0.88,
+        "notes": "Report correctly identifies EverPower.AI LLC as current parent using first-party citations (privacy policy, LinkedIn corporate page) and explicitly flags the gap on deal date/structure \u2014 exactly what the expectation requires. Minor deduction: the EverPower.AI business description and Finaventures backing rest on a single LinkedIn profile, which is flagged but still load-bearing for context claims.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "fact-03",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 76.5,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://github.com/ziglang/zig/pull/6101"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/d1e42c0c90c445fda977c6196cbfc1a5.md",
+      "scores": {
+        "factual_accuracy": 1.0,
+        "citation_accuracy": 1.0,
+        "completeness": 1.0,
+        "source_quality": 1.0,
+        "instruction_following": 1.0,
+        "expectation_met": true,
+        "overall": 1.0,
+        "notes": "Report fully satisfies the expectation: MIT license and Zig Software Foundation both confirmed with primary source citations (GitHub LICENSE file and ziglang.org/zsf). No factual overreach, all claims well-supported.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "fact-04",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 107.3,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://www.postgresql.org/docs/release/18.4/",
+        "cited URL not in Sources: https://www.postgresql.org/docs/18/release-18.html"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/df87544e0d7d4d1e9833e1516ba572d6.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.92,
+        "completeness": 1.0,
+        "source_quality": 0.88,
+        "instruction_following": 0.98,
+        "expectation_met": true,
+        "overall": 0.94,
+        "notes": "Excellent report: names PostgreSQL 18 with release date 2025-09-25, lists well over 2-4 headline features with citations to official postgresql.org announcements. Minor deduction: support-lifecycle EOL dates for PG 15-17 are single-sourced from a third-party aggregator (versionlog.com) rather than postgresql.org directly, and some minor CVE details are noted as unfetched.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "fact-05",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 299.7,
+      "structural_ok": false,
+      "structural_failures": [
+        "uncited finding: - **NVIDIA, single-stream batch faster than RT:** \u22658 GB VRAM with faster-whisper",
+        "uncited finding: - **NVIDIA, sub-1s live captioning:** 16 GB Blackwell (RTX 5060 Ti / 5080) or RT"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/b043d6eee2a94b14b8b81afc2572fa4b.md",
+      "scores": {
+        "factual_accuracy": 0.88,
+        "citation_accuracy": 0.89,
+        "completeness": 0.93,
+        "source_quality": 0.78,
+        "instruction_following": 0.92,
+        "expectation_met": true,
+        "overall": 0.87,
+        "notes": "Expectation fully satisfied: concrete VRAM/RTF tables with precision-level breakdowns and explicit tiering of official sources (HF model card quote, SYSTRAN README benchmark, whisper.cpp PR #1270) vs flagged SEO publishers (GigaGPU, llmhardware.io). Main weakness is that the majority of GPU-specific RTF numbers trace to a single SEO-style domain (gigagpu.com) with no independent corroboration beyond the SYSTRAN and Ryfter/asr-bench spot-checks, limiting confidence in the exact figures despite the transparent caveating.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "fact-06",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 193.4,
+      "structural_ok": false,
+      "structural_failures": [
+        "uncited finding: - **(a) Model evaluation with adversarial testing** \u2014 perform model evaluation u",
+        "uncited finding: - **(b) Union-level systemic-risk assessment and mitigation** \u2014 assess and mitig",
+        "uncited finding: - **(c) Serious-incident reporting** \u2014 track, document and report to the AI Offi"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/3f4c1c9cf94d428fa6ee8c099cd621c9.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.93,
+        "completeness": 0.97,
+        "source_quality": 0.92,
+        "instruction_following": 0.97,
+        "expectation_met": true,
+        "overall": 0.95,
+        "notes": "Exceptionally thorough report with correct article numbers (53, 55, 51, 111, 113), accurate FLOP thresholds, and well-staged timeline; Article 101 fine ceiling is flagged as single-source and Article 111(3) transitional text not fetched from primary EU source, but both gaps are honestly disclosed.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "fact-07",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 85.8,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/4ef8dc2bb62c4cf0a959ab254dbbff73.md",
+      "scores": {
+        "factual_accuracy": 0.97,
+        "citation_accuracy": 0.95,
+        "completeness": 1.0,
+        "source_quality": 0.98,
+        "instruction_following": 0.97,
+        "expectation_met": true,
+        "overall": 0.97,
+        "notes": "Report fully satisfies the expectation: six-month YY.05/YY.11 cadence is explained with RFC citation, and current stable 26.05 is cited to nixos.org. All load-bearing claims carry specific, plausible official citations.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "fact-08",
+      "category": "factual",
+      "status": "done",
+      "wall_s": 111.3,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/cecb83b0edb3409f88deee4d0f2fbd25.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.92,
+        "completeness": 0.98,
+        "source_quality": 0.9,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.94,
+        "notes": "Thorough, well-cited report correctly identifies maintainers (McVittie, Larsson, Walters), the containers/bubblewrap GitHub org, and Flatpak's genesis/runtime relationship. Minor caveat: commit counts sourced from a downstream fork mirror rather than the canonical repo, appropriately flagged in Gaps.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "trap-01",
+      "category": "trap",
+      "status": "done",
+      "wall_s": 96.7,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/8747a9567b314bfcb2e921945e9fc314.md",
+      "scores": {
+        "factual_accuracy": 0.97,
+        "citation_accuracy": 0.95,
+        "completeness": 1.0,
+        "source_quality": 0.88,
+        "instruction_following": 0.97,
+        "expectation_met": true,
+        "overall": 0.95,
+        "notes": "Report cleanly refuses the false premise on two independent grounds (12 books only; AI concept postdates Marcus by 1,775 years), with multi-source corroboration and no fabricated quotes. Minor caveat: jmc.stanford.edu URL is plausible but the specific path cannot be independently verified here; LitCharts and Wikipedia are aggregator-tier sources but acceptable given the factual nature of the query.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "trap-02",
+      "category": "trap",
+      "status": "done",
+      "wall_s": 144.0,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://www.regeringen.se/pressmeddelanden/",
+        "uncited finding: - The only 2025 Swedish government press releases on software/cybersecurity conc",
+        "uncited finding: - None of these texts contain the word \"Rust\" or any mention of banning a progra",
+        "cited URL not in Sources: https://www.infoworld.com/article/2336216/white-house-urges-developers-to-dump-c-and-c.html",
+        "cited URL not in Sources: https://www.darpa.mil/news/2024/memory-safety-vulnerabilities"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/661b6ef854234ca0a0c3384e44627361.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.9,
+        "completeness": 0.97,
+        "source_quality": 0.9,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.93,
+        "notes": "Exemplary report: clearly states no such press release exists, provides positive evidence (Digg's active Rust use, actual 2025 cybersecurity releases), and explicitly flags the Tavily hallucination as a likely source of the false premise. Minor caveat: some regeringen.se URLs are cited from search results rather than direct verification, but they are plausible and specific.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "trap-03",
+      "category": "trap",
+      "status": "done",
+      "wall_s": 119.7,
+      "structural_ok": false,
+      "structural_failures": [
+        "uncited finding: - Foreign private issuers do not file 10-Q. Under SEC rules, Klarna Group plc \u2014 ",
+        "cited URL not in Sources: https://www.klarna.com/international/press/interim-financial-statement-release-january-june-2019/"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/0697ddf003e6436a824b19bca7262cc7.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.9,
+        "completeness": 0.95,
+        "source_quality": 0.9,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.93,
+        "notes": "Report correctly identifies the false premise \u2014 Klarna was a private Swedish company in 2019 with no SEC 10-Q obligation \u2014 and provides no invented figures. Citations are specific and plausible, including direct EDGAR and Klarna investor relations links; the only minor gap is that the Swedish nine-month PDF was not retrieved to provide exact cumulative figures, but this is appropriately flagged rather than fabricated.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "trap-04",
+      "category": "trap",
+      "status": "done",
+      "wall_s": 101.1,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://preview-www.nature.com/articles/s41598-024-62539-5",
+        "cited URL not in Sources: https://preview-www.nature.com/articles/s41534-024-00824-x",
+        "cited URL not in Sources: https://www.nature.com/articles/s41586-024-07173-x",
+        "uncited finding: - **Prior-plausibility check.** Quantum-biology work that has appeared in peer r"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/6195ec2c775245a5bf45aeb344cf69e5.md",
+      "scores": {
+        "factual_accuracy": 0.92,
+        "citation_accuracy": 0.85,
+        "completeness": 0.95,
+        "source_quality": 0.82,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.91,
+        "notes": "The report correctly refuses to fabricate a summary and clearly states the paper does not appear to exist after thorough searching. Citations are real and plausible, though the techexplorist.com source is a popular-science aggregator rather than a primary source.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "trap-05",
+      "category": "trap",
+      "status": "done",
+      "wall_s": 95.9,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/7aa5a99f1f6947c084b5fe02461b2cf5.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.92,
+        "completeness": 0.95,
+        "source_quality": 0.88,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.93,
+        "notes": "Report correctly states Python 4.0 does not exist, cites Guido van Rossum and PEP 2026, and invents no changelog. Citations are plausible and specific; Built In is a lower-quality source but used appropriately to relay a quote.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "trap-06",
+      "category": "trap",
+      "status": "done",
+      "wall_s": 119.1,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/acd796744b5344599d2267aae5334786.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.9,
+        "completeness": 0.95,
+        "source_quality": 0.8,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.92,
+        "notes": "Report correctly and clearly states Valve is private with no NASDAQ listing, fabricates no price or ticker. Source mix is reasonable though leans on aggregators (Market Realist, Bitget Academy) alongside higher-quality sources (Motley Fool, Forbes, Wikipedia).",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "conf-01",
+      "category": "conflicting",
+      "status": "done",
+      "wall_s": 146.0,
+      "structural_ok": false,
+      "structural_failures": [
+        "uncited finding: - **Total (stored) parameters**: ~1.76\u20131.8T (per SemiAnalysis/Hotz).",
+        "uncited finding: - **Active parameters per token**: ~280B (SemiAnalysis) or ~440B (Hotz's 8\u00d7220B ",
+        "uncited finding: - **State as fact (multi-source)**: OpenAI has not officially disclosed GPT-4's ",
+        "uncited finding: - **Supported (2 non-independent reports)**: GPT-4 has ~1.76\u20131.8T total paramete"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/63f21bb805d54bfc878edbf56fdf9bef.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.92,
+        "completeness": 0.98,
+        "source_quality": 0.85,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.93,
+        "notes": "Excellent report that correctly surfaces OpenAI's non-disclosure, presents multiple conflicting estimates as unverified rumors with sources, and explains the MoE total-vs-active distinction. Minor concern: SemiAnalysis source is paywalled and accessed via snippet/secondary summary, slightly weakening citation chain for the specific decomposition figures.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "conf-02",
+      "category": "conflicting",
+      "status": "done",
+      "wall_s": 228.7,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/60cb8ae0361d497e8b43cd72caeba7f5.md",
+      "scores": {
+        "factual_accuracy": 0.88,
+        "citation_accuracy": 0.87,
+        "completeness": 0.95,
+        "source_quality": 0.91,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.92,
+        "notes": "The report cleanly separates null-result trials (Liu 2022 NEJM, Sundf\u00f8r 2018, BMJ 2025 NMA at \u226524 weeks) from the Catenacci 2025 outlier without falsely resolving the tension, and explicitly ranks source quality in the sources list with certainty labels; minor issues are one 'preview-www.nature.com' subdomain that looks unusual and Cioffi 2018 cited in the Gaps section but absent from the numbered sources list.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "conf-03",
+      "category": "conflicting",
+      "status": "done",
+      "wall_s": 202.9,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/05b590233efc4fef841f242499db7882.md",
+      "scores": {
+        "factual_accuracy": 0.88,
+        "citation_accuracy": 0.85,
+        "completeness": 0.92,
+        "source_quality": 0.82,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.88,
+        "notes": "Report explicitly surfaces conflicting evidence (2015 ABP using more memory than baseline, Garimella et al. showing near-zero bandwidth gains), cites both directions, and explains divergence by methodology year and blocker version. Minor concern: gorhill wiki URLs are cited as 'snippet-only, not fetched this run' which slightly undermines citation confidence, and vendor-authored sources (Brave 2019, 2026) dominate the positive findings without strong independent corroboration from 2020+.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "conf-04",
+      "category": "conflicting",
+      "status": "done",
+      "wall_s": 138.8,
+      "structural_ok": false,
+      "structural_failures": [
+        "uncited finding: - Note the \"Unknown\" bucket at 21.45% \u2014 over a fifth of the panel is unclassifie",
+        "uncited finding: - **All-time Steam high was 5.33% in March 2026** \u2014 the first time Linux crossed",
+        "uncited finding: - **SteamOS accounts for ~23% of Steam's Linux gamers** in June 2026; SteamOS Ho",
+        "uncited finding: - **StatCounter** counts page views from tracker-instrumented sites (>1M) and ta",
+        "uncited finding: - **Steam** counts opt-in surveys from Steam clients \u2014 a gaming-population sampl"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/5e0ffd19f9934ecca1afd5afc3422889.md",
+      "scores": {
+        "factual_accuracy": 0.92,
+        "citation_accuracy": 0.88,
+        "completeness": 0.95,
+        "source_quality": 0.8,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.9,
+        "notes": "Report excellently satisfies the expectation by presenting divergent measurements (StatCounter 4.36% vs Steam 3.69%), explaining methodology differences clearly, and providing a defensible range rather than a single number. Minor deductions for relying on secondary reporters (Phoronix, GamingOnLinux) rather than the raw Steam survey page, and for citing unverified third-party figures (Cloudflare ~7%, US-gov >10%) without independent confirmation \u2014 though the report appropriately flags these as unverified.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "rec-01",
+      "category": "recency",
+      "status": "done",
+      "wall_s": 122.3,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/a0b0062e750f4b2c9b7b39ec91d084a0.md",
+      "scores": {
+        "factual_accuracy": 0.85,
+        "citation_accuracy": 0.82,
+        "completeness": 0.95,
+        "source_quality": 0.75,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.85,
+        "notes": "Report finds genuinely recent release (v2.1.207, 2026-07-11) with dated citations from official GitHub and a third-party aggregator, satisfying the recency expectation. Source quality is slightly reduced by reliance on changelogs.directory as a secondary aggregator rather than primary GitHub release notes for several claims; the truncated bullet and unverified 24-change count are appropriately flagged as gaps.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "rec-02",
+      "category": "recency",
+      "status": "done",
+      "wall_s": 151.3,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/de1be3c076db4ed683c0cfa05508cdfb.md",
+      "scores": {
+        "factual_accuracy": 0.75,
+        "citation_accuracy": 0.6,
+        "completeness": 0.95,
+        "source_quality": 0.9,
+        "instruction_following": 0.9,
+        "expectation_met": true,
+        "overall": 0.75,
+        "notes": "The companion PR (#530964) and backport PR (#531269) both link to the same URL as the primary PR (#530955), a clear hallucination pattern where PR numbers were invented but the same URL reused \u2014 this undermines trust in those specific claims. The core finding (PR #530955, CVE-2026-45447, CVE-2026-45445, June 2026 advisory) is well-cited with plausible primary sources and satisfies the recency/dating expectation.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "rec-03",
+      "category": "recency",
+      "status": "done",
+      "wall_s": 306.6,
+      "structural_ok": false,
+      "structural_failures": [
+        "uncited finding: - **\"2 days ago\" \u2014 Restore raw_data files and regenerate data_viewer & leaderboa",
+        "uncited finding: - **\"2 days ago\" \u2014 Remove 3 models: `claude-3-5-sonnet-with-search`, `gpt-4.1-mi",
+        "uncited finding: - **\"7 days ago\" \u2014 Update Cellcog scores: rerun rank_leaderboard and merge_raw_d",
+        "uncited finding: - **\"10 days ago\" \u2014 Add Baidu Qianfan-DeepResearch Pro (1st) and Qianfan-DeepRes",
+        "uncited finding: - Onyx's own submission README places **Onyx** at #1 (54.92 Overall).",
+        "uncited finding: - The muset-ai HF Space commit history is consistent with that \u2014 Onyx was added ",
+        "uncited finding: - The most recent third-party mirror (2026-06-23) still had **WhaleCloud-DocChai",
+        "uncited finding: - Baidu's own README continues to advertise **DuMate-DeepResearch (`qianfan_deep",
+        "uncited finding: - **Legacy Gemini-2.5-Pro leaderboard:** `qianfan_deepresearch_0430` (Baidu DuMa"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/351eb041c742470a87b96466963c1c3c.md",
+      "scores": {
+        "factual_accuracy": 0.85,
+        "citation_accuracy": 0.9,
+        "completeness": 0.95,
+        "source_quality": 0.85,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.88,
+        "notes": "Report correctly identifies the current GPT-5.5 leaderboard leader (Onyx at 54.92) with a dated citation and explicitly acknowledges data age and the live-scrape gap. Minor concern: the DRB-II arXiv paper date '2026-01-13' with DOI 2601.08536 is plausible but the paper title/date combination deserves scrutiny since January 2026 preprints would have a 2601.XXXXX ID, which checks out.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "dec-01",
+      "category": "decomposition",
+      "status": "done",
+      "wall_s": 145.5,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://redis.io/blog/best-open-source-vector-databases-comparison/"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/c705166bfb4a4d628311346ed058768d.md",
+      "scores": {
+        "factual_accuracy": 0.92,
+        "citation_accuracy": 0.88,
+        "completeness": 0.95,
+        "source_quality": 0.88,
+        "instruction_following": 0.93,
+        "expectation_met": true,
+        "overall": 0.91,
+        "notes": "All three axes (stars, license, managed cloud) are covered and cited for each of the three databases; the structured per-database sections supply source links for every load-bearing claim. Minor deduction on citation_accuracy: the comparison table itself carries no inline per-cell citations, relying on the prose sections below for sourcing, and one OSSInsight cross-check URL cannot be fully verified as canonical.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "dec-02",
+      "category": "decomposition",
+      "status": "done",
+      "wall_s": 122.6,
+      "structural_ok": true,
+      "structural_failures": [],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/56d3ff4275414e7eba30c4fac75b6f6f.md",
+      "scores": {
+        "factual_accuracy": 0.95,
+        "citation_accuracy": 0.95,
+        "completeness": 1.0,
+        "source_quality": 0.95,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.95,
+        "notes": "All six data points are present and individually cited to reputable sources (PwC Tax Summaries, KPMG, GTAI, Estonian Tax Board). Minor nuance: Estonia's CIT is distribution-based (22/78 mechanic) which the report explains clearly, and the conflicting-evidence section appropriately addresses the 2026 rate question.",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    },
+    {
+      "id": "dec-03",
+      "category": "decomposition",
+      "status": "done",
+      "wall_s": 191.9,
+      "structural_ok": false,
+      "structural_failures": [
+        "cited URL not in Sources: https://ai-tldr.dev/models/llama-4-maverick/",
+        "cited URL not in Sources: https://d-central.tech/ai/model/llama-4/",
+        "uncited finding: - Both models advertise 256K context ([Hugging Face model cards, above]).",
+        "cited URL not in Sources: https://neuronfeed.com/news/mistral-ai-ships-medium-3-5-a-128b-open-weight-flagship-model"
+      ],
+      "report_path": "/home/jonathan/Repos/research-agent/reports/eeb3f8cfb8034662b41e8f0b5b3d9897.md",
+      "scores": {
+        "factual_accuracy": 0.85,
+        "citation_accuracy": 0.9,
+        "completeness": 0.95,
+        "source_quality": 0.8,
+        "instruction_following": 0.95,
+        "expectation_met": true,
+        "overall": 0.88,
+        "notes": "Report thoroughly names current flagships per vendor with context windows and citations, and explicitly flags the Llama 4 vs 4.5 naming uncertainty. Minor concern: Mistral's 'flagship' is ambiguous between Large 3 and Medium 3.5, which the report acknowledges but doesn't resolve cleanly; source quality is mixed (aggregators AI/TLDR used alongside primary HF cards and official blogs).",
+        "judge_model": "claude-sonnet-4-6"
+      }
+    }
+  ]
+}
