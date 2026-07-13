@@ -145,7 +145,12 @@ def run_suite(subset: str, depth: str, ids: list[str] | None = None) -> list[dic
     for q in suite:
         t0 = time.monotonic()
         print(f"[{q['id']}] researching...", flush=True)
-        res = asyncio.run(_research_once(q["prompt"], depth))
+        try:
+            res = asyncio.run(_research_once(q["prompt"], depth))
+        except BaseException as e:  # ExceptionGroup subclasses BaseExceptionGroup
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            res = {"status": "error", "error": f"client exception: {type(e).__name__}: {str(e)[:200]}"}
         entry: dict = {"id": q["id"], "category": q["category"],
                        "status": res.get("status"), "wall_s": round(time.monotonic() - t0, 1)}
         if res.get("status") != "done":

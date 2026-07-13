@@ -99,3 +99,16 @@ def test_merge_results_appends_new_ids():
     from evals.run_eval import merge_results
     merged = merge_results([{"id": "a", "status": "done"}], [{"id": "z", "status": "done"}])
     assert [r["id"] for r in merged] == ["a", "z"]
+
+
+def test_run_suite_survives_client_exception(monkeypatch):
+    import evals.run_eval as re_mod
+
+    async def boom(prompt, depth):
+        raise ExceptionGroup("unhandled", [RuntimeError("Connection closed")])
+
+    monkeypatch.setattr(re_mod, "_research_once", boom)
+    results = re_mod.run_suite("smoke", "normal")
+    assert len(results) == 4
+    assert all(r["status"] == "error" for r in results)
+    assert "client exception" in results[0]["error"]
