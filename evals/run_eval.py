@@ -123,19 +123,34 @@ async def _research_once(prompt: str, depth: str) -> dict:
     return {"status": "error", "error": "no content"}
 
 
-def run_suite(subset: str, depth: str) -> list[dict]:
+def merge_results(existing: list[dict], fresh: list[dict]) -> list[dict]:
+    """Replace existing entries by id with fresh ones; append new ids at the end."""
+    fresh_by_id = {r["id"]: r for r in fresh}
+    merged = [fresh_by_id.pop(r["id"], r) for r in existing]
+    merged.extend(fresh_by_id.values())
+    return merged
+
+
+def run_suite(subset: str, depth: str, ids: list[str] | None = None) -> list[dict]:
     from evals.judge import JudgeError, judge_report
     from evals.structural import check_report
 
     suite = json.loads((REPO_ROOT / "evals" / "questions.json").read_text())
-    if subset == "smoke":
+    if ids is not None:
+        suite = [q for q in suite if q["id"] in ids]
+    elif subset == "smoke":
         suite = [q for q in suite if q["smoke"]]
 
     results = []
     for q in suite:
         t0 = time.monotonic()
         print(f"[{q['id']}] researching...", flush=True)
-        res = asyncio.run(_research_once(q["prompt"], depth))
+        try:
+            res = asyncio.run(_research_once(q["prompt"], depth))
+        except BaseException as e:  # ExceptionGroup subclasses BaseExceptionGroup
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            res = {"status": "error", "error": f"client exception: {type(e).__name__}: {str(e)[:200]}"}
         entry: dict = {"id": q["id"], "category": q["category"],
                        "status": res.get("status"), "wall_s": round(time.monotonic() - t0, 1)}
         if res.get("status") != "done":
@@ -162,18 +177,35 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--subset", choices=["smoke", "full"], default="smoke")
     ap.add_argument("--depth", default="normal")
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--ids", default=None,
+                    help="Comma-separated question ids to run (overrides --subset)")
+    out_group = ap.add_mutually_exclusive_group(required=True)
+    out_group.add_argument("--out")
+    out_group.add_argument("--merge-into")
     ap.add_argument("--baseline", default=None)
     args = ap.parse_args()
 
-    results = run_suite(args.subset, args.depth)
-    summary = summarize(results)
-    out = {"subset": args.subset, "depth": args.depth,
-           "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
-           "summary": summary, "results": results}
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(out, indent=2))
+    ids: list[str] | None = [i.strip() for i in args.ids.split(",")] if args.ids else None
+    results = run_suite(args.subset, args.depth, ids=ids)
+
+    if args.merge_into:
+        merge_path = Path(args.merge_into)
+        existing_file = json.loads(merge_path.read_text())
+        merged = merge_results(existing_file["results"], results)
+        summary = summarize(merged)
+        out = {**existing_file,
+               "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+               "summary": summary, "results": merged}
+        merge_path.write_text(json.dumps(out, indent=2))
+    else:
+        summary = summarize(results)
+        out = {"subset": args.subset, "depth": args.depth,
+               "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+               "summary": summary, "results": results}
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(out, indent=2))
+
     print(json.dumps(summary, indent=2))
 
     if args.baseline:

@@ -167,6 +167,18 @@ Prefer tables over prose for quantitative comparisons (3+ items with the same at
   conflict — never average or silently pick one. Classify why they diverge
   (methodology, recency, source independence, definitions).
 
+## Completion rubric (before searching)
+
+Derive from the research prompt a rubric of 3-7 binary completion
+criteria — the concrete things a complete answer must contain (entities
+covered, comparison axes filled, dates found, registers checked). Write
+the rubric into your working notes before the first search.
+- Plan sub-questions FROM the rubric: every criterion maps to at least
+  one sub-question.
+- At each reflection, check criteria off against gathered evidence.
+- Unsatisfied criteria that survive the budget go into the Gaps section,
+  stated as such — never silently dropped.
+
 ## Research method
 
 - Decompose the prompt into single-search-answerable sub-questions before
@@ -179,14 +191,21 @@ Prefer tables over prose for quantitative comparisons (3+ items with the same at
 - As you read each fetched page, bind claims to evidence immediately:
   note (claim, source URL, short verbatim quote) while the page is in
   front of you — do not reconstruct citations later from memory.
-- After each search round, reflect: which sub-questions are answered, what
-  gaps remain, do any results conflict? Issue targeted follow-up searches
-  for gaps only — do not re-search what is already answered.
+- Maintain a STATE block in your working notes, rewritten after every
+  search round:
+    CONFIRMED: claim → source URL (verbatim quote noted)
+    OPEN: rubric criteria / sub-questions still unanswered
+    DEAD-ENDS: queries or strategies that returned nothing useful — do
+    not repeat these
+    PLAN: the next 1-3 searches and why
+  Decide the next action from the STATE block, not by rereading raw tool
+  output — this keeps late-round decisions sharp in a long context, and
+  stops re-searching what is already answered.
 - Before finalizing a directional conclusion (X beats Y, X is growing),
   run ONE counter-search phrased against your conclusion; report what it
   turns up, even if nothing.
-- Stop researching when every sub-question is either answered with adequate
-  sourcing or confirmed unanswerable within budget. Then write.
+- Stop researching when every rubric criterion is satisfied or confirmed
+  unsatisfiable within budget. Then write.
 
 ## Self-check before writing DONE
 
@@ -200,6 +219,8 @@ Before writing the report file, audit your draft:
 4. Numbers carry their applicability envelope (population, time window,
    conditions) rather than standing unqualified.
 5. Unanswered sub-questions appear in the Gaps section, not papered over.
+6. Every rubric criterion is either satisfied by the report or listed
+   under Gaps.
 On any failure: fix the claim, mark it unverified, or drop it.
 
 ## When done
