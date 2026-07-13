@@ -79,3 +79,23 @@ def test_agenix_env_sets_deployed_reports_dir(tmp_path, monkeypatch):
 
     monkeypatch.setenv("RESEARCH_REPORTS_DIR", "/custom")
     assert _agenix_env()["RESEARCH_REPORTS_DIR"] == "/custom"
+
+
+def test_merge_results_replaces_by_id():
+    from evals.run_eval import merge_results
+    existing = [
+        {"id": "a", "status": "error"},
+        {"id": "b", "status": "done", "structural_ok": True,
+         "scores": {"overall": 0.9, "expectation_met": True}, "category": "factual"},
+    ]
+    fresh = [{"id": "a", "status": "done", "structural_ok": True,
+              "scores": {"overall": 0.8, "expectation_met": True}, "category": "trap"}]
+    merged = merge_results(existing, fresh)
+    assert [r["id"] for r in merged] == ["a", "b"]
+    assert merged[0]["status"] == "done"
+
+
+def test_merge_results_appends_new_ids():
+    from evals.run_eval import merge_results
+    merged = merge_results([{"id": "a", "status": "done"}], [{"id": "z", "status": "done"}])
+    assert [r["id"] for r in merged] == ["a", "z"]
