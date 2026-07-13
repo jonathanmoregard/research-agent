@@ -52,3 +52,13 @@ def test_date_anchor_in_prompt_template():
     sys.path.insert(0, str(REPO))
     from mcp_server.server import PROMPT_TEMPLATE
     assert "{today}" in PROMPT_TEMPLATE
+
+
+def test_completion_rubric_protocol():
+    assert "## Completion rubric" in AGENT_MD
+    assert "3-7 binary" in AGENT_MD
+
+
+def test_retrac_state_buffer():
+    for marker in ("STATE block", "DEAD-ENDS:", "CONFIRMED:", "PLAN:"):
+        assert marker in AGENT_MD
