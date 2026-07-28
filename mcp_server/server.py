@@ -335,6 +335,36 @@ def _secrets() -> dict[str, str]:
 # Timeout for a single research call (seconds).
 AGENT_TIMEOUT = int(os.environ.get("RESEARCH_AGENT_TIMEOUT", "1500"))
 
+# ssh transport-failure (rc=255) retry policy. The research-agent microvm
+# periodically wedges on a warm-reboot and is restored by the host watchdog
+# within ~1-3 min; without a retry, calls that land in that window fail with
+# a bare 255. `_SSH_RETRIES` re-dials; between attempts we wait up to
+# `_SSH_WAIT_SECS` for sshd to answer again (covers the watchdog recovery).
+_SSH_RETRIES = int(os.environ.get("RESEARCH_SSH_RETRIES", "2"))
+_SSH_WAIT_SECS = int(os.environ.get("RESEARCH_SSH_WAIT_SECS", "200"))
+
+
+def _wait_for_sshd(host: str, port: int, timeout_s: int) -> bool:
+    """Block until the VM's sshd accepts a TCP connection, or `timeout_s`
+    elapses. Cheap TCP-connect probe (no auth, no key material) on a short
+    backoff. Returns True if sshd came back, False on timeout — the caller
+    retries the dial either way (a False just means the next attempt will
+    also likely fail, which is fine; we don't want to hang forever)."""
+    import socket
+    deadline = time.monotonic() + timeout_s
+    delay = 2.0
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=3):
+                _LOG.info("sshd reachable again at %s:%d", host, port)
+                return True
+        except OSError:
+            pass
+        time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+        delay = min(delay * 1.5, 15.0)
+    _LOG.warning("sshd still unreachable at %s:%d after %ds", host, port, timeout_s)
+    return False
+
 
 def _ssh_settings() -> dict[str, str]:
     """Resolve SSH transport settings from env at call time.
@@ -606,26 +636,45 @@ def _run_agent(
         remote_cmd,
     ]
 
-    t0 = time.monotonic()
-    try:
-        result = subprocess.run(
-            ssh_cmd,
-            input=stdin_payload,
-            capture_output=True,
-            text=True,
-            timeout=AGENT_TIMEOUT,
+    # ssh exit 255 is a TRANSPORT failure (connection refused/reset/closed),
+    # not an agent failure — the research-agent microvm periodically wedges
+    # on a warm-reboot and is restored by the host watchdog
+    # (research-agent-microvm-healthcheck) within ~1-3 min. Without a retry
+    # here, every research() call that lands in that recovery window fails
+    # with a bare 255 (49 of 63 hard failures over 2 months, 2026-07). So on
+    # 255 we wait for sshd to come back (bounded) and re-dial. A 255 is safe
+    # to retry: either the connection never established (agent never ran) or
+    # the VM died mid-run (its scratch report is gone) — both mean re-running
+    # the agent is correct, not double work. Non-255 rc is returned as-is.
+    for attempt in range(_SSH_RETRIES + 1):
+        t0 = time.monotonic()
+        try:
+            result = subprocess.run(
+                ssh_cmd,
+                input=stdin_payload,
+                capture_output=True,
+                text=True,
+                timeout=AGENT_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            _LOG.warning(
+                "agent timeout id=%s after=%dms limit=%ds",
+                report_id, int((time.monotonic() - t0) * 1000), AGENT_TIMEOUT,
+            )
+            raise
+        _LOG.info(
+            "agent return id=%s rc=%d wall_ms=%d out_bytes=%d err_bytes=%d attempt=%d",
+            report_id, result.returncode, int((time.monotonic() - t0) * 1000),
+            len(result.stdout), len(result.stderr), attempt,
         )
-    except subprocess.TimeoutExpired:
+        if result.returncode != 255 or attempt == _SSH_RETRIES:
+            return result.returncode, (result.stdout + result.stderr)
         _LOG.warning(
-            "agent timeout id=%s after=%dms limit=%ds",
-            report_id, int((time.monotonic() - t0) * 1000), AGENT_TIMEOUT,
+            "agent ssh transport-fail id=%s rc=255 attempt=%d — waiting for VM sshd then retrying",
+            report_id, attempt,
         )
-        raise
-    _LOG.info(
-        "agent return id=%s rc=%d wall_ms=%d out_bytes=%d err_bytes=%d",
-        report_id, result.returncode, int((time.monotonic() - t0) * 1000),
-        len(result.stdout), len(result.stderr),
-    )
+        _wait_for_sshd(ssh["host"], int(ssh["port"]), _SSH_WAIT_SECS)
+    # Unreachable (loop always returns), but keep the type checker happy.
     return result.returncode, (result.stdout + result.stderr)
 
 
