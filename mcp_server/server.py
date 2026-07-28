@@ -973,6 +973,16 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             "use depth='normal' or 'deep'",
         }
 
+    healthy, reason = _scanner_health_gate()
+    if not healthy:
+        _LOG.warning("research refused: scanner degraded (%s)", reason)
+        return {
+            "status": "error",
+            "error": f"scanner degraded ({reason}) — refusing to run research "
+            "fail-closed until the injection scanner recovers. The MCP stays "
+            "connected and re-checks automatically; retry shortly.",
+        }
+
     t_received = time.monotonic()
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     report_id = uuid.uuid4().hex
@@ -1253,6 +1263,14 @@ def retry_research(report_id: str) -> dict:
     if not REPORT_ID_RE.fullmatch(report_id):
         return {"status": "error", "error": "invalid report_id"}
 
+    healthy, reason = _scanner_health_gate()
+    if not healthy:
+        return {
+            "status": "error",
+            "error": f"scanner degraded ({reason}) — refusing to re-scan "
+            "fail-closed until the injection scanner recovers; retry shortly.",
+        }
+
     quarantine = REPORTS_DIR / "_quarantine"
     src = quarantine / f"{report_id}.md"
     if not quarantine.is_dir() or not src.exists():
@@ -1389,15 +1407,22 @@ def _maybe_update_scanner() -> None:
         log.info("scanner update: installed %s", remote_sha)
 
 
-def _boot_smoke() -> None:
-    """Run the scanner self-test before mcp.run() binds.
+# Scanner health gate. A failed self-test used to `SystemExit(2)` before
+# mcp.run() bound stdio — which forced the operator to RECONNECT the MCP
+# after any transient scanner hiccup (a cold Lakera key read, a momentary
+# honeypot outage). Instead the server now marks itself DEGRADED and stays
+# connected: `research()` refuses every call fail-closed (before the agent
+# runs, so no unscanned report is ever produced) until a throttled re-check
+# finds the scanner healthy again. Fail-closed guarantee preserved (a
+# regressed OR unavailable scanner delivers nothing); reconnect requirement
+# removed; recovery is automatic.
+_SCANNER_HEALTH: dict = {"ok": True, "reason": "", "last_check": 0.0}
+_SCANNER_RECHECK_SECS = float(os.environ.get("RESEARCH_SCANNER_RECHECK_SECS", "60"))
 
-    Refuses to start the MCP server if any canary regresses or if the
-    L3 honeypot is unreachable. Costs one Anthropic + two OpenAI
-    round-trips at boot — research-agent serves real research, so a
-    silent scanner regression here would let attacker-authored reports
-    through to the operator session.
-    """
+
+def _run_boot_smoke_once() -> tuple[bool, str]:
+    """Run the scanner self-test once. Returns (ok, reason). Never raises
+    SmokeFailure to the caller — that is mapped to (False, reason)."""
     import logging
     from injection_scanner.smoke import SmokeFailure, run_smoke
 
@@ -1412,9 +1437,50 @@ def _boot_smoke() -> None:
             "boot smoke FAILED took_ms=%d reason=%s",
             int((time.monotonic() - t0) * 1000), e.reason,
         )
-        log.error("research-agent: aborting startup, scanner self-test failed: %s", e.reason)
-        raise SystemExit(2) from e
+        return False, e.reason
     _LOG.info("boot smoke ok took_ms=%d", int((time.monotonic() - t0) * 1000))
+    return True, ""
+
+
+def _boot_smoke() -> None:
+    """Run the scanner self-test at startup — non-fatal.
+
+    On failure the server starts DEGRADED (see `_SCANNER_HEALTH`) rather
+    than exiting: it binds stdio and stays connected, but `research()`
+    rejects every call fail-closed until `_scanner_health_gate` re-checks
+    and finds the scanner healthy again. Costs one Anthropic + two OpenAI
+    round-trips at boot.
+    """
+    ok, reason = _run_boot_smoke_once()
+    _SCANNER_HEALTH.update(ok=ok, reason=reason, last_check=time.monotonic())
+    if not ok:
+        import logging
+        logging.getLogger("research-agent.boot").error(
+            "research-agent: starting DEGRADED — scanner self-test failed (%s). "
+            "research() is refused fail-closed until the scanner recovers; the MCP "
+            "stays connected and re-checks every %ss.",
+            reason, int(_SCANNER_RECHECK_SECS),
+        )
+
+
+def _scanner_health_gate() -> tuple[bool, str]:
+    """Whether the scanner is healthy enough to serve a research call.
+
+    Healthy path is a no-op (boot smoke already verified it; per-scan
+    fail-closed covers the rest). When degraded, re-run the self-test at
+    most once per `_SCANNER_RECHECK_SECS` so the server auto-heals without
+    a reconnect. Returns (ok, reason).
+    """
+    if _SCANNER_HEALTH["ok"]:
+        return True, ""
+    now = time.monotonic()
+    if now - _SCANNER_HEALTH["last_check"] >= _SCANNER_RECHECK_SECS:
+        ok, reason = _run_boot_smoke_once()
+        _SCANNER_HEALTH.update(ok=ok, reason=reason, last_check=now)
+        if ok:
+            _LOG.info("scanner recovered — resuming normal service")
+            return True, ""
+    return False, _SCANNER_HEALTH["reason"]
 
 
 def _log_credentials_state() -> None:
