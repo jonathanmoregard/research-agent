@@ -8,7 +8,7 @@ dependencies = [
     "anthropic>=0.96.0",
     "curl-cffi>=0.7",
     "injection-scanner",
-    "mcp>=1.27.0",
+    "mcp>=1.28.1",
     "openai>=2.32.0",
 ]
 
