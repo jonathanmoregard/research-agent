@@ -8,10 +8,11 @@ Exposes one tool:
 Flow per call:
   1. Host MCP server receives prompt.
   2. ssh into the long-running research-agent microvm on 127.0.0.1:2223
-     (port-forwarded by microvm.nix from the guest's port 22). Four
-     null-terminated fields (claude_token, exa, tavily, prompt_body) ship
-     over stdin; a guest-side inline bash writes the prompt to a tmp
-     file under the agent user's $HOME and execs scripts/run-agent.sh.
+     (port-forwarded by microvm.nix from the guest's port 22). Six
+     null-terminated fields (claude_token, exa, tavily, euipo_client_id,
+     euipo_client_secret, prompt_body) ship over stdin; a guest-side
+     inline bash writes the prompt to a tmp file under the agent user's
+     $HOME and execs scripts/run-agent.sh.
   3. scripts/run-agent.sh spawns a fresh bubblewrap jail — new tmpfs
      $HOME, new tmpfs /tmp, read-only system, writable-only to one
      pre-created report file under /out/<uuid>.md (virtiofs share of
@@ -48,8 +49,9 @@ REPORT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 
 # Model ids the `model` tool param may carry into the guest. Charset-gated
 # (not allowlisted) so new Anthropic releases work without a server change;
-# run-agent.sh re-validates guest-side with the same pattern.
-MODEL_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+# run-agent.sh re-validates guest-side with the same pattern. First char
+# must be alphanumeric so the value can never look like a CLI flag.
+MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 _LOG_PATH = Path(
@@ -525,7 +527,7 @@ def _run_agent(
     """Run a single research call inside the microvm's bubblewrap jail.
 
     Connects to the agent's sshd on RESEARCH_SSH_HOST:RESEARCH_SSH_PORT,
-    streams four null-terminated fields over stdin (three secrets +
+    streams six null-terminated fields over stdin (five secrets +
     prompt body), and waits for run-agent.sh inside the VM to complete.
 
     Returns (exit_code, combined_output).
@@ -1019,7 +1021,7 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
                 report_id, type(exc).__name__,
             )
             report_path.unlink(missing_ok=True)
-            _log_agent_failure(report_id, -1, f"invocation exception")
+            _log_agent_failure(report_id, -1, "invocation exception")
             return {
                 "status": "error",
                 "error": "agent invocation failed",

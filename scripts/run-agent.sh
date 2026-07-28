@@ -82,14 +82,19 @@ case "${DEPTH}" in
 esac
 
 # Per-call model override (RESEARCH_MODEL, set by the MCP server's `model`
-# tool param) beats both the default and the per-depth env pins. Arrives
-# over ssh, so gate it to a model-id charset before it reaches argv.
+# tool param) beats both the default and the per-depth env pins.
 if [[ -n "${RESEARCH_MODEL:-}" ]]; then
-  if ! [[ "${RESEARCH_MODEL}" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
-    echo "run-agent: invalid RESEARCH_MODEL '${RESEARCH_MODEL}'" >&2
-    exit 5
-  fi
   MODEL="${RESEARCH_MODEL}"
+fi
+
+# Gate the FINAL model id whatever its source (default, per-depth env,
+# per-call ssh env) before it reaches claude's argv. First char must be
+# alphanumeric so a value can never be parsed as a flag (e.g.
+# '--dangerously-...' would otherwise ride in as the --model value one
+# argv-parser quirk away from flag injection).
+if [[ -n "${MODEL}" ]] && ! [[ "${MODEL}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+  echo "run-agent: invalid model id '${MODEL}'" >&2
+  exit 5
 fi
 
 MODEL_FLAGS=()
