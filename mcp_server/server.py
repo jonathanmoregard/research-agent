@@ -629,15 +629,22 @@ def _run_agent(
     return result.returncode, (result.stdout + result.stderr)
 
 
-def _scan_text(content: str):
+def _scan_text(content: str, use_lakera: bool = True):
     """Run the layered intercept shim on pre-read `content`. Returns the Verdict.
 
     Scanning in memory (not from a path) eliminates read-vs-swap TOCTOU
     between the file arriving on disk and the scanner reading it. Callers
     snapshot the bytes under O_NOFOLLOW, then hand the string here.
+
+    `use_lakera` defaults to True (Lakera L2 on, fail-closed). The
+    `research(no_lakera=True)` escape hatch sets it False to drop ONLY the
+    Lakera layer — sanitization (L1) and the behavioral honeypot (L3, plus
+    L4 judge where present) still run, and the report is still wrapped as
+    untrusted. Intended for narrow use, e.g. researching Lakera config
+    itself while Lakera false-positives on the report about Lakera.
     """
     from injection_scanner.intercept import scan_text as _intercept_scan_text
-    return _intercept_scan_text(content)
+    return _intercept_scan_text(content, use_lakera=use_lakera)
 
 
 def _safe_read(path: Path) -> str:
@@ -928,7 +935,9 @@ mcp = FastMCP("research-agent")
 
 
 @mcp.tool()
-def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
+def research(
+    prompt: str, depth: str = "normal", model: str = "", no_lakera: bool = False
+) -> dict:
     """Run a web-research task in the isolated agent and return the report path.
 
     Args:
@@ -941,6 +950,13 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             the default pinned in run-agent.sh (currently claude-fable-5).
             Not valid with depth='fast' — the fast path is a direct Exa
             call with no agent, so no model runs at all.
+        no_lakera: Escape hatch — set True to drop ONLY the Lakera L2 layer
+            when scanning this report. Default False (Lakera on, fail-closed).
+            Sanitization (L1) and the behavioral honeypot (L3, plus the L4
+            judge where present) still run and the report is still wrapped
+            as untrusted. Use narrowly, e.g. researching how to configure
+            Lakera while Lakera false-positives on the report about Lakera.
+            Applies at every depth (the fast path's output is scanned too).
 
     Returns:
         On success: {"status": "done", "report_path": str, "report": str,
@@ -1083,8 +1099,14 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             }
         report_path.unlink(missing_ok=True)
 
+    if no_lakera:
+        _LOG.warning(
+            "research id=%s running with Lakera L2 DISABLED (no_lakera=True) — "
+            "honeypot + sanitization still enforced", report_id,
+        )
     return _scan_and_deliver(
-        content, report_id, prompt, agent_ms, t_received, t_scan_start
+        content, report_id, prompt, agent_ms, t_received, t_scan_start,
+        use_lakera=not no_lakera,
     )
 
 
@@ -1138,6 +1160,7 @@ def _scan_and_deliver(
     agent_ms: int,
     t_received: float,
     t_scan_start: float,
+    use_lakera: bool = True,
 ) -> dict:
     """Scan in-memory `content` and either deliver or quarantine.
 
@@ -1172,7 +1195,7 @@ def _scan_and_deliver(
         )
     else:
         try:
-            verdict = _scan_text(content)
+            verdict = _scan_text(content, use_lakera=use_lakera)
         except Exception as exc:
             verdict = _scan_error_verdict(exc)
 
@@ -1216,10 +1239,13 @@ def _scan_and_deliver(
 
     dst = REPORTS_DIR / f"{report_id}.md"
     dst.unlink(missing_ok=True)
+    from functools import partial
     from mcp_server.artifact_gate import gate_artifacts, rewrite_artifact_links
     t_art = time.monotonic()
     saved, quarantined = gate_artifacts(
-        report_id, REPORTS_DIR, _scan_text, audit_fn=_write_artifact_audit
+        report_id, REPORTS_DIR,
+        partial(_scan_text, use_lakera=use_lakera),
+        audit_fn=_write_artifact_audit,
     )
     artifacts_ms = int((time.monotonic() - t_art) * 1000)
     text = rewrite_artifact_links(
