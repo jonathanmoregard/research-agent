@@ -61,11 +61,11 @@ PRV_TOOLS="mcp__prv__prv_search"
 case "${DEPTH}" in
   normal)
     ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},${BROWSE_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},${PRV_TOOLS},Write"
-    MODEL="claude-opus-4-7"
+    MODEL="claude-fable-5"
     ;;
   deep)
     ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${TAVILY_DEEP},${RENDER_TOOLS},${BROWSE_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},${PRV_TOOLS},Write"
-    MODEL="claude-opus-4-7"
+    MODEL="claude-fable-5"
     ;;
   *)
     # fast is handled server-side (direct Exa call, no agent);
@@ -80,6 +80,17 @@ case "${DEPTH}" in
   normal) MODEL="${RESEARCH_MODEL_NORMAL:-$MODEL}" ;;
   deep)   MODEL="${RESEARCH_MODEL_DEEP:-$MODEL}" ;;
 esac
+
+# Per-call model override (RESEARCH_MODEL, set by the MCP server's `model`
+# tool param) beats both the default and the per-depth env pins. Arrives
+# over ssh, so gate it to a model-id charset before it reaches argv.
+if [[ -n "${RESEARCH_MODEL:-}" ]]; then
+  if ! [[ "${RESEARCH_MODEL}" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+    echo "run-agent: invalid RESEARCH_MODEL '${RESEARCH_MODEL}'" >&2
+    exit 5
+  fi
+  MODEL="${RESEARCH_MODEL}"
+fi
 
 MODEL_FLAGS=()
 if [[ -n "${MODEL}" ]]; then

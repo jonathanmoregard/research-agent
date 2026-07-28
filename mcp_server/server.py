@@ -46,6 +46,11 @@ from typing import Literal
 
 REPORT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 
+# Model ids the `model` tool param may carry into the guest. Charset-gated
+# (not allowlisted) so new Anthropic releases work without a server change;
+# run-agent.sh re-validates guest-side with the same pattern.
+MODEL_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
 
 _LOG_PATH = Path(
     os.environ.get("RESEARCH_AGENT_LOG")
@@ -514,7 +519,9 @@ _GUEST_SCRIPT = (
 )
 
 
-def _run_agent(prompt: str, report_id: str, depth: Depth) -> tuple[int, str]:
+def _run_agent(
+    prompt: str, report_id: str, depth: Depth, model: str | None = None
+) -> tuple[int, str]:
     """Run a single research call inside the microvm's bubblewrap jail.
 
     Connects to the agent's sshd on RESEARCH_SSH_HOST:RESEARCH_SSH_PORT,
@@ -557,17 +564,22 @@ def _run_agent(prompt: str, report_id: str, depth: Depth) -> tuple[int, str]:
     # The remote command is one shell-joined string: ssh joins all argv
     # after user@host with spaces and re-parses on the remote side.
     # Quote each piece explicitly so the script source survives intact.
+    env_assignments = [f"RESEARCH_DEPTH={shlex.quote(str(depth))}"]
+    if model:
+        # Pre-validated by the tool layer (MODEL_ID_RE); run-agent.sh
+        # re-checks guest-side before the value reaches claude's argv.
+        env_assignments.append(f"RESEARCH_MODEL={shlex.quote(model)}")
     remote_cmd = " ".join(
         [
-            f"RESEARCH_DEPTH={shlex.quote(str(depth))}",
+            *env_assignments,
             "bash", "-c", shlex.quote(_GUEST_SCRIPT),
             "bash", shlex.quote(report_id),
         ]
     )
 
     _LOG.info(
-        "agent dial id=%s depth=%s host=%s port=%s user=%s",
-        report_id, depth, ssh["host"], ssh["port"], ssh["user"],
+        "agent dial id=%s depth=%s model=%s host=%s port=%s user=%s",
+        report_id, depth, model or "default", ssh["host"], ssh["port"], ssh["user"],
     )
 
     ssh_cmd = [
@@ -914,7 +926,7 @@ mcp = FastMCP("research-agent")
 
 
 @mcp.tool()
-def research(prompt: str, depth: str = "normal") -> dict:
+def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
     """Run a web-research task in the isolated agent and return the report path.
 
     Args:
@@ -922,6 +934,11 @@ def research(prompt: str, depth: str = "normal") -> dict:
         depth: 'fast' | 'normal' | 'deep'. Controls how many queries the
             agent runs, numResults per query, livecrawl aggressiveness, and
             whether deep-research synthesis tools are enabled.
+        model: Optional Claude model id override for the in-jail agent
+            (e.g. 'claude-fable-5', 'claude-sonnet-5'). Empty string uses
+            the default pinned in run-agent.sh (currently claude-fable-5).
+            Not valid with depth='fast' — the fast path is a direct Exa
+            call with no agent, so no model runs at all.
 
     Returns:
         On success: {"status": "done", "report_path": str, "report": str,
@@ -940,6 +957,18 @@ def research(prompt: str, depth: str = "normal") -> dict:
         return {
             "status": "error",
             "error": f"invalid depth {depth!r}; must be one of {list(VALID_DEPTHS)}",
+        }
+    if model and not MODEL_ID_RE.fullmatch(model):
+        return {
+            "status": "error",
+            "error": "invalid model; expected a model id like 'claude-fable-5'",
+        }
+    if model and depth == "fast":
+        return {
+            "status": "error",
+            "error": "model override is not valid with depth='fast' — "
+            "the fast path is a direct search call with no agent; "
+            "use depth='normal' or 'deep'",
         }
 
     t_received = time.monotonic()
@@ -968,7 +997,7 @@ def research(prompt: str, depth: str = "normal") -> dict:
         # normal / deep — agent in bwrap jail.
         report_path.touch()
         try:
-            _code, _output = _run_agent(prompt, report_id, depth)  # type: ignore[arg-type]
+            _code, _output = _run_agent(prompt, report_id, depth, model or None)  # type: ignore[arg-type]
         except subprocess.TimeoutExpired:
             _LOG.warning("research timeout id=%s", report_id)
             report_path.unlink(missing_ok=True)
