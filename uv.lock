@@ -301,7 +301,7 @@ wheels = [
 [[package]]
 name = "injection-scanner"
 version = "0.1.0"
-source = { git = "https://github.com/jonathanmoregard/injection-scanner?rev=main#fb31c84ba735ec3fcee3fc8a5b4f902c767e86f1" }
+source = { git = "https://github.com/jonathanmoregard/injection-scanner?rev=main#001eb1d46037026a3bf8253465a08427c322aefb" }
 dependencies = [
     { name = "anthropic" },
     { name = "openai" },

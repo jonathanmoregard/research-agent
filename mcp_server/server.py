@@ -347,6 +347,36 @@ AGENT_TIMEOUT = int(os.environ.get("RESEARCH_AGENT_TIMEOUT", "1500"))
 _SSH_RETRIES = int(os.environ.get("RESEARCH_SSH_RETRIES", "2"))
 _SSH_WAIT_SECS = int(os.environ.get("RESEARCH_SSH_WAIT_SECS", "200"))
 
+# Model to retry with when the default model hits its org-monthly usage
+# limit. Opus is a separate quota bucket from Fable/Sonnet, so a limit
+# hit on the default model often completes under Opus without operator
+# action. Retry fires at most ONCE per call and only when the caller
+# did NOT pass an explicit `model` (never override caller intent). Set
+# to empty string to disable the fallback entirely.
+_LIMIT_FALLBACK_MODEL = os.environ.get(
+    "RESEARCH_LIMIT_FALLBACK_MODEL", "claude-opus-4-7"
+)
+# stderr / stdout substrings that identify "your subscription is out of
+# budget", case-insensitive contains-match. Kept narrow: only phrases
+# claude-code uses for the org-monthly limit specifically (verified
+# 2026-07-30 incident: "You've hit your org's monthly usage limit").
+# Rate-limit / 429 / transient errors are NOT in scope — those retry
+# via the ssh rc=255 path or surface to the caller as-is.
+_LIMIT_MARKERS = ("usage limit",)
+
+
+def _hit_usage_limit(output: str) -> bool:
+    """True iff agent output signals an org-monthly usage-limit rejection.
+
+    Contains-match against `_LIMIT_MARKERS`, case-insensitive. The claude
+    CLI writes the message to stdout on limit-hit, so callers pass the
+    combined stdout+stderr they already reassemble.
+    """
+    if not output:
+        return False
+    low = output.lower()
+    return any(m in low for m in _LIMIT_MARKERS)
+
 # Cross-process serialization of the single research microvm. Each Claude
 # session spawns its OWN research-agent-mcp process, so two agents issuing
 # research() concurrently dial the one 3 GB microvm at once and OOM it —
@@ -701,7 +731,35 @@ _GUEST_SCRIPT = (
 def _run_agent(
     prompt: str, report_id: str, depth: Depth, model: str | None = None
 ) -> tuple[int, str]:
-    """Run a single research call inside the microvm's bubblewrap jail.
+    """Run a research call, with automatic Opus fallback on usage-limit hit.
+
+    Wraps `_dial_agent` (which owns the ssh dial + rc=255 transport
+    retry). If the dial returns non-zero with a usage-limit marker in
+    the output AND the caller didn't specify a model AND a fallback
+    model is configured, re-dials once with `_LIMIT_FALLBACK_MODEL`.
+    Fallback fires at most once per call — the second dial passes the
+    fallback model explicitly so the recursion guard trips on the
+    reinvocation and no further fallback is attempted.
+    """
+    rc, out = _dial_agent(prompt, report_id, depth, model)
+    if (
+        rc != 0
+        and model is None
+        and _LIMIT_FALLBACK_MODEL
+        and _hit_usage_limit(out)
+    ):
+        _LOG.warning(
+            "agent usage-limit id=%s — retrying with model=%s (default quota exhausted)",
+            report_id, _LIMIT_FALLBACK_MODEL,
+        )
+        return _dial_agent(prompt, report_id, depth, _LIMIT_FALLBACK_MODEL)
+    return rc, out
+
+
+def _dial_agent(
+    prompt: str, report_id: str, depth: Depth, model: str | None = None
+) -> tuple[int, str]:
+    """One ssh dial to the microvm (with rc=255 transport retry).
 
     Connects to the agent's sshd on RESEARCH_SSH_HOST:RESEARCH_SSH_PORT,
     streams six null-terminated fields over stdin (five secrets +
