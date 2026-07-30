@@ -43,6 +43,7 @@ import stat as stat_mod
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -408,6 +409,70 @@ def _vm_lock(wait_secs: int):
         os.close(fd)
 
 
+# Liveness heartbeat the host watchdog reads to tell "busy" from "dead".
+# The research-agent microvm watchdog probes sshd once a minute and
+# restarts the VM after 3 consecutive failures — but a single research
+# run loads the guest enough that the probe can time out, so the watchdog
+# was restarting the VM out from under a legitimately-running agent (the
+# call died rc=255; 93 mid-run restarts in the two days to 2026-07-30).
+# While the MCP is actively dialing the VM (the live ssh subprocess), a
+# background thread touches this file every _HEARTBEAT_INTERVAL_S; the
+# watchdog treats a fresh heartbeat as "busy, don't restart". The
+# heartbeat runs ONLY around the live ssh call — not during the
+# between-retry _wait_for_sshd — so a genuinely wedged VM (ssh dropped or
+# call ended) goes stale within one interval and the watchdog resumes
+# recovery. Path is env-driven: on dellan the nixos wrapper points it at
+# a /run path both the MCP (writer) and the root watchdog (reader) agree
+# on; elsewhere it defaults under the cache dir and is simply unread.
+_ACTIVITY_FILE = Path(
+    os.environ.get("RESEARCH_ACTIVITY_FILE")
+    or (Path.home() / ".cache" / "research-agent" / "active")
+)
+_HEARTBEAT_INTERVAL_S = int(os.environ.get("RESEARCH_HEARTBEAT_INTERVAL_SECS", "20"))
+
+
+def _touch_activity() -> None:
+    """Best-effort update of the heartbeat file's mtime. Never raises —
+    a heartbeat failure must not break a research call."""
+    try:
+        _ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _ACTIVITY_FILE.touch()
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _activity_heartbeat():
+    """Keep the activity heartbeat fresh for the duration of the `with`.
+
+    Touches `_ACTIVITY_FILE` immediately and then every
+    `_HEARTBEAT_INTERVAL_S` from a daemon thread until the block exits, at
+    which point it clears the file so the watchdog resumes immediately
+    rather than waiting out a staleness window.
+    """
+    stop = threading.Event()
+
+    def _beat() -> None:
+        while not stop.wait(_HEARTBEAT_INTERVAL_S):
+            _touch_activity()
+
+    # Touch synchronously on entry so the file exists the moment the `with`
+    # body starts — the watchdog must see "busy" before the ssh dial, not
+    # one thread-schedule later.
+    _touch_activity()
+    t = threading.Thread(target=_beat, name="research-heartbeat", daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=2)
+        try:
+            _ACTIVITY_FILE.unlink()
+        except OSError:
+            pass
+
+
 def _sshd_banner_ok(host: str, port: int) -> bool:
     """True iff the VM's sshd answers with an SSH protocol banner.
 
@@ -731,13 +796,18 @@ def _run_agent(
     for attempt in range(_SSH_RETRIES + 1):
         t0 = time.monotonic()
         try:
-            result = subprocess.run(
-                ssh_cmd,
-                input=stdin_payload,
-                capture_output=True,
-                text=True,
-                timeout=AGENT_TIMEOUT,
-            )
+            # Heartbeat ONLY around the live ssh call: while the agent is
+            # actually connected the watchdog must not restart the VM;
+            # once ssh returns (done or rc=255) the heartbeat clears so a
+            # dead VM can be recovered during the _wait_for_sshd below.
+            with _activity_heartbeat():
+                result = subprocess.run(
+                    ssh_cmd,
+                    input=stdin_payload,
+                    capture_output=True,
+                    text=True,
+                    timeout=AGENT_TIMEOUT,
+                )
         except subprocess.TimeoutExpired:
             _LOG.warning(
                 "agent timeout id=%s after=%dms limit=%ds",
