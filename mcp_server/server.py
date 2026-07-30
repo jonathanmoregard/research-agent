@@ -778,7 +778,13 @@ def _run_agent(
         # the spec wants. Fix: rm ~/.cache/research-agent/known_hosts.
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", f"UserKnownHostsFile={ssh['known_hosts']}",
+        # Keepalive bounds how long a wedged-mid-call VM keeps the activity
+        # heartbeat "fresh" (the MCP heartbeats only while this subprocess
+        # runs). Explicit CountMax so the ~90s dead-peer detection doesn't
+        # silently change if the system ssh_config default moves; the
+        # AGENT_TIMEOUT subprocess timeout is the hard backstop above it.
         "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
         f"{ssh['user']}@{ssh['host']}",
         remote_cmd,
     ]
