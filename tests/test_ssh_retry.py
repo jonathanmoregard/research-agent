@@ -57,7 +57,7 @@ def test_non255_does_not_retry(monkeypatch):
     assert len(calls) == 1  # single dial, no retry
 
 
-def test_wait_for_sshd_returns_true_when_reachable(monkeypatch):
+def _mock_sock(monkeypatch, banner: bytes):
     import socket
 
     class _Sock:
@@ -67,5 +67,23 @@ def test_wait_for_sshd_returns_true_when_reachable(monkeypatch):
         def __exit__(self, *a):
             return False
 
+        def settimeout(self, _t):
+            pass
+
+        def recv(self, _n):
+            return banner
+
     monkeypatch.setattr(socket, "create_connection", lambda *a, **k: _Sock())
+
+
+def test_wait_for_sshd_returns_true_on_ssh_banner(monkeypatch):
+    _mock_sock(monkeypatch, b"SSH-2.0-OpenSSH_10.3\r\n")
     assert server._wait_for_sshd("127.0.0.1", 2223, 5) is True
+
+
+def test_wait_for_sshd_false_on_bare_tcp_accept(monkeypatch):
+    # qemu SLIRP hostfwd accepts the TCP connection even when guest sshd is
+    # down — a bare accept with no SSH banner must NOT count as ready
+    # (the 2026-07-30 false-positive that made the retry fire into a dead VM).
+    _mock_sock(monkeypatch, b"")
+    assert server._wait_for_sshd("127.0.0.1", 2223, 1) is False

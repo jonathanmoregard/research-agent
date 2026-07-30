@@ -28,6 +28,9 @@ state isolation is enforced by bubblewrap, not by VM restart.
 """
 from __future__ import annotations
 
+import contextlib
+import errno
+import fcntl
 import json
 import logging
 import logging.handlers
@@ -343,26 +346,105 @@ AGENT_TIMEOUT = int(os.environ.get("RESEARCH_AGENT_TIMEOUT", "1500"))
 _SSH_RETRIES = int(os.environ.get("RESEARCH_SSH_RETRIES", "2"))
 _SSH_WAIT_SECS = int(os.environ.get("RESEARCH_SSH_WAIT_SECS", "200"))
 
+# Cross-process serialization of the single research microvm. Each Claude
+# session spawns its OWN research-agent-mcp process, so two agents issuing
+# research() concurrently dial the one 3 GB microvm at once and OOM it —
+# the second agent's ssh drops as rc=255 (observed 2026-07-28 22:40: two
+# overlapping deep calls, second failed). An in-process lock can't help
+# (separate processes); an flock on a shared file does. Only the
+# VM-dialing (normal/deep) path takes it — the fast/direct-Exa path never
+# touches the VM and stays fully concurrent. Bounded wait so a caller
+# queued behind a long deep run eventually gets a clean "busy" error
+# instead of hanging forever.
+_VM_LOCK_PATH = Path(
+    os.environ.get("RESEARCH_LOCK_FILE")
+    or (Path.home() / ".cache" / "research-agent" / "agent.lock")
+)
+_VM_LOCK_WAIT_SECS = int(os.environ.get("RESEARCH_LOCK_WAIT_SECS", "1800"))
+
+
+class _VMBusy(Exception):
+    """Raised when the cross-process VM lock can't be acquired in time."""
+
+
+@contextlib.contextmanager
+def _vm_lock(wait_secs: int):
+    """Hold an exclusive cross-process lock on the research microvm.
+
+    Serializes research() calls across all MCP processes so the single
+    microvm runs at most one agent at a time. Blocks (polling a
+    non-blocking flock) until the lock is free or `wait_secs` elapses;
+    on timeout raises `_VMBusy` so the caller returns a clean busy error.
+    The lock is always released and the fd closed on exit — a crash inside
+    the `with` body still frees it because flock is tied to the open fd
+    (kernel drops it when the process dies).
+    """
+    _VM_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(_VM_LOCK_PATH, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    deadline = time.monotonic() + wait_secs
+    delay = 0.5
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError as e:
+                if e.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _VMBusy() from None
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 1.5, 5.0)
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
+
+
+def _sshd_banner_ok(host: str, port: int) -> bool:
+    """True iff the VM's sshd answers with an SSH protocol banner.
+
+    A bare TCP connect is NOT enough: qemu SLIRP host-forwarding binds the
+    host port (:2223) and accepts the connection even while the guest sshd
+    is down or the guest has wedged — so TCP-connect success is a false
+    positive (observed 2026-07-30: the rc=255 retry fired 12 ms after the
+    failure because TCP accepted instantly into a dead VM). Read the
+    server's identification string ("SSH-2.0-...") the way the host
+    watchdog's ssh-keyscan probe does; only a real banner means sshd is
+    actually serving again.
+    """
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=4) as s:
+            s.settimeout(4)
+            banner = s.recv(64)
+        return banner.startswith(b"SSH-")
+    except OSError:
+        return False
+
 
 def _wait_for_sshd(host: str, port: int, timeout_s: int) -> bool:
-    """Block until the VM's sshd accepts a TCP connection, or `timeout_s`
-    elapses. Cheap TCP-connect probe (no auth, no key material) on a short
-    backoff. Returns True if sshd came back, False on timeout — the caller
-    retries the dial either way (a False just means the next attempt will
-    also likely fail, which is fine; we don't want to hang forever)."""
-    import socket
+    """Block until the VM's sshd serves an SSH banner, or `timeout_s`
+    elapses. Probes the real protocol banner (see `_sshd_banner_ok`), not
+    a bare TCP connect, so the recovery window after a watchdog restart is
+    actually waited out. Returns True once sshd answers, False on timeout —
+    the caller retries the dial either way (we never hang forever)."""
     deadline = time.monotonic() + timeout_s
     delay = 2.0
     while time.monotonic() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=3):
-                _LOG.info("sshd reachable again at %s:%d", host, port)
-                return True
-        except OSError:
-            pass
+        if _sshd_banner_ok(host, port):
+            _LOG.info("sshd serving again at %s:%d", host, port)
+            return True
         time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
         delay = min(delay * 1.5, 15.0)
-    _LOG.warning("sshd still unreachable at %s:%d after %ds", host, port, timeout_s)
+    _LOG.warning("sshd still not serving at %s:%d after %ds", host, port, timeout_s)
     return False
 
 
@@ -1055,10 +1137,23 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             }
         content = body
     else:
-        # normal / deep — agent in bwrap jail.
+        # normal / deep — agent in bwrap jail. Serialized across processes
+        # by _vm_lock: the single microvm OOMs if two agents run at once.
         report_path.touch()
         try:
-            _code, _output = _run_agent(prompt, report_id, depth, model or None)  # type: ignore[arg-type]
+            with _vm_lock(_VM_LOCK_WAIT_SECS):
+                _code, _output = _run_agent(prompt, report_id, depth, model or None)  # type: ignore[arg-type]
+        except _VMBusy:
+            _LOG.warning(
+                "research busy id=%s — VM lock wait exceeded %ds",
+                report_id, _VM_LOCK_WAIT_SECS,
+            )
+            report_path.unlink(missing_ok=True)
+            return {
+                "status": "error",
+                "error": "research backend busy — another research call is "
+                "using the agent VM; retry shortly.",
+            }
         except subprocess.TimeoutExpired:
             _LOG.warning("research timeout id=%s", report_id)
             report_path.unlink(missing_ok=True)
