@@ -13,11 +13,23 @@
 #   - Writable bind of /tool-cache (when present) — persistent PRV +
 #     Bolagsverket SQLite indexes; see CACHE_ARGS below.
 #   - Network: inherited (exa + tavily MCPs need outbound).
+#   - Memory: bounded by a per-call cgroup cap; see MEMGUARD below and
+#     lib/memguard.sh.
 #
 # When the jail exits, tmpfs is reaped. Nothing persists except the
 # report file and the /tool-cache indexes.
 
 set -euo pipefail
+
+# Resolved before anything else so the memguard helper can be sourced
+# regardless of the caller's cwd (the MCP server invokes us by absolute
+# path from the ssh login shell's $HOME).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# `source=` lets `shellcheck -x` follow the helper; `disable=SC1091` keeps
+# a plain `shellcheck scripts/run-agent.sh` (no -x) clean too, since the
+# path is only resolvable at runtime.
+# shellcheck source=lib/memguard.sh disable=SC1091
+. "${SCRIPT_DIR}/lib/memguard.sh"
 
 REPORT_UUID="${1:?uuid required}"
 PROMPT_FILE="${2:?prompt file required}"
@@ -102,6 +114,15 @@ if [[ -n "${MODEL}" ]]; then
   MODEL_FLAGS=(--model "${MODEL}")
 fi
 
+# Per-call memory cap. Validated here, alongside the other config gates,
+# so a typo'd RESEARCH_MEM_MAX fails immediately and loudly instead of
+# surfacing 20 minutes later as an opaque systemd-run error. The argv is
+# assembled further down, just above bwrap. See lib/memguard.sh.
+if ! MEM_CAP="$(memguard_cap)"; then
+  echo "run-agent: invalid RESEARCH_MEM_MAX '${RESEARCH_MEM_MAX:-}' (want bytes or K/M/G/T suffix, e.g. 2G; or off)" >&2
+  exit 6
+fi
+
 AGENT_DIR="/workspace/agent"
 OUT_DIR="${RESEARCH_REPORTS_DIR:-/out}"
 SCRATCH_FILE="/scratch/${REPORT_UUID}.md"
@@ -177,6 +198,40 @@ else
   CACHE_ARGS=(--setenv PRV_CACHE_DIR "${PRV_CACHE_DIR:-/tmp/prv-cache}")
 fi
 
+# MEMGUARD — per-call memory cap.
+#
+# bwrap isolates the filesystem but shares the guest's memory with every
+# other in-flight call. Without a cap, one runaway call drives the whole
+# 6 GiB VM into reclaim, stalls sshd, and gets the VM restarted by the
+# host watchdog — killing unrelated concurrent calls. Wrapping bwrap in
+# its own transient cgroup scope makes a runaway call die alone.
+#
+# MEMGUARD_ARGV is EMPTY when the cap is disabled or unavailable, in which
+# case bwrap runs exactly as it did before this block existed. Expanding
+# an empty array under `set -u` is safe on bash >= 4.4 (guest ships 5.3).
+MEMGUARD_ARGV=()
+if [[ "${MEM_CAP}" != "off" ]]; then
+  if memguard_available; then
+    # Scope name is derived from the (already regex-gated) report uuid, so
+    # concurrent calls can never collide on a unit name and `systemctl
+    # --user status research-<uuid>.scope` is a usable live debug handle.
+    mapfile -t MEMGUARD_ARGV < <(
+      memguard_scope_argv \
+        "${MEM_CAP}" \
+        "research-${REPORT_UUID}.scope" \
+        "${SCRIPT_DIR}/lib/memguard.sh"
+    )
+    echo "run-agent: memory cap ${MEM_CAP} armed (scope research-${REPORT_UUID}.scope)" >&2
+  else
+    # Degrade rather than fail: the guest always has a user manager (we
+    # run inside an ssh session), but a developer checkout or a bare
+    # container does not, and refusing to run there would make the script
+    # untestable outside the VM. Loud, greppable, and never silent.
+    echo "run-agent: WARNING memory cap ${MEM_CAP} requested but systemd-run --user --scope is unavailable — running UNCAPPED" >&2
+  fi
+fi
+
+"${MEMGUARD_ARGV[@]}" \
 bwrap \
   --ro-bind /nix/store /nix/store \
   --ro-bind /run/current-system /run/current-system \
