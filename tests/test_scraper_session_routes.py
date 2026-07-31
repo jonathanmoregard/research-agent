@@ -31,10 +31,19 @@ sys.modules.setdefault("playwright", types.ModuleType("playwright"))
 sys.modules["playwright.sync_api"] = _pw_sync
 
 # Stub the token file before _load_token() runs at import time.
+#
+# Assign, don't setdefault: under a full-suite run the render-shim test
+# modules import first (alphabetically) and hard-set SCRAPER_TOKEN_FILE
+# to their own stub, whose contents are "test-token". setdefault would
+# then be a no-op, scraper/server.py would cache that token at import,
+# and every request here would come back 403 "bad bearer" — passing in
+# isolation but failing in the suite. Each module owns the env var for
+# the module it is about to import, so an explicit set is correct
+# regardless of import order.
 _TOKEN_FILE = REPO_ROOT / "tests" / "_scraper_token_stub"
 _TOKEN_FILE.write_text("stub-token-for-tests\n")
 import os
-os.environ.setdefault("SCRAPER_TOKEN_FILE", str(_TOKEN_FILE))
+os.environ["SCRAPER_TOKEN_FILE"] = str(_TOKEN_FILE)
 
 import server   # noqa: E402
 import sessions  # noqa: E402

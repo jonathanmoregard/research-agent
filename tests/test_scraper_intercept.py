@@ -30,10 +30,14 @@ sys.modules.setdefault("playwright", types.ModuleType("playwright"))
 sys.modules["playwright.sync_api"] = _pw_sync
 
 # Stub the token file before _load_token() runs at import time.
+# Assign rather than setdefault — see the same block in
+# test_scraper_session_routes.py: the render-shim modules import earlier
+# in a full-suite run and point this var at a stub holding a different
+# token, which setdefault would silently keep.
 _TOKEN_FILE = REPO_ROOT / "tests" / "_scraper_token_stub"
 _TOKEN_FILE.write_text("stub-token-for-tests\n")
 import os
-os.environ.setdefault("SCRAPER_TOKEN_FILE", str(_TOKEN_FILE))
+os.environ["SCRAPER_TOKEN_FILE"] = str(_TOKEN_FILE)
 
 from server import (  # noqa: E402
     _validate_intercept_inputs,
