@@ -107,6 +107,100 @@ def _install_file_logger() -> logging.Logger:
 
 _LOG = _install_file_logger()
 
+# Code-staleness reporting.
+#
+# This process runs straight out of the working copy
+# (`uv run --project ~/Repos/research-agent`), so the Python it imported
+# is frozen at spawn time while the checkout underneath keeps moving. A
+# cron job pulls every 30 minutes, which makes every NEWLY spawned server
+# current — but a long-lived Claude Code session keeps whatever it
+# imported until the session ends.
+#
+# That gap is exactly how 2026-07-29..31 went unnoticed: a merged fix sat
+# unapplied while calls failed, and nothing in any response said which
+# code was answering. Hot-swapping modules under a running call is not
+# the fix (stale references, half-updated modules, module-level caches);
+# making the staleness *visible* is. We stamp the SHA this process booted
+# from and compare it to HEAD per call, so a drifted server announces
+# itself in the log and in the tool response instead of failing silently.
+#
+# Guest-side code is deliberately NOT part of this: /workspace is a
+# read-only bind of the same checkout, read fresh per call, so
+# run-agent.sh and the shims are always current regardless of this value.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _head_sha(repo: Path) -> str | None:
+    """Short HEAD SHA of `repo`, or None if git can't answer.
+
+    Never raises: a missing git, a detached/corrupt repo, or a slow disk
+    must not fail a research call — staleness reporting is diagnostic,
+    not load-bearing. Bounded at 2s so it can't stall the hot path.
+    """
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    sha = r.stdout.strip()
+    return sha if r.returncode == 0 and sha else None
+
+
+_BOOT_SHA = _head_sha(_REPO_ROOT)
+
+
+def _stamped(fn):
+    """Attach a `server_staleness` key to a tool's dict result when the
+    checkout has moved since this process booted.
+
+    Applied under @mcp.tool() so FastMCP still derives its schema from the
+    real signature (functools.wraps keeps annotations and __wrapped__).
+    Every return path of the wrapped tool gets stamped — including the
+    error paths, which is where a stale server is most likely to be the
+    explanation the caller needs.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        out = fn(*args, **kwargs)
+        if isinstance(out, dict):
+            drift = _staleness()
+            if drift:
+                _LOG.warning(
+                    "stale server: running %s, checkout at %s",
+                    drift["running"], drift["on_disk"],
+                )
+                out["server_staleness"] = drift
+        return out
+
+    return wrapper
+
+
+def _staleness() -> dict | None:
+    """Return a drift descriptor when the checkout has moved since boot.
+
+    None in the steady state, so the common path adds nothing to the
+    response. When it fires, the caller learns both SHAs and what to do
+    about it — the remedy is starting a new session, not any retry.
+    """
+    current = _head_sha(_REPO_ROOT)
+    if not current or not _BOOT_SHA or current == _BOOT_SHA:
+        return None
+    return {
+        "running": _BOOT_SHA,
+        "on_disk": current,
+        "note": (
+            f"This MCP server booted from {_BOOT_SHA}; the checkout is now at "
+            f"{current}. Host-side Python is frozen at spawn, so this call ran "
+            "the older code. Guest-side agent code (/workspace) is always "
+            "current. Start a new session to pick up the newer server."
+        ),
+    }
+
 # Timing buckets (ms) — reject responses report timings_ms.scan rounded up
 # to the nearest bucket so callers can't fingerprint which scanner layer
 # rejected (regex ~ms vs honeypot ~seconds). Deliver responses report
@@ -1271,6 +1365,7 @@ mcp = FastMCP("research-agent")
 
 
 @mcp.tool()
+@_stamped
 def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
     """Run a web-research task in the isolated agent and return the report path.
 
@@ -1599,6 +1694,7 @@ def _scan_and_deliver(
 
 
 @mcp.tool()
+@_stamped
 def retry_research(report_id: str) -> dict:
     """Re-run the scanner on a previously quarantined report.
 
