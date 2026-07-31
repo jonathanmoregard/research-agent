@@ -508,12 +508,16 @@ def _hit_usage_limit(output: str) -> bool:
 # screenshots as inline base64 that stay in the agent's context (~20 MB
 # per screenshot); even a 20-screenshot session extrapolates to ~+0.4 GB.
 #
-# Default 3: at the measured ~0.9 GB per concurrent call that leaves the
-# guest roughly half empty. The binding constraint above 3 is external,
-# not local — Tavily's REST limit is 100 RPM on Development plans (1,000
-# on Production) with /research at 20 RPM, so several bursty agents can
-# reach the API ceiling while the VM is still idle. Raise past 3 only
-# after confirming which Tavily plan this key is on.
+# Default 6: from the 2026-07-31 measurement above, per-concurrent-call
+# delta is ~0.43 GB (cgroup), so 6 slots project to baseline + 6×delta ≈
+# 3.3 GB peak inside the guest. Companion nixos-config PR shrinks the
+# microvm mem to 4096 MiB (≈+20% buffer over that projected peak).
+# Depth barely moves memory — extra slots cost Tavily-side RPM budget,
+# not guest RAM. Tavily Development is 100 RPM overall / 20 RPM on
+# /research; 6 concurrent bursty deep runs can graze that ceiling and
+# should hold on Production (1000 / 200 RPM) without tuning. If Tavily
+# rate-limits, calls fail loudly with an HTTP status the caller sees;
+# no silent corruption.
 _VM_LOCK_PATH = Path(
     os.environ.get("RESEARCH_LOCK_FILE")
     or (Path.home() / ".cache" / "research-agent" / "agent.lock")
@@ -521,7 +525,7 @@ _VM_LOCK_PATH = Path(
 _VM_LOCK_WAIT_SECS = int(os.environ.get("RESEARCH_LOCK_WAIT_SECS", "1800"))
 
 
-_VM_SLOTS_DEFAULT = 3
+_VM_SLOTS_DEFAULT = 6
 
 
 def _read_slots(raw: str | None) -> int:
