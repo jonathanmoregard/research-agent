@@ -96,3 +96,32 @@ def test_stamped_preserves_signature_for_schema_generation():
     params = inspect.signature(server.research).parameters
     assert list(params) == ["prompt", "depth", "model"]
     assert server.research.__doc__ and "depth" in server.research.__doc__
+
+
+def test_fastmcp_publishes_the_real_schema_over_the_wire():
+    """Signature transparency at the Python level is not the same as
+    what FastMCP actually publishes to a client. This asserts the
+    contract boundary a future FastMCP release could silently break by
+    reading `__signature__` directly and ignoring `__wrapped__`. We ask
+    the registered `mcp` object for its tool schemas and check the
+    parameters are still visible."""
+    import asyncio
+
+    async def _list():
+        # FastMCP exposes tools via list_tools() on the server instance.
+        return await server.mcp.list_tools()
+
+    tools = asyncio.run(_list())
+    tools_by_name = {t.name: t for t in tools}
+    research_tool = tools_by_name.get("research")
+    assert research_tool is not None, f"research tool missing from {list(tools_by_name)}"
+    schema = getattr(research_tool, "inputSchema", None) or getattr(
+        research_tool, "input_schema", None
+    )
+    assert schema is not None, "research tool schema not exposed"
+    props = schema.get("properties", {})
+    for expected in ("prompt", "depth", "model"):
+        assert expected in props, (
+            f"FastMCP is not publishing '{expected}' — decorator ordering "
+            f"lost the signature. Got: {list(props)}"
+        )

@@ -564,10 +564,22 @@ def _vm_lock(wait_secs: int):
     range they share.
     """
     _VM_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    fds = [
-        os.open(f"{_VM_LOCK_PATH}.{i}", os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
-        for i in range(_VM_SLOTS)
-    ]
+    # Open each slot file one at a time and close what we've already got
+    # if a later open raises (EMFILE at ulimit, ENOSPC on the cache tmpfs,
+    # permission race). A list comprehension leaks the earlier fds because
+    # the exception exits the comprehension before entering the try below,
+    # so the finally block never sees them. On a long-lived MCP process
+    # under repeated failure that starves the fd table.
+    fds: list[int] = []
+    try:
+        for i in range(_VM_SLOTS):
+            fds.append(
+                os.open(f"{_VM_LOCK_PATH}.{i}", os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+            )
+    except BaseException:
+        for fd in fds:
+            os.close(fd)
+        raise
     deadline = time.monotonic() + wait_secs
     delay = 0.5
     held: int | None = None

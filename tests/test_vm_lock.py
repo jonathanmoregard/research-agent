@@ -8,6 +8,7 @@ Multi-slot behaviour is covered separately below."""
 from __future__ import annotations
 
 import multiprocessing
+import os
 import time
 
 import pytest
@@ -168,6 +169,33 @@ def test_slots_are_cross_process(slots, tmp_path):
     finally:
         proc.join(10)
     assert released.is_set()
+
+
+def test_partial_open_failure_does_not_leak_fds(slots, monkeypatch):
+    """If the 2nd os.open in the slot loop raises, the 1st fd must be
+    closed rather than leaked. Reproduced 2026-07-31 on a real process:
+    a simulated EMFILE on the 2nd open leaked one fd until the process
+    died. On a long-lived MCP that starves the fd table under repeated
+    failure."""
+    slots(3)
+    before = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+
+    real_open = os.open
+    calls = {"n": 0}
+
+    def raising_open(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError(24, "EMFILE simulated")
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(server.os, "open", raising_open)
+    with pytest.raises(OSError):
+        with server._vm_lock(1):
+            pass
+
+    after = len(os.listdir(f"/proc/{os.getpid()}/fd"))
+    assert after == before, f"leaked {after - before} fd(s) on partial open failure"
 
 
 @pytest.mark.parametrize(
