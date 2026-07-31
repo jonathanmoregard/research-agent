@@ -57,6 +57,15 @@ REPORT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 # must be alphanumeric so the value can never look like a CLI flag.
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
+# Per-call memory cap forwarded to the guest (scripts/lib/memguard.sh owns
+# the default and the enforcement). Host-side this is operator config, not
+# a tool param — callers must not be able to raise their own ceiling. Set
+# RESEARCH_MEM_MAX in the MCP server's environment to override; leave it
+# unset to take the guest default. Charset-gated to systemd's MemoryMax
+# syntax (bytes or K/M/G/T suffix, or off/none) so a typo fails here
+# rather than 20 minutes into a call; run-agent.sh re-validates guest-side.
+MEM_MAX_RE = re.compile(r"^([1-9][0-9]*[KMGT]?|off|none|0)$")
+
 
 _LOG_PATH = Path(
     os.environ.get("RESEARCH_AGENT_LOG")
@@ -377,21 +386,64 @@ def _hit_usage_limit(output: str) -> bool:
     low = output.lower()
     return any(m in low for m in _LIMIT_MARKERS)
 
-# Cross-process serialization of the single research microvm. Each Claude
-# session spawns its OWN research-agent-mcp process, so two agents issuing
-# research() concurrently dial the one 3 GB microvm at once and OOM it —
-# the second agent's ssh drops as rc=255 (observed 2026-07-28 22:40: two
-# overlapping deep calls, second failed). An in-process lock can't help
-# (separate processes); an flock on a shared file does. Only the
-# VM-dialing (normal/deep) path takes it — the fast/direct-Exa path never
-# touches the VM and stays fully concurrent. Bounded wait so a caller
-# queued behind a long deep run eventually gets a clean "busy" error
-# instead of hanging forever.
+# Cross-process admission control for the research microvm. Each Claude
+# session spawns its OWN research-agent-mcp process, so an in-process lock
+# can't help (separate processes); flock on shared files does. Only the
+# VM-dialing (normal/deep) path takes a slot — the fast/direct-Exa path
+# never touches the VM and stays fully concurrent. Bounded wait so a
+# caller queued behind a long deep run eventually gets a clean "busy"
+# error instead of hanging forever.
+#
+# This was an exclusive lock (strictly one agent at a time), written when
+# two overlapping deep calls failed on 2026-07-28 against a 3 GB guest
+# with a watchdog that restarted any VM whose sshd probe was slow — the
+# second call died rc=255. Both causes are gone: `mem` is 6144 and the
+# watchdog reads a liveness heartbeat before restarting. Re-measured
+# 2026-07-31 with two genuinely concurrent calls (host-cgroup
+# MemoryCurrent, which counts every page the guest has ever touched and
+# so cannot under-report):
+#
+#     normal x2   1.55 GB peak    agent wall  47s / 145s
+#     deep   x2   1.57 GB peak    agent wall 371s / 430s
+#     browse x2   1.80 GB peak    agent wall 113s / 136s
+#
+# against 6.00 GB allocated, 0 guest OOM kills, CPU peak 0.68 of 2 vCPU
+# (the work is network-bound, not compute-bound). Depth barely moves
+# memory — deep costs wall time, not RAM — so slots are flat rather than
+# depth-weighted. Browse is the heaviest path because render_shim returns
+# screenshots as inline base64 that stay in the agent's context (~20 MB
+# per screenshot); even a 20-screenshot session extrapolates to ~+0.4 GB.
+#
+# Default 3: at the measured ~0.9 GB per concurrent call that leaves the
+# guest roughly half empty. The binding constraint above 3 is external,
+# not local — Tavily's REST limit is 100 RPM on Development plans (1,000
+# on Production) with /research at 20 RPM, so several bursty agents can
+# reach the API ceiling while the VM is still idle. Raise past 3 only
+# after confirming which Tavily plan this key is on.
 _VM_LOCK_PATH = Path(
     os.environ.get("RESEARCH_LOCK_FILE")
     or (Path.home() / ".cache" / "research-agent" / "agent.lock")
 )
 _VM_LOCK_WAIT_SECS = int(os.environ.get("RESEARCH_LOCK_WAIT_SECS", "1800"))
+
+
+_VM_SLOTS_DEFAULT = 3
+
+
+def _read_slots(raw: str | None) -> int:
+    """Parse RESEARCH_SLOTS, clamping to at least 1.
+
+    A malformed or non-positive value must not disable admission control
+    altogether (0 slots = every call busy) nor crash the server at import
+    time, so anything unparseable falls back to the default.
+    """
+    try:
+        return max(1, int(raw)) if raw else _VM_SLOTS_DEFAULT
+    except ValueError:
+        return _VM_SLOTS_DEFAULT
+
+
+_VM_SLOTS = _read_slots(os.environ.get("RESEARCH_SLOTS"))
 
 
 class _VMBusy(Exception):
@@ -400,43 +452,57 @@ class _VMBusy(Exception):
 
 @contextlib.contextmanager
 def _vm_lock(wait_secs: int):
-    """Hold an exclusive cross-process lock on the research microvm.
+    """Hold one of `_VM_SLOTS` cross-process slots on the research microvm.
 
-    Serializes research() calls across all MCP processes so the single
-    microvm runs at most one agent at a time. Blocks (polling a
-    non-blocking flock) until the lock is free or `wait_secs` elapses;
-    on timeout raises `_VMBusy` so the caller returns a clean busy error.
-    The lock is always released and the fd closed on exit — a crash inside
-    the `with` body still frees it because flock is tied to the open fd
-    (kernel drops it when the process dies).
+    Admission control across all MCP processes: at most `_VM_SLOTS` agents
+    dial the guest at once. Each slot is its own lock file
+    (`<_VM_LOCK_PATH>.<i>`); acquiring means winning a non-blocking flock
+    on any one of them. Polls the whole set until a slot frees or
+    `wait_secs` elapses; on timeout raises `_VMBusy` so the caller returns
+    a clean busy error. The slot is always released and every fd closed on
+    exit — a crash inside the `with` body still frees it because flock is
+    tied to the open fd (kernel drops it when the process dies).
+
+    Slot count is read per-call from the module global so tests (and an
+    operator exporting RESEARCH_SLOTS) can change it without reimport. If
+    two processes disagree on the count, each simply contends over the
+    slots it knows about; the lower count is the effective cap on the
+    range they share.
     """
     _VM_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(_VM_LOCK_PATH, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    fds = [
+        os.open(f"{_VM_LOCK_PATH}.{i}", os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        for i in range(_VM_SLOTS)
+    ]
     deadline = time.monotonic() + wait_secs
     delay = 0.5
-    acquired = False
+    held: int | None = None
     try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
+        while held is None:
+            for fd in fds:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held = fd
+                    break
+                except OSError as e:
+                    if e.errno not in (errno.EACCES, errno.EAGAIN):
+                        raise
+            if held is not None:
                 break
-            except OSError as e:
-                if e.errno not in (errno.EACCES, errno.EAGAIN):
-                    raise
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise _VMBusy() from None
-                time.sleep(min(delay, remaining))
-                delay = min(delay * 1.5, 5.0)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _VMBusy() from None
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 1.5, 5.0)
         yield
     finally:
-        if acquired:
+        if held is not None:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                fcntl.flock(held, fcntl.LOCK_UN)
             except OSError:
                 pass
-        os.close(fd)
+        for fd in fds:
+            os.close(fd)
 
 
 # Liveness heartbeat the host watchdog reads to tell "busy" from "dead".
@@ -806,6 +872,18 @@ def _dial_agent(
         # Pre-validated by the tool layer (MODEL_ID_RE); run-agent.sh
         # re-checks guest-side before the value reaches claude's argv.
         env_assignments.append(f"RESEARCH_MODEL={shlex.quote(model)}")
+    # Forward the per-call memory cap only when an operator has explicitly
+    # set it; otherwise the guest applies memguard.sh's default. A value
+    # that fails MEM_MAX_RE is dropped with a warning rather than passed
+    # on, so a typo degrades to the safe default instead of failing every
+    # call at the guest-side gate.
+    mem_max = os.environ.get("RESEARCH_MEM_MAX", "").strip()
+    if mem_max and MEM_MAX_RE.fullmatch(mem_max):
+        env_assignments.append(f"RESEARCH_MEM_MAX={shlex.quote(mem_max)}")
+    elif mem_max:
+        _LOG.warning(
+            "ignoring invalid RESEARCH_MEM_MAX=%r — using guest default", mem_max
+        )
     remote_cmd = " ".join(
         [
             *env_assignments,
