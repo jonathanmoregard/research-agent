@@ -8,6 +8,9 @@ Covered:
                                 not leak to caller.
   2. Agent failure (exit!=0) — _output tail must not leak; full output
                                 lands in reports/_quarantine/agent_failures.jsonl.
+  2b. Provider usage-policy  — refusal gets its own fixed error string, still
+      refusal                   with zero captures; markers stay narrow enough
+                                not to fire on ordinary security research.
   3. Agent invocation raise  — exception message must not leak.
   4. Fast-mode Exa HTTP err  — response body bytes must not leak.
   5. Fast-mode Exa generic   — exception stringification must not leak.
@@ -113,7 +116,13 @@ def case_agent_failure_no_leak(tmp: Path) -> list[str]:
     """Non-zero agent exit: output tail must not reach caller."""
     srv.REPORTS_DIR = tmp
 
-    def fake_run_agent(prompt, report_id, depth):
+    # Signature must match `_run_agent(prompt, report_id, depth, model)` —
+    # the server passes `model or None` as a 4th positional arg. A stub
+    # missing it raises TypeError, which the caller's broad `except
+    # Exception` swallows into "agent invocation failed", so this case
+    # silently stopped exercising the agent-failure path when the `model`
+    # param landed in d496c24.
+    def fake_run_agent(prompt, report_id, depth, model=None):
         return 1, f"Traceback ... {CANARY_AGENT_OUTPUT} ... done"
 
     o1 = _with(srv, "_run_agent", fake_run_agent)
@@ -142,11 +151,90 @@ def case_agent_failure_no_leak(tmp: Path) -> list[str]:
     return failures
 
 
+def case_agent_refusal_no_leak(tmp: Path) -> list[str]:
+    """Provider usage-policy refusal: distinct error, still zero captures.
+
+    The refusal path returns a *different* fixed string than the generic
+    "agent failed", so the caller can tell "rephrase" from "retry". The
+    invariant under test is that the distinction costs nothing in leakage:
+    the returned error must be the module constant verbatim, with no byte
+    of the agent's stdout (here, the API's real refusal text plus a canary)
+    interpolated into it.
+    """
+    srv.REPORTS_DIR = tmp
+
+    # Verbatim shape of a real API-classifier refusal (see the agent-failure
+    # log), with a canary spliced in where an injected payload would ride.
+    refusal_output = (
+        "API Error: Claude Code is unable to respond to this request, which "
+        "appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). "
+        "This request triggered restrictions on violative cyber content and was "
+        f"blocked under Anthropic's Usage Policy. {CANARY_AGENT_OUTPUT} "
+        "If you are seeing this refusal repeatedly, try running /model "
+        "claude-sonnet-4-20250514 to switch models.\n"
+    )
+
+    def fake_run_agent(prompt, report_id, depth, model=None):
+        return 1, refusal_output
+
+    o1 = _with(srv, "_run_agent", fake_run_agent)
+    try:
+        result = srv.research(prompt="x", depth="normal")
+    finally:
+        srv._run_agent = o1
+
+    failures: list[str] = []
+    blob = json.dumps(result)
+    if CANARY_AGENT_OUTPUT in blob:
+        failures.append(f"refusal leaked output canary: {blob}")
+    # The API's own text suggests a model swap; that suggestion must not be
+    # relayed to the caller verbatim, or the "no captures" rule is moot.
+    for fragment in ("claude-sonnet-4-20250514", "anthropic.com/legal/aup", "/model"):
+        if fragment in blob:
+            failures.append(f"refusal leaked agent-output fragment {fragment!r}: {blob}")
+    if result.get("error") != srv._REFUSAL_ERROR:
+        failures.append(
+            f"expected the fixed _REFUSAL_ERROR constant, got {result.get('error')!r}"
+        )
+    if result.get("error") == "agent failed":
+        failures.append("refusal was not distinguished from a generic failure")
+    return failures
+
+
+def case_agent_refusal_markers_narrow(tmp: Path) -> list[str]:
+    """Refusal markers must not fire on ordinary security-research output.
+
+    The agent's whole job is researching topics whose reports quote words
+    like "blocked", "policy", and "refused". Over-matching would relabel a
+    genuine crash as a policy block and send the caller chasing the wrong
+    fix, so this pins the markers narrow.
+    """
+    benign = [
+        "the vendor blocked the request per their security policy",
+        "Error: connection refused by upstream proxy",
+        "report covers the AUP and acceptable-use policy landscape",
+        "Traceback (most recent call last): RuntimeError: boom",
+        "You've hit your org's monthly usage limit",  # limit path, not refusal
+    ]
+    failures: list[str] = []
+    for text in benign:
+        if srv._hit_refusal(text):
+            failures.append(f"_REFUSAL_MARKERS over-matched benign output: {text!r}")
+    # ...and must still fire on the real thing, case-insensitively.
+    if not srv._hit_refusal("...appears to violate our USAGE POLICY..."):
+        failures.append("_hit_refusal missed a real usage-policy refusal")
+    if not srv._hit_refusal("restrictions on violative cyber content"):
+        failures.append("_hit_refusal missed the 'violative' marker")
+    return failures
+
+
 def case_agent_exception_no_leak(tmp: Path) -> list[str]:
     """_run_agent raises: exception str must not reach caller."""
     srv.REPORTS_DIR = tmp
 
-    def fake_run_agent(prompt, report_id, depth):
+    # 4-arg signature for the same reason as above — without it this case
+    # passed on a TypeError rather than the RuntimeError it means to test.
+    def fake_run_agent(prompt, report_id, depth, model=None):
         raise RuntimeError(CANARY_AGENT_EXC)
 
     o1 = _with(srv, "_run_agent", fake_run_agent)
@@ -405,6 +493,8 @@ def main() -> int:
     cases = [
         ("scanner_reject_no_leak", case_scanner_reject_no_leak),
         ("agent_failure_no_leak", case_agent_failure_no_leak),
+        ("agent_refusal_no_leak", case_agent_refusal_no_leak),
+        ("agent_refusal_markers_narrow", case_agent_refusal_markers_narrow),
         ("agent_exception_no_leak", case_agent_exception_no_leak),
         ("exa_http_error_no_leak", case_exa_http_error_no_leak),
         ("exa_generic_exception_no_leak", case_exa_generic_exception_no_leak),

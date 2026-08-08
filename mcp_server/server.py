@@ -480,6 +480,57 @@ def _hit_usage_limit(output: str) -> bool:
     low = output.lower()
     return any(m in low for m in _LIMIT_MARKERS)
 
+
+# stdout substrings that identify a provider-side Usage Policy refusal —
+# Anthropic's API classifier declining the request BEFORE the agent runs
+# any search. Same discipline as _LIMIT_MARKERS above: kept deliberately
+# narrow, because over-matching mislabels an unrelated failure as a policy
+# block and sends the caller chasing the wrong fix. Verified 2026-08-08
+# against the agent-failure log, which records the API's verbatim text:
+#   "API Error: Claude Code is unable to respond to this request, which
+#    appears to violate our Usage Policy (...). This request triggered
+#    restrictions on violative cyber content and was blocked under
+#    Anthropic's Usage Policy."
+# Deliberately NOT included: "refus", "blocked", "policy", "aup" — all of
+# those appear in ordinary research output about security topics, which is
+# exactly the corpus this agent handles.
+_REFUSAL_MARKERS = ("usage policy", "violative")
+
+# Fixed, closed-set response for the refusal case.
+#
+# NO-LEAK INVARIANT: this is a module constant, selected by a boolean
+# marker match. Never interpolate any part of the agent's stdout/stderr
+# into it, and never widen it into an f-string — agent output is
+# attacker-influenceable (a prompt-inject can shape the crash text), which
+# is why server.py:~1510 suppresses it wholesale. The marker match returns
+# one bit; the bit picks one of two constants. Same pattern as the
+# closed-set classifier in scripts/diagnose-last-failure.sh.
+#
+# NO AUTO-RETRY: unlike the usage-limit path below, a policy refusal does
+# NOT trigger a model swap. The API's own message suggests one, but
+# auto-routing around a provider policy decision is the caller's call to
+# make, not the server's. Surface it; let the caller decide.
+_REFUSAL_ERROR = (
+    "agent refused: provider usage-policy block (cyber content); "
+    "rephrase defensively or pass an explicit model"
+)
+
+
+def _hit_refusal(output: str) -> bool:
+    """True iff agent output signals a provider Usage Policy refusal.
+
+    Contains-match against `_REFUSAL_MARKERS`, case-insensitive. The claude
+    CLI writes the API refusal to stdout and exits non-zero, so callers
+    pass the same combined stdout+stderr they hand `_hit_usage_limit`.
+
+    Returns a bool and nothing else: the caller maps it to a fixed string,
+    so no byte of `output` can reach the tool response.
+    """
+    if not output:
+        return False
+    low = output.lower()
+    return any(m in low for m in _REFUSAL_MARKERS)
+
 # Cross-process admission control for the research microvm. Each Claude
 # session spawns its OWN research-agent-mcp process, so an in-process lock
 # can't help (separate processes); flock on shared files does. Only the
@@ -1392,7 +1443,7 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             whether deep-research synthesis tools are enabled.
         model: Optional Claude model id override for the in-jail agent
             (e.g. 'claude-fable-5', 'claude-sonnet-5'). Empty string uses
-            the default pinned in run-agent.sh (currently claude-fable-5).
+            the default pinned in run-agent.sh (currently claude-opus-5).
             Not valid with depth='fast' — the fast path is a direct Exa
             call with no agent, so no model runs at all.
 
@@ -1417,7 +1468,7 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
     if model and not MODEL_ID_RE.fullmatch(model):
         return {
             "status": "error",
-            "error": "invalid model; expected a model id like 'claude-fable-5'",
+            "error": "invalid model; expected a model id like 'claude-opus-5'",
         }
     if model and depth == "fast":
         return {
@@ -1511,16 +1562,26 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             # can shape the output to echo payloads on crash. Don't return
             # ANY of it to the caller; log the full tail to the quarantine
             # zone so an operator can diagnose from a bare terminal.
+            #
+            # One bit of classification survives the suppression: whether
+            # the provider's Usage Policy classifier refused the request
+            # before the agent ran. That distinction is otherwise invisible
+            # to the caller ("agent failed" after ~60s looks like a crash),
+            # and it is the difference between "retry" and "rephrase". The
+            # bit selects between two module constants — see _REFUSAL_ERROR
+            # for the no-leak / no-auto-retry invariants.
+            refused = _hit_refusal(_output)
             _LOG.warning(
-                "research agent-fail id=%s rc=%d agent_ms=%d (see agent_failures.jsonl in quarantine for output)",
-                report_id, _code, agent_ms,
+                "research agent-fail id=%s rc=%d agent_ms=%d refused=%s "
+                "(see agent_failures.jsonl in quarantine for output)",
+                report_id, _code, agent_ms, refused,
             )
             _log_agent_failure(report_id, _code, _output)
             report_path.unlink(missing_ok=True)
             total_ms = int((time.monotonic() - t_received) * 1000)
             return {
                 "status": "error",
-                "error": "agent failed",
+                "error": _REFUSAL_ERROR if refused else "agent failed",
                 "report_id": report_id,
                 "timings_ms": {"agent": agent_ms, "scan": 0, "total": total_ms},
             }
