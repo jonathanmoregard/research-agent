@@ -882,33 +882,40 @@ def _direct_exa(prompt: str) -> tuple[bool, str]:
     return True, "\n".join(lines)
 
 
+# Only name parameters the guest shims actually declare, or the agent burns
+# turns on calls the schema rejects. `web_search_exa` accepts `query` and
+# `numResults` ONLY (agent/shims/exa_shim.py:26-34) and hardcodes
+# `type: "auto"` server-side (:95) — there is no `type` or `livecrawl` knob to
+# set, and no `type='deep'` mode. The tavily shim implements `tavily_search`
+# and `tavily_extract` ONLY (agent/shims/tavily_shim.py:74,98); there is no
+# `tavily_research` or `tavily_crawl`.
 DEPTH_GUIDANCE: dict[Depth, str] = {
     "fast": (
         "Research depth: FAST. Call `mcp__exa__web_search_exa` once with "
-        "`type='auto'`, `numResults=3`, `livecrawl='never'`. Do not fetch "
-        "individual URLs. Produce a short report (<15 lines) from snippets."
+        "`numResults=3`. Do not fetch individual URLs. Produce a short "
+        "report (<15 lines) from snippets."
     ),
     "normal": (
         "Research depth: NORMAL. Decompose the prompt into 2-3 "
         "single-search-answerable sub-questions. Up to 3 "
         "`mcp__exa__web_search_exa` calls (one per sub-question) with "
-        "`type='auto'`, `numResults=8`, `livecrawl='fallback'`. Fetch "
-        "the top 2 most relevant URLs via `mcp__exa__web_fetch_exa` for "
-        "fuller context — load-bearing claims need a fetched source, "
-        "not a snippet. Cross-reference. Stop as soon as every "
-        "sub-question is answered or confirmed unanswerable."
+        "`numResults=8`. Fetch the top 2 most relevant URLs via "
+        "`mcp__exa__web_fetch_exa` for fuller context — load-bearing "
+        "claims need a fetched source, not a snippet. Cross-reference. "
+        "Stop as soon as every sub-question is answered or confirmed "
+        "unanswerable."
     ),
     "deep": (
         "Research depth: DEEP. Decompose into sub-questions and call "
-        "`mcp__exa__web_search_exa` with `type='deep'` (Exa's built-in "
-        "deep-research mode), `numResults=15`, `livecrawl='always'` for "
-        "freshness. Fan out to 2-3 sub-questions. Fetch the top 5 URLs "
-        "via `mcp__exa__web_fetch_exa`. After each round, reflect on "
-        "remaining gaps and conflicts; search only the gaps. If "
-        "available, also use `mcp__tavily-remote-mcp__tavily_research` "
-        "to run a cross-provider synthesis over one sub-question. Aim "
-        "for broad coverage and explicit cross-referencing. Stop when "
-        "gaps are closed or the call budget is spent."
+        "`mcp__exa__web_search_exa` with `numResults=15`. Fan out to 2-3 "
+        "sub-questions. Fetch the top 5 URLs via "
+        "`mcp__exa__web_fetch_exa`. Cross-check the load-bearing claims "
+        "against a second provider with "
+        "`mcp__tavily-remote-mcp__tavily_search` and "
+        "`mcp__tavily-remote-mcp__tavily_extract`. After each round, "
+        "reflect on remaining gaps and conflicts; search only the gaps. "
+        "Aim for broad coverage and explicit cross-referencing. Stop "
+        "when gaps are closed or the call budget is spent."
     ),
 }
 
@@ -1439,8 +1446,10 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
     Args:
         prompt: The research question or instructions for the agent.
         depth: 'fast' | 'normal' | 'deep'. Controls how many queries the
-            agent runs, numResults per query, livecrawl aggressiveness, and
-            whether deep-research synthesis tools are enabled.
+            agent runs, numResults per query, how many URLs it fetches, and
+            whether it cross-checks against a second provider (Tavily) and
+            iterates on remaining gaps. Wall time: fast ~2-5s, normal
+            ~1.5-3min, deep ~10-15min.
         model: Optional Claude model id override for the in-jail agent
             (e.g. 'claude-fable-5', 'claude-sonnet-5'). Empty string uses
             the default pinned in run-agent.sh (currently claude-opus-5).

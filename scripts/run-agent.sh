@@ -48,8 +48,9 @@ fi
 # Per-depth tool allowlist. The prompt tells the agent *how* to use these;
 # we restrict *which* are callable at all.
 EXA_TOOLS="mcp__exa__web_search_exa,mcp__exa__web_fetch_exa"
+# tavily_shim.py implements tavily_search + tavily_extract and nothing else,
+# so there is no deep-only Tavily tier to allowlist.
 TAVILY_SEARCH="mcp__tavily-remote-mcp__tavily_search,mcp__tavily-remote-mcp__tavily_extract"
-TAVILY_DEEP="mcp__tavily-remote-mcp__tavily_research,mcp__tavily-remote-mcp__tavily_crawl"
 # JS-render fallback. Crosses VMs (research-agent -> scraper microvm via
 # HTTP on 10.0.2.2:8123) and is an order of magnitude slower than an
 # extract API; the agent's CLAUDE.md gates calls to the thin-extract case.
@@ -93,7 +94,7 @@ case "${DEPTH}" in
     MODEL="${DEFAULT_MODEL}"
     ;;
   deep)
-    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${TAVILY_DEEP},${RENDER_TOOLS},${BROWSE_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},${PRV_TOOLS},Write"
+    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},${BROWSE_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},${PRV_TOOLS},Write"
     MODEL="${DEFAULT_MODEL}"
     ;;
   *)
