@@ -25,6 +25,8 @@ from pathlib import Path
 
 from injection_scanner.intercept import scan as intercept_scan
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 
 def resolve_path(ref: str) -> Path:
     """Accept either a full path or a bare UUID (looks in reports/_quarantine)."""
@@ -32,8 +34,10 @@ def resolve_path(ref: str) -> Path:
     if p.exists():
         return p
     quarantine = REPO_ROOT / "reports" / "_quarantine"
-    # Bare uuid or uuid.md
-    stem = ref.rstrip(".md")
+    # Bare uuid or uuid.md. removesuffix, not rstrip: rstrip strips a CHARACTER
+    # SET, so an id ending in 'd', 'm' or '.' would be silently mangled
+    # (e.g. "…3ddd".rstrip(".md") -> "…3").
+    stem = ref.removesuffix(".md")
     for candidate in (quarantine / f"{stem}.md", quarantine / ref):
         if candidate.exists():
             return candidate
