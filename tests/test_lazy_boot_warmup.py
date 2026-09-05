@@ -45,6 +45,19 @@ def _pre_warmup():
     server._SCANNER_HEALTH.update(ok=False, reason="warming up", last_check=0.0)
 
 
+def _stale_last_check() -> float:
+    """A monotonic timestamp old enough that any admissible recheck interval
+    has already elapsed.
+
+    Not 0.0: `time.monotonic()` is CLOCK_MONOTONIC, which on Linux counts
+    from boot. On a fresh CI microVM or container 0.0 is roughly *now*, so
+    the throttle is not bypassed, the probe never runs, and the case fails
+    for a reason that has nothing to do with the code under test. Same
+    helper as tests/test_scanner_health_gate.py.
+    """
+    return time.monotonic() - 86_400.0
+
+
 # --- (a) fail-closed from t=0 ------------------------------------------------
 
 
@@ -214,7 +227,9 @@ def test_two_concurrent_gate_rechecks_smoke_once(monkeypatch):
     """Two research() calls arriving together past the recheck throttle must
     not each pay for a smoke, nor interleave writes to _SCANNER_HEALTH."""
     server._SCANNER_WARMUP_DONE.set()
-    server._SCANNER_HEALTH.update(ok=False, reason="degraded", last_check=0.0)
+    server._SCANNER_HEALTH.update(
+        ok=False, reason="degraded", last_check=_stale_last_check()
+    )
     probe = _OverlapProbe()
     monkeypatch.setattr(server, "_run_boot_smoke_once", probe)
 

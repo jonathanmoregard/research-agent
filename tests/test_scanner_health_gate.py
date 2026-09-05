@@ -3,6 +3,10 @@ of killing it, research() refuses fail-closed while degraded, and the
 gate auto-heals on recovery without a reconnect."""
 from __future__ import annotations
 
+import time
+
+import pytest
+
 import mcp_server.server as server
 
 
@@ -13,6 +17,39 @@ def _reset_health():
     # _SCANNER_WARMUP_WAIT_SECS waiting for a warmup that never runs here.
     # Warmup-window behaviour is covered by tests/test_lazy_boot_warmup.py.
     server._SCANNER_WARMUP_DONE.set()
+
+
+@pytest.fixture(autouse=True)
+def _restore_module_state():
+    """Leave the module settled, healthy and warmup-finished so no case here
+    can contaminate a later test that calls research() without its own reset.
+
+    `test_gate_throttles_recheck` in particular used to exit leaving
+    _SCANNER_HEALTH degraded with a fresh last_check, which refuses every
+    later research() that does not reset for itself — order-dependent
+    contamination that only shows up when the suite is resharded.
+
+    Same fixture as tests/test_lazy_boot_warmup.py — these two files are the
+    only ones that mutate the live scanner-health globals, and they must
+    restore identically or the order they happen to run in becomes load
+    bearing.
+    """
+    yield
+    server._SCANNER_HEALTH.update(ok=True, reason="", last_check=0.0)
+    server._SCANNER_WARMUP_DONE.set()
+
+
+def _stale_last_check() -> float:
+    """A monotonic timestamp old enough that any admissible recheck interval
+    has already elapsed.
+
+    Not 0.0: `time.monotonic()` is CLOCK_MONOTONIC, which on Linux counts
+    from boot. On a fresh CI microVM or container 0.0 is roughly *now*, so
+    `now - 0.0 >= _SCANNER_RECHECK_SECS` is False and the throttle is not
+    bypassed at all — the probe never runs and the test fails for a reason
+    that has nothing to do with the gate.
+    """
+    return time.monotonic() - 86_400.0
 
 
 def test_boot_smoke_failure_is_non_fatal(monkeypatch):
@@ -41,7 +78,9 @@ def test_research_refused_while_degraded_without_running_agent(monkeypatch):
 def test_gate_auto_heals_after_recheck(monkeypatch):
     _reset_health()
     # Degraded, last check long ago so a re-check is due.
-    server._SCANNER_HEALTH.update(ok=False, reason="honeypot_unavailable:x", last_check=0.0)
+    server._SCANNER_HEALTH.update(
+        ok=False, reason="honeypot_unavailable:x", last_check=_stale_last_check()
+    )
     monkeypatch.setattr(server, "_run_boot_smoke_once", lambda: (True, ""))
     ok, reason = server._scanner_health_gate()
     assert ok is True
