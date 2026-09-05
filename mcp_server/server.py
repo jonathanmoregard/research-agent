@@ -1468,6 +1468,14 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             When `error` is "scanner rejected report (quarantined)",
             `report_id` is included — pass it back to `retry_research` to
             re-scan the quarantined report.
+            That reject also carries `scanner_infra_reason` when — and only
+            when — the rejection was a scanner SETUP/INFRA outage rather
+            than a detection (e.g. "lakera_unavailable:HTTPError:429",
+            "honeypot_unavailable:..."). It is a content-free diagnosis
+            code: fix the named dependency, then retry. Its absence means
+            the scanner detected something in the report itself; that
+            reason stays opaque and quarantine-only by design. The report
+            is withheld and quarantined either way.
     """
     if depth not in VALID_DEPTHS:
         return {
@@ -1625,17 +1633,108 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
     )
 
 
+# Reject-reason classification: SETUP/INFRA vs CONTENT-DERIVED.
+#
+# A failing Verdict means one of two very different things and they must
+# not share a disposition:
+#
+#   CONTENT-DERIVED — a detection. `secret_shape:*`, `encoded_secret:*`,
+#     `unicode_anomaly:*`, `lakera:prompt_attack`, honeypot triggers,
+#     `wrap_escape:*`, `oversized:*`. The reason is a function of
+#     attacker-controlled report bytes (even a rule NAME tells the caller
+#     which planted shape matched, and a length tells it how much text
+#     survived). Stays opaque and quarantine-only.
+#
+#   SETUP / INFRA — an outage. `*_unavailable:*` plus the bare `no-key` /
+#     `key-config-error` / `bad-response` setup codes. These are
+#     content-free BY CONSTRUCTION: they are our own literal codes plus
+#     Python/SDK exception *type names* and a fixed set of layer/scenario
+#     labels. injection_scanner deliberately keeps matched values out of
+#     `reason` — see the comments around intercept.py lines 100, 137 and
+#     170, written after a past leak. That invariant is what makes it safe
+#     to surface these; if it is ever broken upstream, this predicate must
+#     be revisited.
+#
+# The classification is an ALLOWLIST anchored at the head of the reason.
+# Anything not positively recognised — a novel layer, a future code, a
+# malformed string — falls through to CONTENT-DERIVED and stays opaque.
+#
+# Accepted residual channel: an attacker can in principle steer which
+# exception *type* a provider call raises, making the visible reason a
+# very low-bandwidth signal. That is a closed set of class names, it is
+# the same channel `reason` already crosses in server.log for boot-smoke
+# failures and in the scanner-degraded refusal text, and it is accepted
+# deliberately — not an oversight.
+_INFRA_REASON_HEAD_SUFFIX = "_unavailable"
+
+# Standalone setup codes. Today they only ever appear as the tail of
+# `lakera_unavailable:<code>`; listed here so a future call site emitting
+# one bare is still classified as infra rather than silently opaque.
+_INFRA_BARE_REASONS = frozenset({"no-key", "key-config-error", "bad-response"})
+
+# The single key the infra path is allowed to add to a reject response.
+_INFRA_REASON_KEY = "scanner_infra_reason"
+
+
+def _is_infra_reason(reason) -> bool:
+    """True iff `reason` is a positively-recognised setup/infra outage code.
+
+    Default is False: an unrecognised or malformed reason is treated as
+    content-derived and stays opaque. Matching is anchored at the head
+    segment, never a substring search — `secret_shape:thing_unavailable`
+    and `lakera_arbitration:judge_unavailable:...` are detections (the
+    latter only runs *after* Lakera flagged the text, so surfacing it
+    would leak that the report was flagged).
+    """
+    if not isinstance(reason, str) or not reason:
+        return False
+    segments = reason.split(":")
+    if segments[0].endswith(_INFRA_REASON_HEAD_SUFFIX):
+        return True
+    # intercept.py re-wraps the honeypot's own result reason, so an outage
+    # arrives double-prefixed as `honeypot:honeypot_unavailable:...` while
+    # a real trigger arrives as `honeypot:honeypot:<scenario>:<signal>`.
+    if (
+        segments[0] == "honeypot"
+        and len(segments) > 1
+        and segments[1].endswith(_INFRA_REASON_HEAD_SUFFIX)
+    ):
+        return True
+    return reason in _INFRA_BARE_REASONS
+
+
 def _reject_response(
-    report_id: str, agent_ms: int, t_received: float, t_scan_start: float
+    report_id: str,
+    agent_ms: int,
+    t_received: float,
+    t_scan_start: float,
+    reason: str | None = None,
 ) -> dict:
-    """Generic reject return. No reason, no snippet, no layer info.
+    """Generic reject return. No snippet, no layer info, no report bytes.
 
     Scan timing is bucketized to prevent side-channel fingerprinting of
     which scanner layer rejected.
+
+    `reason` is the raw Verdict reason. It is classified here and only
+    surfaced when `_is_infra_reason` says it is a setup/infra outage — an
+    operator's agent needs to see "Lakera is down" without a quarantine
+    dive. A detection reason is dropped on the floor and the payload is
+    byte-identical to the no-reason case.
+
+    Fail-closed is UNCHANGED either way: the caller never gets the report,
+    and the content is quarantined by `_scan_and_deliver` regardless. Only
+    the diagnosis becomes visible.
+
+    The payload is built by naming safe fields explicitly. Never populate
+    it by filtering a Verdict / layers dict — `api_error_detail`,
+    `honeypot_api_errors`, `raw_excerpt` and `sanitized_text` carry
+    provider error bodies that can echo request fragments (they are
+    audit-only for that reason), and a field added upstream tomorrow must
+    default to invisible.
     """
     t_done = time.monotonic()
     raw_scan_ms = int((t_done - t_scan_start) * 1000)
-    return {
+    out = {
         "status": "error",
         "error": "scanner rejected report (quarantined)",
         "report_id": report_id,
@@ -1645,6 +1744,16 @@ def _reject_response(
             "total": int((t_done - t_received) * 1000),
         },
     }
+    if _is_infra_reason(reason):
+        # Mirrors how the boot smoke logs its failures, so both the outage
+        # and its history are triageable from server.log.
+        _LOG.error(
+            "research infra-reject id=%s reason=%s — report quarantined "
+            "fail-closed; fix the scanner dependency and retry",
+            report_id, reason,
+        )
+        out[_INFRA_REASON_KEY] = reason
+    return out
 
 
 def _scan_error_verdict(exc: BaseException):
@@ -1726,7 +1835,9 @@ def _scan_and_deliver(
                 f"research-agent: quarantine mkdir failed for {report_id}: {e}",
                 file=sys.stderr,
             )
-            return _reject_response(report_id, agent_ms, t_received, t_scan_start)
+            return _reject_response(
+                report_id, agent_ms, t_received, t_scan_start, verdict.reason
+            )
         # Oversized rejects: skip the quarantine-file write and keep the
         # audit-row text field to a fixed ceiling so repeated oversized
         # rejects can't fill the disk.
@@ -1749,7 +1860,9 @@ def _scan_and_deliver(
         _write_quarantine_audit(report_id, prompt, verdict, audit_content)
         from mcp_server.artifact_gate import discard_artifacts
         discard_artifacts(report_id)
-        return _reject_response(report_id, agent_ms, t_received, t_scan_start)
+        return _reject_response(
+            report_id, agent_ms, t_received, t_scan_start, verdict.reason
+        )
 
     dst = REPORTS_DIR / f"{report_id}.md"
     dst.unlink(missing_ok=True)
