@@ -46,6 +46,7 @@ import tempfile
 import threading
 import time
 import uuid
+from enum import Enum
 from pathlib import Path
 from typing import Literal
 
@@ -1468,14 +1469,19 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             When `error` is "scanner rejected report (quarantined)",
             `report_id` is included — pass it back to `retry_research` to
             re-scan the quarantined report.
-            That reject also carries `scanner_infra_reason` when — and only
-            when — the rejection was a scanner SETUP/INFRA outage rather
-            than a detection (e.g. "lakera_unavailable:HTTPError:429",
-            "honeypot_unavailable:..."). It is a content-free diagnosis
-            code: fix the named dependency, then retry. Its absence means
-            the scanner detected something in the report itself; that
-            reason stays opaque and quarantine-only by design. The report
-            is withheld and quarantined either way.
+            That reject also carries `scanner_infra` when — and only when —
+            the rejection was a scanner SETUP/INFRA outage rather than a
+            detection: {"layer": "lakera"|"honeypot"|"judge"|
+            "unicode_sanitize"|"secret_shapes"|"decode"|"other",
+            "condition": "unavailable"|"no_key"|"key_config_error"|
+            "bad_response"|"lib_missing"|"other", "exc_type"?: str,
+            "http_status"?: int}. Every value is drawn from a closed
+            vocabulary — it is a diagnosis, never text from the report or
+            the provider. Fix the named dependency, then retry. The
+            absence of `scanner_infra` means the scanner detected
+            something in the report itself; that reason stays opaque and
+            quarantine-only by design. The report is withheld and
+            quarantined either way.
     """
     if depth not in VALID_DEPTHS:
         return {
@@ -1659,13 +1665,35 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
 # Anything not positively recognised — a novel layer, a future code, a
 # malformed string — falls through to CONTENT-DERIVED and stays opaque.
 #
+# "This report was blocked" is NOT the secret; the report's CONTENT is.
+# So an outage stays an outage even when the layer it happened in only
+# runs on already-suspicious text: `lakera_arbitration:judge_unavailable:*`
+# fires only after Lakera flagged the report, and it is still INFRA,
+# because the operator needs to know the judge panel is down. What stays
+# CONTENT-DERIVED is anything whose reason encodes attacker-controlled
+# bytes or names which rule/shape matched.
+#
 # Accepted residual channel: an attacker can in principle steer which
-# exception *type* a provider call raises, making the visible reason a
-# very low-bandwidth signal. That is a closed set of class names, it is
-# the same channel `reason` already crosses in server.log for boot-smoke
+# exception *type* a provider call raises, making the visible field a very
+# low-bandwidth signal. That is a closed set of class names, it is the
+# same channel `reason` already crosses in server.log for boot-smoke
 # failures and in the scanner-degraded refusal text, and it is accepted
 # deliberately — not an oversight.
+#
+# NOTHING that crosses this boundary is free text. The raw reason is
+# parsed into the closed vocabularies below and only enum members / a
+# range-checked int are emitted; see `_infra_diagnosis`. The full raw
+# reason still reaches the isolation-zone audit record for a human,
+# unchanged.
 _INFRA_REASON_HEAD_SUFFIX = "_unavailable"
+
+# Reason prefixes that WRAP another layer's reason. intercept.py re-emits
+# the honeypot's own result reason under `honeypot:`, and the L4 judge's
+# under `lakera_arbitration:`, so a genuine outage arrives one segment
+# deeper than it was raised. Kept as an explicit set rather than "look at
+# segment 1 too", so `secret_shape:thing_unavailable` — a rule NAME that
+# merely ends in the suffix — cannot be mistaken for an outage.
+_INFRA_WRAPPER_PREFIXES = frozenset({"honeypot", "lakera_arbitration"})
 
 # Standalone setup codes. Today they only ever appear as the tail of
 # `lakera_unavailable:<code>`; listed here so a future call site emitting
@@ -1673,7 +1701,105 @@ _INFRA_REASON_HEAD_SUFFIX = "_unavailable"
 _INFRA_BARE_REASONS = frozenset({"no-key", "key-config-error", "bad-response"})
 
 # The single key the infra path is allowed to add to a reject response.
-_INFRA_REASON_KEY = "scanner_infra_reason"
+_INFRA_KEY = "scanner_infra"
+
+
+class _InfraLayer(Enum):
+    """Which scanner layer went down. Closed set; parse falls back to OTHER."""
+    UNICODE_SANITIZE = "unicode_sanitize"
+    SECRET_SHAPES = "secret_shapes"
+    DECODE = "decode"
+    LAKERA = "lakera"
+    HONEYPOT = "honeypot"
+    JUDGE = "judge"
+    OTHER = "other"
+
+
+class _InfraCondition(Enum):
+    """What kind of outage it was. Closed set; parse falls back to OTHER."""
+    UNAVAILABLE = "unavailable"      # reachable-but-failing / generic outage
+    NO_KEY = "no_key"                # credential absent
+    KEY_CONFIG_ERROR = "key_config_error"  # credential present but unloadable
+    BAD_RESPONSE = "bad_response"    # provider answered, shape unusable
+    LIB_MISSING = "lib_missing"      # provider SDK not installed
+    OTHER = "other"
+
+
+# Tail tokens that pin the condition more precisely than "unavailable".
+# Keys are the literal tokens injection_scanner emits (lakera reason tails
+# and honeypot scenario signals); values are enum members. A token not in
+# here never reaches the caller — it just leaves the condition at its
+# default.
+_INFRA_CONDITION_TOKENS: dict[str, "_InfraCondition"] = {
+    "no-key": _InfraCondition.NO_KEY,
+    "no-anthropic-api-key": _InfraCondition.NO_KEY,
+    "no-openai-api-key": _InfraCondition.NO_KEY,
+    "key-config-error": _InfraCondition.KEY_CONFIG_ERROR,
+    "bad-response": _InfraCondition.BAD_RESPONSE,
+    "anthropic-lib-missing": _InfraCondition.LIB_MISSING,
+    "openai-lib-missing": _InfraCondition.LIB_MISSING,
+}
+
+# Exception TYPE names we are willing to name out loud. Hardcoded: an
+# unrecognised type is reported as "other", never passed through, never
+# truncated-and-passed. Covers stdlib transport/parse errors, the import
+# and asyncio failures the layers can hit, injection_scanner's own
+# KeyConfigError, and the Anthropic/OpenAI SDK error hierarchy.
+_INFRA_EXC_TYPES = frozenset({
+    # stdlib transport
+    "HTTPError", "URLError", "ContentTooShortError", "RemoteDisconnected",
+    "IncompleteRead", "TimeoutError", "socket.timeout", "gaierror",
+    "ConnectionError", "ConnectionResetError", "ConnectionRefusedError",
+    "ConnectionAbortedError", "BrokenPipeError", "OSError",
+    "SSLError", "SSLEOFError", "SSLZeroReturnError", "SSLCertVerificationError",
+    # parse / shape
+    "JSONDecodeError", "ValueError", "TypeError", "KeyError", "IndexError",
+    "AttributeError", "UnicodeDecodeError", "UnicodeEncodeError",
+    # import / runtime / scheduling
+    "ImportError", "ModuleNotFoundError", "RuntimeError", "RecursionError",
+    "MemoryError", "AssertionError", "NotImplementedError", "StopIteration",
+    "CancelledError", "InvalidStateError", "BrokenExecutor",
+    "BrokenThreadPool", "BrokenProcessPool",
+    # injection_scanner
+    "KeyConfigError", "SmokeFailure",
+    # Anthropic / OpenAI SDK
+    "APIError", "APIConnectionError", "APITimeoutError", "APIStatusError",
+    "APIResponseValidationError", "AuthenticationError", "PermissionDeniedError",
+    "NotFoundError", "BadRequestError", "ConflictError",
+    "UnprocessableEntityError", "RateLimitError", "InternalServerError",
+    "OverloadedError", "LengthFinishReasonError",
+    "ContentFilterFinishReasonError",
+})
+
+# HTTP status range, matching injection_scanner.http_status.bounded_status
+# on the sibling `feat/http-status-in-reason` branch. A RANGE, not an
+# allowlist: real deployments emit codes no RFC defines (nginx 444/499,
+# Cloudflare 520-530) and those are exactly what an operator debugging a
+# proxy needs. Anything outside it is a bug or a rebound attribute, and is
+# dropped rather than reported.
+_INFRA_MIN_HTTP_STATUS = 100
+_INFRA_MAX_HTTP_STATUS = 599
+
+
+def _infra_segments(reason: str) -> list[str]:
+    """Split a reason into tokens, dropping the `+skipped=N/M` suffix.
+
+    honeypot appends `+skipped=<n>/<total>` to its top-line reason, which
+    would otherwise glue itself to the last token (e.g. `429+skipped=1/6`)
+    and defeat both the exception-name and the status-code match.
+    """
+    return [seg.split("+", 1)[0] for seg in reason.split(":")]
+
+
+def _looks_like_exc_token(seg: str) -> bool:
+    """Whether `seg` sits where an exception type name would.
+
+    Only ever used to choose between the two literals "other" and None —
+    the segment itself is never emitted — so this heuristic cannot leak.
+    Keeps `exc_type` absent for `lakera_unavailable:no-key` (there was no
+    exception) while still reporting "other" for an unrecognised type.
+    """
+    return bool(seg) and seg.isascii() and seg.isidentifier() and seg[:1].isupper()
 
 
 def _is_infra_reason(reason) -> bool:
@@ -1681,26 +1807,91 @@ def _is_infra_reason(reason) -> bool:
 
     Default is False: an unrecognised or malformed reason is treated as
     content-derived and stays opaque. Matching is anchored at the head
-    segment, never a substring search — `secret_shape:thing_unavailable`
-    and `lakera_arbitration:judge_unavailable:...` are detections (the
-    latter only runs *after* Lakera flagged the text, so surfacing it
-    would leak that the report was flagged).
+    segment (or at segment 1 behind a known wrapper prefix), never a
+    substring search — `secret_shape:thing_unavailable` is a rule name, not
+    an outage.
     """
     if not isinstance(reason, str) or not reason:
         return False
-    segments = reason.split(":")
+    segments = _infra_segments(reason)
     if segments[0].endswith(_INFRA_REASON_HEAD_SUFFIX):
         return True
-    # intercept.py re-wraps the honeypot's own result reason, so an outage
-    # arrives double-prefixed as `honeypot:honeypot_unavailable:...` while
-    # a real trigger arrives as `honeypot:honeypot:<scenario>:<signal>`.
     if (
-        segments[0] == "honeypot"
+        segments[0] in _INFRA_WRAPPER_PREFIXES
         and len(segments) > 1
         and segments[1].endswith(_INFRA_REASON_HEAD_SUFFIX)
     ):
         return True
     return reason in _INFRA_BARE_REASONS
+
+
+def _infra_diagnosis(reason: str) -> dict:
+    """Cast an infra reason into a closed vocabulary. Never returns free text.
+
+    Every string in the result is an `_InfraLayer` / `_InfraCondition`
+    member value or the literal "other"; `http_status` is a real `int`
+    inside [100, 599] or the key is absent. Nothing is passed through from
+    the input — a token that is not a recognised member maps to a
+    fallback, it is never echoed, truncated, or interpolated. That is the
+    whole point: even if a future upstream change starts putting data in
+    `reason`, there is no field here for it to ride out on.
+
+    Total by construction — every branch ends in a declared member — so a
+    malformed reason degrades to `{layer: other, condition: other}` rather
+    than raising on the reject path.
+
+    Call only on a reason `_is_infra_reason` accepted.
+    """
+    segments = _infra_segments(reason)
+
+    # Layer: the `<layer>_unavailable` head, possibly behind a wrapper.
+    head = ""
+    if segments[0].endswith(_INFRA_REASON_HEAD_SUFFIX):
+        head = segments[0]
+    elif (
+        segments[0] in _INFRA_WRAPPER_PREFIXES
+        and len(segments) > 1
+        and segments[1].endswith(_INFRA_REASON_HEAD_SUFFIX)
+    ):
+        head = segments[1]
+    try:
+        layer = _InfraLayer(head[: -len(_INFRA_REASON_HEAD_SUFFIX)]) if head else _InfraLayer.OTHER
+    except ValueError:
+        layer = _InfraLayer.OTHER
+
+    # Condition: a recognised setup token anywhere in the tail, else the
+    # generic outage when the head said `*_unavailable`, else OTHER.
+    condition = _InfraCondition.UNAVAILABLE if head else _InfraCondition.OTHER
+    for seg in segments:
+        if seg in _INFRA_CONDITION_TOKENS:
+            condition = _INFRA_CONDITION_TOKENS[seg]
+            break
+
+    out: dict = {"layer": layer.value, "condition": condition.value}
+
+    # Exception type: last whitelisted name wins. "other" only when some
+    # segment sat in exception position without being recognised; absent
+    # when there was no exception at all (e.g. `lakera_unavailable:no-key`).
+    exc_type = None
+    for seg in reversed(segments):
+        if seg in _INFRA_EXC_TYPES:
+            exc_type = seg
+            break
+    if exc_type is None and any(_looks_like_exc_token(s) for s in segments):
+        exc_type = "other"
+    if exc_type is not None:
+        out["exc_type"] = exc_type
+
+    # HTTP status: only from a pure-ASCII-digit trailing token, coerced to
+    # int and range-checked. `isdigit()` alone accepts non-ASCII digits, so
+    # gate on `isascii()` too; `int()` also accepts `4_2_9`, which
+    # `isdigit()` already rejects.
+    tail = segments[-1] if segments else ""
+    if tail.isascii() and tail.isdigit():
+        status = int(tail)
+        if _INFRA_MIN_HTTP_STATUS <= status <= _INFRA_MAX_HTTP_STATUS:
+            out["http_status"] = status
+    return out
 
 
 def _reject_response(
@@ -1715,15 +1906,18 @@ def _reject_response(
     Scan timing is bucketized to prevent side-channel fingerprinting of
     which scanner layer rejected.
 
-    `reason` is the raw Verdict reason. It is classified here and only
-    surfaced when `_is_infra_reason` says it is a setup/infra outage — an
-    operator's agent needs to see "Lakera is down" without a quarantine
-    dive. A detection reason is dropped on the floor and the payload is
-    byte-identical to the no-reason case.
+    `reason` is the raw Verdict reason. It never leaves this function. It
+    is classified, and only when `_is_infra_reason` says it is a
+    setup/infra outage is it cast — via `_infra_diagnosis` — into a closed
+    vocabulary that gets attached under `scanner_infra`. An operator's
+    agent needs to see "Lakera is down"; it does not need, and must not
+    get, a free-form string. A detection reason is dropped on the floor
+    and the payload is byte-identical to the no-reason case.
 
     Fail-closed is UNCHANGED either way: the caller never gets the report,
     and the content is quarantined by `_scan_and_deliver` regardless. Only
-    the diagnosis becomes visible.
+    the diagnosis becomes visible. The full raw reason still reaches the
+    isolation-zone audit record for a human.
 
     The payload is built by naming safe fields explicitly. Never populate
     it by filtering a Verdict / layers dict — `api_error_detail`,
@@ -1745,14 +1939,22 @@ def _reject_response(
         },
     }
     if _is_infra_reason(reason):
-        # Mirrors how the boot smoke logs its failures, so both the outage
-        # and its history are triageable from server.log.
+        diagnosis = _infra_diagnosis(reason)  # type: ignore[arg-type]
+        # Log the SAME closed-vocabulary value, not the raw reason: no free
+        # text crosses onto this path, into the response or into server.log.
+        # (The boot smoke logs its own raw reason on a different code path;
+        # that is deliberate and untouched.)
         _LOG.error(
-            "research infra-reject id=%s reason=%s — report quarantined "
-            "fail-closed; fix the scanner dependency and retry",
-            report_id, reason,
+            "research infra-reject id=%s layer=%s condition=%s exc_type=%s "
+            "http_status=%s — report quarantined fail-closed; fix the named "
+            "scanner dependency and retry",
+            report_id,
+            diagnosis["layer"],
+            diagnosis["condition"],
+            diagnosis.get("exc_type"),
+            diagnosis.get("http_status"),
         )
-        out[_INFRA_REASON_KEY] = reason
+        out[_INFRA_KEY] = diagnosis
     return out
 
 
