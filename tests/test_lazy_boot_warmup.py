@@ -38,6 +38,7 @@ def _restore_module_state():
     yield
     server._SCANNER_HEALTH.update(ok=True, reason="", last_check=0.0)
     server._SCANNER_WARMUP_DONE.set()
+    server._SCANNER_SMOKE_ORPHANED.clear()
 
 
 def _pre_warmup():
@@ -322,13 +323,14 @@ def test_import_survives_hostile_scanner_seconds_env():
         "import json, math, mcp_server.server as s; "
         "print('RESULT' + json.dumps(["
         "s._SCANNER_RECHECK_SECS, s._SCANNER_WARMUP_WAIT_SECS, "
-        "s._SCANNER_HEALTH['ok']]))"
+        "s._SCANNER_SMOKE_TIMEOUT_SECS, s._SCANNER_HEALTH['ok']]))"
     )
     env = dict(
         os.environ,
         PYTHONPATH=str(_REPO_ROOT),
         RESEARCH_SCANNER_RECHECK_SECS="abc",
         RESEARCH_SCANNER_WARMUP_WAIT_SECS="nan",
+        RESEARCH_SCANNER_SMOKE_TIMEOUT_SECS="-inf",
     )
     r = subprocess.run(
         [sys.executable, "-c", code],
@@ -339,10 +341,130 @@ def test_import_survives_hostile_scanner_seconds_env():
         f"the MCP would die before binding stdio.\n{r.stderr}"
     )
     line = next(ln for ln in r.stdout.splitlines() if ln.startswith("RESULT"))
-    recheck, wait, ok = json.loads(line[len("RESULT"):])
+    recheck, wait, smoke_timeout, ok = json.loads(line[len("RESULT"):])
     assert math.isfinite(recheck) and recheck > 0, (
         "a non-finite or non-positive recheck interval stops the degraded "
         "server from ever re-checking"
     )
     assert math.isfinite(wait) and wait >= 0
+    assert math.isfinite(smoke_timeout) and smoke_timeout > 0
     assert ok is False, "a bad env var must not flip the gate open"
+
+
+# --- (h) the smoke itself is bounded -----------------------------------------
+
+
+def _await_orphan_drain(timeout=15.0):
+    """Wait for an abandoned smoke worker to finish so it cannot bleed into
+    the next test."""
+    deadline = time.monotonic() + timeout
+    while server._SCANNER_SMOKE_ORPHANED.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def test_a_wedged_smoke_does_not_pin_the_warmup(monkeypatch):
+    """`run_smoke()` has no timeout of its own and makes ~6 live HTTP calls.
+    If one hangs, the warmup thread never sets `_SCANNER_WARMUP_DONE` and
+    every research() is refused "warming up" forever — while the message tells
+    the caller to retry shortly. The warmup must give up and publish a
+    degraded verdict instead."""
+    _pre_warmup()
+    monkeypatch.setattr(server, "_SCANNER_SMOKE_TIMEOUT_SECS", 0.1)
+    monkeypatch.setattr(server, "_maybe_update_scanner", lambda: None)
+    release = threading.Event()
+
+    def _hang():
+        release.wait(30)
+        return True, ""
+
+    monkeypatch.setattr(server, "_run_boot_smoke_once", _hang)
+
+    try:
+        t0 = time.monotonic()
+        server._scanner_warmup()
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 10.0, f"warmup sat on the smoke for {elapsed:.1f}s"
+        assert server._SCANNER_WARMUP_DONE.is_set()
+        assert server._SCANNER_HEALTH["ok"] is False, "a timeout must refuse"
+        assert "timeout" in server._SCANNER_HEALTH["reason"]
+    finally:
+        release.set()
+        _await_orphan_drain()
+
+
+def test_an_abandoned_smoke_is_not_stacked_on_by_the_next_one(monkeypatch):
+    """The worker we gave up on is still making live calls. Starting another
+    smoke on top of it doubles the spend the lock exists to prevent — and at
+    one recheck a minute would leak a thread per minute for as long as the
+    provider stays wedged. Refuse instead, and let the next recheck retry once
+    the orphan has drained."""
+    _pre_warmup()
+    monkeypatch.setattr(server, "_SCANNER_SMOKE_TIMEOUT_SECS", 0.1)
+    monkeypatch.setattr(server, "_maybe_update_scanner", lambda: None)
+    release = threading.Event()
+    starts = []
+
+    def _hang():
+        starts.append(1)
+        release.wait(30)
+        return True, ""
+
+    monkeypatch.setattr(server, "_run_boot_smoke_once", _hang)
+
+    try:
+        server._scanner_warmup()
+        assert starts == [1]
+
+        server._SCANNER_HEALTH.update(last_check=_stale_last_check())
+        ok, reason = server._scanner_health_gate()
+
+        assert ok is False
+        assert starts == [1], "started a second smoke on top of the abandoned one"
+    finally:
+        release.set()
+        _await_orphan_drain()
+
+
+def test_a_smoke_worker_that_cannot_start_does_not_wedge_the_flag(monkeypatch):
+    """The orphan flag is set before the worker starts, and only the worker
+    clears it. If the spawn fails there is no worker, so a naive version
+    leaves the flag set forever — which refuses every future smoke and stops
+    the server healing for the rest of its life."""
+    _pre_warmup()
+
+    class _DeadThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+        def join(self, timeout=None):
+            raise AssertionError("must not join a thread that never started")
+
+    monkeypatch.setattr(server.threading, "Thread", _DeadThread)
+    ok, reason = server._run_smoke_bounded()
+
+    assert ok is False, "a smoke that never ran must refuse"
+    assert reason
+    assert server._SCANNER_SMOKE_ORPHANED.is_set() is False
+
+
+def test_a_slow_but_finite_smoke_still_publishes(monkeypatch):
+    """The bound must not turn a merely-slow provider into a false failure:
+    a smoke that returns inside the budget publishes its real verdict."""
+    _pre_warmup()
+    monkeypatch.setattr(server, "_SCANNER_SMOKE_TIMEOUT_SECS", 10.0)
+    monkeypatch.setattr(server, "_maybe_update_scanner", lambda: None)
+
+    def _slow():
+        time.sleep(0.2)
+        return True, ""
+
+    monkeypatch.setattr(server, "_run_boot_smoke_once", _slow)
+
+    server._scanner_warmup()
+
+    assert server._SCANNER_HEALTH["ok"] is True
+    assert server._SCANNER_SMOKE_ORPHANED.is_set() is False

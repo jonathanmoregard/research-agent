@@ -4,6 +4,7 @@ gate auto-heals on recovery without a reconnect."""
 from __future__ import annotations
 
 import math
+import threading
 import time
 
 import pytest
@@ -38,6 +39,7 @@ def _restore_module_state():
     yield
     server._SCANNER_HEALTH.update(ok=True, reason="", last_check=0.0)
     server._SCANNER_WARMUP_DONE.set()
+    server._SCANNER_SMOKE_ORPHANED.clear()
 
 
 def _stale_last_check() -> float:
@@ -149,6 +151,8 @@ def test_scanner_seconds_knobs_are_finite_and_usable():
     assert server._SCANNER_RECHECK_SECS > 0
     assert math.isfinite(server._SCANNER_WARMUP_WAIT_SECS)
     assert server._SCANNER_WARMUP_WAIT_SECS >= 0
+    assert math.isfinite(server._SCANNER_SMOKE_TIMEOUT_SECS)
+    assert server._SCANNER_SMOKE_TIMEOUT_SECS > 0
 
 
 def test_a_nan_recheck_interval_cannot_wedge_the_gate(monkeypatch):
@@ -162,3 +166,51 @@ def test_a_nan_recheck_interval_cannot_wedge_the_gate(monkeypatch):
     monkeypatch.setattr(server, "_run_boot_smoke_once", lambda: (True, ""))
     ok, _ = server._scanner_health_gate()
     assert ok is False, "a poisoned interval must fail closed, never open"
+
+
+# --- the smoke is bounded ----------------------------------------------------
+#
+# injection_scanner.smoke.run_smoke() makes ~6 live HTTP calls and passes no
+# timeout to any of them (verified: `grep -c timeout` over the installed
+# smoke.py returns 0). A wedged provider therefore parks the smoke forever
+# while it holds _SCANNER_SMOKE_LOCK.
+
+
+def test_gate_refuses_promptly_when_a_peer_smoke_holds_the_lock(monkeypatch):
+    """A gate call that cannot get the smoke lock inside its budget must
+    refuse fail-closed, not block on the lock for as long as the peer runs."""
+    _reset_health()
+    server._SCANNER_HEALTH.update(
+        ok=False, reason="degraded", last_check=_stale_last_check()
+    )
+    monkeypatch.setattr(server, "_SCANNER_SMOKE_LOCK_WAIT_SECS", 0.05)
+    monkeypatch.setattr(
+        server, "_run_boot_smoke_once",
+        lambda: (_ for _ in ()).throw(AssertionError("must not smoke behind the lock")),
+    )
+
+    release = threading.Event()
+    holding = threading.Event()
+
+    def _squat():
+        with server._SCANNER_SMOKE_LOCK:
+            holding.set()
+            release.wait(30)
+
+    t = threading.Thread(target=_squat, daemon=True)
+    t.start()
+    try:
+        assert holding.wait(5), "helper never took the lock"
+        t0 = time.monotonic()
+        ok, reason = server._scanner_health_gate()
+        elapsed = time.monotonic() - t0
+    finally:
+        release.set()
+        t.join(10)
+
+    assert ok is False
+    assert reason, "a refusal must carry a reason the caller can act on"
+    assert elapsed < 5.0, (
+        f"gate blocked {elapsed:.1f}s on a held smoke lock — the acquisition "
+        "is still unbounded"
+    )

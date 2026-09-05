@@ -658,7 +658,6 @@ def _read_secs(
     return clamped
 
 
-
 class _VMBusy(Exception):
     """Raised when the cross-process VM lock can't be acquired in time."""
 
@@ -2026,6 +2025,7 @@ def _maybe_update_scanner() -> None:
 # exactly the window this design exists to close — a research() arriving
 # before the first smoke would run against an unverified scanner.
 _SCANNER_HEALTH: dict = {"ok": False, "reason": "warming up", "last_check": 0.0}
+
 # How often a DEGRADED server re-runs the self-test. This is the knob the
 # whole self-healing property hangs on, so both bounds are load bearing:
 #
@@ -2055,6 +2055,16 @@ _SCANNER_WARMUP_DONE = threading.Event()
 # writes to `_SCANNER_HEALTH`, publishing a stale verdict last.
 _SCANNER_SMOKE_LOCK = threading.Lock()
 
+# Set while a smoke that outlived `_SCANNER_SMOKE_TIMEOUT_SECS` is STILL
+# running on its worker thread. We abandoned its verdict, but the thread is
+# still holding sockets and making live calls, so starting another smoke on
+# top of it re-creates exactly the double-spend `_SCANNER_SMOKE_LOCK`
+# prevents — and at one re-check a minute would leak a thread per minute for
+# as long as the provider stays wedged. Cleared by the worker itself when it
+# finally returns, so the next re-check runs a fresh smoke and the server
+# still heals by itself.
+_SCANNER_SMOKE_ORPHANED = threading.Event()
+
 # How long a research() call arriving mid-warmup blocks for the verdict before
 # refusing. Sized off the measured boot smoke (2026-09-05: p50 4.0 s, p90
 # 10.1 s, max 22.4 s) so the steady state waits rather than refuses; the
@@ -2072,6 +2082,46 @@ _SCANNER_WARMUP_WAIT_SECS = _read_secs(
     lo=0.0,
     hi=300.0,
     name="RESEARCH_SCANNER_WARMUP_WAIT_SECS",
+)
+
+# Wall-clock bound on one `run_smoke()`.
+#
+# `injection_scanner.smoke` makes ~6 live HTTP calls and passes no timeout to
+# any of them (verified 2026-09-05: `grep -c timeout` over the installed
+# smoke.py returns 0). An unresponsive provider therefore parks the smoke
+# indefinitely. On the warmup thread that means `_SCANNER_WARMUP_DONE` is
+# never set and every research() is refused "warming up" forever, while the
+# refusal message tells the caller to retry shortly; on the re-check path it
+# means the next gate call blocks on `_SCANNER_SMOKE_LOCK` for as long as the
+# provider stays wedged, hanging the tool call.
+#
+#   lo=1 s   — a sub-second bound would time out every honest smoke and pin
+#              the server degraded permanently. Fail-closed, but uselessly.
+#   hi=600 s — past this the bound is not bounding anything a caller would
+#              wait for; the MCP would look hung either way.
+# Default 120 s ≈ 5x the measured max (22.4 s), so a slow-but-alive provider
+# still completes rather than being killed and reported as a false failure.
+_SCANNER_SMOKE_TIMEOUT_SECS = _read_secs(
+    os.environ.get("RESEARCH_SCANNER_SMOKE_TIMEOUT_SECS"),
+    120.0,
+    lo=1.0,
+    hi=600.0,
+    name="RESEARCH_SCANNER_SMOKE_TIMEOUT_SECS",
+)
+
+# How long a caller waits for `_SCANNER_SMOKE_LOCK` before refusing outright.
+# Same measured basis and same trade as `_SCANNER_WARMUP_WAIT_SECS`: a peer's
+# in-flight smoke normally publishes well inside this, and adopting its
+# verdict beats making the caller retry. Past it we refuse promptly with an
+# accurate reason rather than sitting on the lock for the peer's full budget
+# (which can be `_SCANNER_SMOKE_TIMEOUT_SECS` — far longer than a tool call
+# should ever block).
+_SCANNER_SMOKE_LOCK_WAIT_SECS = _read_secs(
+    os.environ.get("RESEARCH_SCANNER_SMOKE_LOCK_WAIT_SECS"),
+    30.0,
+    lo=0.0,
+    hi=300.0,
+    name="RESEARCH_SCANNER_SMOKE_LOCK_WAIT_SECS",
 )
 
 
@@ -2097,7 +2147,74 @@ def _run_boot_smoke_once() -> tuple[bool, str]:
     return True, ""
 
 
-def _smoke_and_publish(seen_last_check: float | None = None) -> tuple[bool, str]:
+def _run_smoke_bounded() -> tuple[bool, str]:
+    """`_run_boot_smoke_once()` with a wall-clock bound. Never raises.
+
+    `run_smoke()` sets no timeout on its own HTTP calls, so the only way to
+    bound it from out here is to run it somewhere we can walk away from.
+    A daemon worker thread + `join(timeout)` does that. Deliberately NOT
+    `signal.alarm`: signals are main-thread-only and every caller of this
+    (the warmup thread, a FastMCP request thread) is not the main thread.
+
+    Timing out ABANDONS the worker rather than cancelling it — Python has no
+    safe way to kill a thread parked in a socket read. The worker is a daemon
+    so it can never hold the process open, and `_SCANNER_SMOKE_ORPHANED`
+    keeps a later caller from stacking a second smoke on top of it.
+
+    Fail-closed in every branch: a timeout, a raise, and a worker that
+    finished without leaving a verdict all return (False, reason). Nothing
+    here can return True without a passing smoke behind it.
+    """
+    if _SCANNER_SMOKE_ORPHANED.is_set():
+        # A previous smoke blew its budget and is still out there. Refusing
+        # is both cheaper and more honest than racing it.
+        _LOG.warning("previous scanner smoke still running — refusing fail-closed")
+        return False, "smoke_timeout:previous check still running"
+
+    verdict: dict[str, tuple[bool, str]] = {}
+    # Set BEFORE the worker starts, cleared by the worker itself. Ordering
+    # matters: the worker's `finally` runs before the thread terminates, and
+    # `join()` returns only after termination, so a worker we successfully
+    # joined has always already cleared the flag. Setting it after a failed
+    # join instead would race a worker that finished in that same window and
+    # leave the flag stuck set forever.
+    _SCANNER_SMOKE_ORPHANED.set()
+
+    def _worker() -> None:
+        try:
+            verdict["v"] = _run_boot_smoke_once()
+        except Exception as e:  # unavailable == degraded; never raised at a caller
+            _LOG.exception("boot smoke raised — treating scanner as unavailable")
+            verdict["v"] = (False, f"scanner_unavailable:{type(e).__name__}")
+        finally:
+            _SCANNER_SMOKE_ORPHANED.clear()
+
+    t = threading.Thread(target=_worker, name="scanner-smoke", daemon=True)
+    try:
+        t.start()
+    except RuntimeError:
+        # Could not spawn (fd/thread exhaustion). Nothing will ever clear the
+        # flag we just set, and a stuck flag refuses every future smoke — the
+        # server would never heal again. Clear it here and refuse this one.
+        _SCANNER_SMOKE_ORPHANED.clear()
+        _LOG.exception("could not start the smoke worker — refusing fail-closed")
+        return False, "scanner_unavailable:RuntimeError"
+    t.join(_SCANNER_SMOKE_TIMEOUT_SECS)
+
+    got = verdict.get("v")
+    if got is None:
+        _LOG.error(
+            "scanner smoke exceeded %.0fs — abandoning it and refusing fail-closed",
+            _SCANNER_SMOKE_TIMEOUT_SECS,
+        )
+        return False, f"smoke_timeout:{_SCANNER_SMOKE_TIMEOUT_SECS:g}s"
+    return got
+
+
+def _smoke_and_publish(
+    seen_last_check: float | None = None,
+    lock_wait: float | None = None,
+) -> tuple[bool, str]:
     """Run the self-test under `_SCANNER_SMOKE_LOCK` and publish the verdict.
 
     Every path that runs a smoke goes through here, so the warmup thread and
@@ -2111,20 +2228,39 @@ def _smoke_and_publish(seen_last_check: float | None = None) -> tuple[bool, str]
     rather than by elapsed time so it does not depend on where
     `time.monotonic()` happens to start on this platform.
 
+    `lock_wait` bounds the queueing itself (default
+    `_SCANNER_SMOKE_LOCK_WAIT_SECS`). An unbounded `with _SCANNER_SMOKE_LOCK`
+    made a gate call inherit the peer's entire smoke budget, so one wedged
+    provider hung the tool call instead of refusing it. Failing to acquire is
+    a refusal with its own reason, and publishes nothing — we never checked,
+    so we must not overwrite what the last real check concluded.
+
     An unexpected exception (an unimportable or broken scanner package) is
-    mapped to a degraded verdict, not raised: unavailable is refused exactly
-    like regressed, and a gate call must never surface a traceback in place
-    of a fail-closed refusal.
+    mapped to a degraded verdict by `_run_smoke_bounded`, not raised:
+    unavailable is refused exactly like regressed, and a gate call must never
+    surface a traceback in place of a fail-closed refusal.
     """
-    with _SCANNER_SMOKE_LOCK:
+    if lock_wait is None:
+        lock_wait = _SCANNER_SMOKE_LOCK_WAIT_SECS
+    # acquire(timeout=0) is rejected by threading.Lock; -1 means "block
+    # forever", which is the thing we are removing. Map a zero budget onto a
+    # genuine non-blocking try.
+    if lock_wait > 0:
+        acquired = _SCANNER_SMOKE_LOCK.acquire(timeout=lock_wait)
+    else:
+        acquired = _SCANNER_SMOKE_LOCK.acquire(blocking=False)
+    if not acquired:
+        _LOG.warning(
+            "scanner smoke lock busy after %.2fs — refusing fail-closed", lock_wait
+        )
+        return False, "scanner_check_in_progress"
+    try:
         if seen_last_check is not None and _SCANNER_HEALTH["last_check"] != seen_last_check:
             return _SCANNER_HEALTH["ok"], _SCANNER_HEALTH["reason"]
-        try:
-            ok, reason = _run_boot_smoke_once()
-        except Exception as e:  # unavailable == degraded; never raise past the gate
-            ok, reason = False, f"scanner_unavailable:{type(e).__name__}"
-            _LOG.exception("boot smoke raised — treating scanner as unavailable")
+        ok, reason = _run_smoke_bounded()
         _SCANNER_HEALTH.update(ok=ok, reason=reason, last_check=time.monotonic())
+    finally:
+        _SCANNER_SMOKE_LOCK.release()
     return ok, reason
 
 
@@ -2174,8 +2310,10 @@ def _scanner_health_gate() -> tuple[bool, str]:
     makes the gate reuse the warmup's result instead of racing it.
 
     Fail-closed is preserved in every branch: if the wait expires with the
-    warmup still running we refuse with "warming up" rather than proceed,
-    and we never return True without a passing smoke behind it.
+    warmup still running we refuse with "warming up" rather than proceed; if
+    the re-check cannot get the smoke lock inside its budget, or the smoke
+    itself blows its budget, we refuse with that reason; and we never return
+    True without a passing smoke behind it.
     """
     if _SCANNER_HEALTH["ok"]:
         return True, ""
