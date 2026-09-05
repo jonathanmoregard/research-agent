@@ -34,6 +34,7 @@ import fcntl
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import shlex
@@ -593,6 +594,69 @@ def _read_slots(raw: str | None) -> int:
 
 
 _VM_SLOTS = _read_slots(os.environ.get("RESEARCH_SLOTS"))
+
+
+def _read_secs(
+    raw: str | None,
+    default: float,
+    *,
+    lo: float,
+    hi: float,
+    name: str = "value",
+) -> float:
+    """Parse a seconds knob from the environment. Never raises; always finite.
+
+    Same discipline as `_read_slots` above, for the float-valued knobs. Every
+    caller runs at module scope, which is BEFORE `mcp.run()` binds stdio — a
+    `ValueError` escaping here kills the server during the MCP handshake, so
+    the client reports a bare connect failure and the operator has no typo to
+    look at. A malformed value degrades to the documented default with a
+    warning instead.
+
+    Non-finite values are rejected explicitly rather than clamped, because
+    `float()` accepts them and they are silent rather than loud:
+    `float("nan")` parses happily and then poisons every comparison it takes
+    part in — `time.monotonic() - last_check >= nan` is False forever, so a
+    degraded server's re-check never fires and it never self-heals. That is a
+    permanent outage that looks like a working server. `inf`, `-inf` and any
+    literal that overflows to them (`1e400`) are the same failure with an
+    honest spelling.
+
+    Finite values are clamped into [lo, hi] rather than rejected: the operator
+    meant a number, and the nearest usable number is closer to their intent
+    than the default is. Each caller documents why its own bounds are the
+    defensible ones. Clamping can only ever narrow the window in which the
+    server acts — it can never flip a refusal into an approval, because the
+    gate's only True path is a passing smoke.
+    """
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        # `export X=` means "unset", not "force empty". Same convention as
+        # `_ssh_settings` and `_read_slots`.
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        _LOG.warning(
+            "ignoring malformed %s=%r — using default %ss", name, raw, default
+        )
+        return default
+    if not math.isfinite(val):
+        _LOG.warning(
+            "ignoring non-finite %s=%r — using default %ss "
+            "(nan/inf would disable the behaviour this value controls)",
+            name, raw, default,
+        )
+        return default
+    clamped = min(max(val, lo), hi)
+    if clamped != val:
+        _LOG.warning(
+            "clamping %s=%r to %ss (allowed range %s..%s)", name, raw, clamped, lo, hi
+        )
+    return clamped
+
 
 
 class _VMBusy(Exception):
@@ -1962,7 +2026,25 @@ def _maybe_update_scanner() -> None:
 # exactly the window this design exists to close — a research() arriving
 # before the first smoke would run against an unverified scanner.
 _SCANNER_HEALTH: dict = {"ok": False, "reason": "warming up", "last_check": 0.0}
-_SCANNER_RECHECK_SECS = float(os.environ.get("RESEARCH_SCANNER_RECHECK_SECS", "60"))
+# How often a DEGRADED server re-runs the self-test. This is the knob the
+# whole self-healing property hangs on, so both bounds are load bearing:
+#
+#   lo=1 s   — a zero or negative interval makes `now - last_check >= interval`
+#              true on every single call, so every refused research() pays for
+#              a full smoke (~6 live API calls, p50 4.0 s). That is a
+#              self-inflicted DoS on the provider quota and on the caller's
+#              latency, for no extra safety: the gate is already refusing.
+#   hi=3600 s — an absurd interval (a typo'd 60000) leaves the server refusing
+#              for the rest of its life. Auto-recovery-without-a-reconnect is
+#              the reason this gate exists; an hour is already far past any
+#              transient hiccup it is meant to ride out.
+_SCANNER_RECHECK_SECS = _read_secs(
+    os.environ.get("RESEARCH_SCANNER_RECHECK_SECS"),
+    60.0,
+    lo=1.0,
+    hi=3600.0,
+    name="RESEARCH_SCANNER_RECHECK_SECS",
+)
 
 # Set once the warmup thread has resolved, pass or fail. Unset at import so a
 # gate call that beats the warmup can wait for it rather than refuse.
@@ -1978,8 +2060,18 @@ _SCANNER_SMOKE_LOCK = threading.Lock()
 # 10.1 s, max 22.4 s) so the steady state waits rather than refuses; the
 # tail that exceeds it is the scanner-reinstall path, where refusing with
 # "warming up" beats holding the call open for a 120 s `uv pip install`.
-_SCANNER_WARMUP_WAIT_SECS = float(
-    os.environ.get("RESEARCH_SCANNER_WARMUP_WAIT_SECS", "30")
+#
+# lo=0 s is deliberate: "never wait, refuse immediately" is a coherent and
+# still fail-closed operator choice. hi=300 s is the warmup's own worst case
+# (the 120 s `uv pip install` cap at _maybe_update_scanner plus a bounded
+# smoke, with slack) — waiting longer than the warmup can possibly take
+# cannot change the answer, it only holds the tool call open.
+_SCANNER_WARMUP_WAIT_SECS = _read_secs(
+    os.environ.get("RESEARCH_SCANNER_WARMUP_WAIT_SECS"),
+    30.0,
+    lo=0.0,
+    hi=300.0,
+    name="RESEARCH_SCANNER_WARMUP_WAIT_SECS",
 )
 
 
@@ -2102,6 +2194,11 @@ def _scanner_health_gate() -> tuple[bool, str]:
             return False, _SCANNER_HEALTH["reason"]
 
     seen = _SCANNER_HEALTH["last_check"]
+    # `_read_secs` guarantees a finite, positive interval, which is what keeps
+    # this comparison meaningful — a NaN here would make it False forever and
+    # the re-check would never fire again. Note the direction of that failure
+    # is still closed (we fall through to the refusal below), so the clamp
+    # buys self-healing, not safety.
     if time.monotonic() - seen >= _SCANNER_RECHECK_SECS:
         ok, reason = _smoke_and_publish(seen_last_check=seen)
         if ok:

@@ -12,6 +12,7 @@ a passing warmup smoke flips it healthy.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -301,3 +302,47 @@ def test_main_runs_warmup_in_a_daemon_thread(monkeypatch):
     finally:
         release.set()
         t.join(10)
+
+
+# --- (g) a hostile env cannot stop the server booting ------------------------
+
+
+def test_import_survives_hostile_scanner_seconds_env():
+    """The recheck interval and the warmup wait are parsed at module scope,
+    which runs before `mcp.run()` binds stdio — so a bare `float()` turns an
+    operator typo into an MCP that dies during the handshake with no useful
+    message anywhere.
+
+    `nan` is the nastier half: it parses, and then `now - last_check >= nan`
+    is False forever, so the degraded server's recheck never fires and it
+    never self-heals. Checked in a subprocess because the parse happens once,
+    at import.
+    """
+    code = (
+        "import json, math, mcp_server.server as s; "
+        "print('RESULT' + json.dumps(["
+        "s._SCANNER_RECHECK_SECS, s._SCANNER_WARMUP_WAIT_SECS, "
+        "s._SCANNER_HEALTH['ok']]))"
+    )
+    env = dict(
+        os.environ,
+        PYTHONPATH=str(_REPO_ROOT),
+        RESEARCH_SCANNER_RECHECK_SECS="abc",
+        RESEARCH_SCANNER_WARMUP_WAIT_SECS="nan",
+    )
+    r = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=180,
+    )
+    assert r.returncode == 0, (
+        "server module failed to import with a malformed seconds env var — "
+        f"the MCP would die before binding stdio.\n{r.stderr}"
+    )
+    line = next(ln for ln in r.stdout.splitlines() if ln.startswith("RESULT"))
+    recheck, wait, ok = json.loads(line[len("RESULT"):])
+    assert math.isfinite(recheck) and recheck > 0, (
+        "a non-finite or non-positive recheck interval stops the degraded "
+        "server from ever re-checking"
+    )
+    assert math.isfinite(wait) and wait >= 0
+    assert ok is False, "a bad env var must not flip the gate open"

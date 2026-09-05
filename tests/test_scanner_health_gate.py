@@ -3,6 +3,7 @@ of killing it, research() refuses fail-closed while degraded, and the
 gate auto-heals on recovery without a reconnect."""
 from __future__ import annotations
 
+import math
 import time
 
 import pytest
@@ -107,3 +108,57 @@ def test_healthy_gate_is_noop(monkeypatch):
     )
     ok, reason = server._scanner_health_gate()
     assert ok is True and reason == ""
+
+
+# --- tolerant parsing of the seconds knobs -----------------------------------
+#
+# These are parsed at module scope, before stdio is bound, so a bare float()
+# turns an operator typo into a server that dies during the MCP handshake.
+# Worse, float() accepts "nan": every comparison against NaN is False, so
+# `now - last_check >= nan` never fires and a degraded server silently stops
+# self-healing. Mirrors tests/test_vm_lock.py::test_read_slots_parsing.
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, 60.0),        # unset -> documented default
+        ("", 60.0),          # `export X=` means "unset", not "force empty"
+        ("30", 30.0),
+        ("30.5", 30.5),
+        ("  45 ", 45.0),
+        ("abc", 60.0),       # malformed -> default, never ValueError at import
+        ("nan", 60.0),       # parses as a float and then poisons every compare
+        ("inf", 60.0),
+        ("-inf", 60.0),
+        ("1e400", 60.0),     # overflows to inf
+        ("0", 1.0),          # a zero interval re-smokes on every single call
+        ("-5", 1.0),
+        ("999999", 3600.0),  # an absurd interval stops self-healing entirely
+    ],
+)
+def test_read_secs_parsing(raw, expected):
+    assert server._read_secs(raw, 60.0, lo=1.0, hi=3600.0, name="X") == expected
+
+
+def test_scanner_seconds_knobs_are_finite_and_usable():
+    """Whatever the environment said, the live constants must be values the
+    gate can actually act on — a non-finite recheck interval would leave a
+    degraded server refusing forever."""
+    assert math.isfinite(server._SCANNER_RECHECK_SECS)
+    assert server._SCANNER_RECHECK_SECS > 0
+    assert math.isfinite(server._SCANNER_WARMUP_WAIT_SECS)
+    assert server._SCANNER_WARMUP_WAIT_SECS >= 0
+
+
+def test_a_nan_recheck_interval_cannot_wedge_the_gate(monkeypatch):
+    """Belt and braces on the clamp: even if a NaN reached the interval, the
+    gate must refuse rather than return healthy."""
+    _reset_health()
+    server._SCANNER_HEALTH.update(
+        ok=False, reason="degraded", last_check=_stale_last_check()
+    )
+    monkeypatch.setattr(server, "_SCANNER_RECHECK_SECS", float("nan"))
+    monkeypatch.setattr(server, "_run_boot_smoke_once", lambda: (True, ""))
+    ok, _ = server._scanner_health_gate()
+    assert ok is False, "a poisoned interval must fail closed, never open"
