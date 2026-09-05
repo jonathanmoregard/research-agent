@@ -34,6 +34,7 @@ import fcntl
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import shlex
@@ -46,6 +47,7 @@ import tempfile
 import threading
 import time
 import uuid
+from enum import Enum
 from pathlib import Path
 from typing import Literal
 
@@ -593,6 +595,68 @@ def _read_slots(raw: str | None) -> int:
 
 
 _VM_SLOTS = _read_slots(os.environ.get("RESEARCH_SLOTS"))
+
+
+def _read_secs(
+    raw: str | None,
+    default: float,
+    *,
+    lo: float,
+    hi: float,
+    name: str = "value",
+) -> float:
+    """Parse a seconds knob from the environment. Never raises; always finite.
+
+    Same discipline as `_read_slots` above, for the float-valued knobs. Every
+    caller runs at module scope, which is BEFORE `mcp.run()` binds stdio — a
+    `ValueError` escaping here kills the server during the MCP handshake, so
+    the client reports a bare connect failure and the operator has no typo to
+    look at. A malformed value degrades to the documented default with a
+    warning instead.
+
+    Non-finite values are rejected explicitly rather than clamped, because
+    `float()` accepts them and they are silent rather than loud:
+    `float("nan")` parses happily and then poisons every comparison it takes
+    part in — `time.monotonic() - last_check >= nan` is False forever, so a
+    degraded server's re-check never fires and it never self-heals. That is a
+    permanent outage that looks like a working server. `inf`, `-inf` and any
+    literal that overflows to them (`1e400`) are the same failure with an
+    honest spelling.
+
+    Finite values are clamped into [lo, hi] rather than rejected: the operator
+    meant a number, and the nearest usable number is closer to their intent
+    than the default is. Each caller documents why its own bounds are the
+    defensible ones. Clamping can only ever narrow the window in which the
+    server acts — it can never flip a refusal into an approval, because the
+    gate's only True path is a passing smoke.
+    """
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        # `export X=` means "unset", not "force empty". Same convention as
+        # `_ssh_settings` and `_read_slots`.
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        _LOG.warning(
+            "ignoring malformed %s=%r — using default %ss", name, raw, default
+        )
+        return default
+    if not math.isfinite(val):
+        _LOG.warning(
+            "ignoring non-finite %s=%r — using default %ss "
+            "(nan/inf would disable the behaviour this value controls)",
+            name, raw, default,
+        )
+        return default
+    clamped = min(max(val, lo), hi)
+    if clamped != val:
+        _LOG.warning(
+            "clamping %s=%r to %ss (allowed range %s..%s)", name, raw, clamped, lo, hi
+        )
+    return clamped
 
 
 class _VMBusy(Exception):
@@ -1468,6 +1532,19 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             When `error` is "scanner rejected report (quarantined)",
             `report_id` is included — pass it back to `retry_research` to
             re-scan the quarantined report.
+            That reject also carries `scanner_infra` when — and only when —
+            the rejection was a scanner SETUP/INFRA outage rather than a
+            detection: {"layer": "lakera"|"honeypot"|"judge"|
+            "unicode_sanitize"|"secret_shapes"|"decode"|"other",
+            "condition": "unavailable"|"no_key"|"key_config_error"|
+            "bad_response"|"lib_missing"|"other", "exc_type"?: str,
+            "http_status"?: int}. Every value is drawn from a closed
+            vocabulary — it is a diagnosis, never text from the report or
+            the provider. Fix the named dependency, then retry. The
+            absence of `scanner_infra` means the scanner detected
+            something in the report itself; that reason stays opaque and
+            quarantine-only by design. The report is withheld and
+            quarantined either way.
     """
     if depth not in VALID_DEPTHS:
         return {
@@ -1625,17 +1702,296 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
     )
 
 
+# Reject-reason classification: SETUP/INFRA vs CONTENT-DERIVED.
+#
+# A failing Verdict means one of two very different things and they must
+# not share a disposition:
+#
+#   CONTENT-DERIVED — a detection. `secret_shape:*`, `encoded_secret:*`,
+#     `unicode_anomaly:*`, `lakera:prompt_attack`, honeypot triggers,
+#     `wrap_escape:*`, `oversized:*`. The reason is a function of
+#     attacker-controlled report bytes (even a rule NAME tells the caller
+#     which planted shape matched, and a length tells it how much text
+#     survived). Stays opaque and quarantine-only.
+#
+#   SETUP / INFRA — an outage. `*_unavailable:*` plus the bare `no-key` /
+#     `key-config-error` / `bad-response` setup codes. These are
+#     content-free BY CONSTRUCTION: they are our own literal codes plus
+#     Python/SDK exception *type names* and a fixed set of layer/scenario
+#     labels. injection_scanner deliberately keeps matched values out of
+#     `reason` — see the comments around intercept.py lines 100, 137 and
+#     170, written after a past leak. That invariant is what makes it safe
+#     to surface these; if it is ever broken upstream, this predicate must
+#     be revisited.
+#
+# The classification is an ALLOWLIST anchored at the head of the reason.
+# Anything not positively recognised — a novel layer, a future code, a
+# malformed string — falls through to CONTENT-DERIVED and stays opaque.
+#
+# "This report was blocked" is NOT the secret; the report's CONTENT is.
+# So an outage stays an outage even when the layer it happened in only
+# runs on already-suspicious text: `lakera_arbitration:judge_unavailable:*`
+# fires only after Lakera flagged the report, and it is still INFRA,
+# because the operator needs to know the judge panel is down. What stays
+# CONTENT-DERIVED is anything whose reason encodes attacker-controlled
+# bytes or names which rule/shape matched.
+#
+# Accepted residual channel: an attacker can in principle steer which
+# exception *type* a provider call raises, making the visible field a very
+# low-bandwidth signal. That is a closed set of class names, it is the
+# same channel `reason` already crosses in server.log for boot-smoke
+# failures and in the scanner-degraded refusal text, and it is accepted
+# deliberately — not an oversight.
+#
+# NOTHING that crosses this boundary is free text. The raw reason is
+# parsed into the closed vocabularies below and only enum members / a
+# range-checked int are emitted; see `_infra_diagnosis`. The full raw
+# reason still reaches the isolation-zone audit record for a human,
+# unchanged.
+_INFRA_REASON_HEAD_SUFFIX = "_unavailable"
+
+# Reason prefixes that WRAP another layer's reason. intercept.py re-emits
+# the honeypot's own result reason under `honeypot:`, and the L4 judge's
+# under `lakera_arbitration:`, so a genuine outage arrives one segment
+# deeper than it was raised. Kept as an explicit set rather than "look at
+# segment 1 too", so `secret_shape:thing_unavailable` — a rule NAME that
+# merely ends in the suffix — cannot be mistaken for an outage.
+_INFRA_WRAPPER_PREFIXES = frozenset({"honeypot", "lakera_arbitration"})
+
+# Standalone setup codes. Today they only ever appear as the tail of
+# `lakera_unavailable:<code>`; listed here so a future call site emitting
+# one bare is still classified as infra rather than silently opaque.
+_INFRA_BARE_REASONS = frozenset({"no-key", "key-config-error", "bad-response"})
+
+# The single key the infra path is allowed to add to a reject response.
+_INFRA_KEY = "scanner_infra"
+
+
+class _InfraLayer(Enum):
+    """Which scanner layer went down. Closed set; parse falls back to OTHER."""
+    UNICODE_SANITIZE = "unicode_sanitize"
+    SECRET_SHAPES = "secret_shapes"
+    DECODE = "decode"
+    LAKERA = "lakera"
+    HONEYPOT = "honeypot"
+    JUDGE = "judge"
+    OTHER = "other"
+
+
+class _InfraCondition(Enum):
+    """What kind of outage it was. Closed set; parse falls back to OTHER."""
+    UNAVAILABLE = "unavailable"      # reachable-but-failing / generic outage
+    NO_KEY = "no_key"                # credential absent
+    KEY_CONFIG_ERROR = "key_config_error"  # credential present but unloadable
+    BAD_RESPONSE = "bad_response"    # provider answered, shape unusable
+    LIB_MISSING = "lib_missing"      # provider SDK not installed
+    OTHER = "other"
+
+
+# Tail tokens that pin the condition more precisely than "unavailable".
+# Keys are the literal tokens injection_scanner emits (lakera reason tails
+# and honeypot scenario signals); values are enum members. A token not in
+# here never reaches the caller — it just leaves the condition at its
+# default.
+_INFRA_CONDITION_TOKENS: dict[str, "_InfraCondition"] = {
+    "no-key": _InfraCondition.NO_KEY,
+    "no-anthropic-api-key": _InfraCondition.NO_KEY,
+    "no-openai-api-key": _InfraCondition.NO_KEY,
+    "key-config-error": _InfraCondition.KEY_CONFIG_ERROR,
+    "bad-response": _InfraCondition.BAD_RESPONSE,
+    "anthropic-lib-missing": _InfraCondition.LIB_MISSING,
+    "openai-lib-missing": _InfraCondition.LIB_MISSING,
+}
+
+# Exception TYPE names we are willing to name out loud. Hardcoded: an
+# unrecognised type is reported as "other", never passed through, never
+# truncated-and-passed. Covers stdlib transport/parse errors, the import
+# and asyncio failures the layers can hit, injection_scanner's own
+# KeyConfigError, and the Anthropic/OpenAI SDK error hierarchy.
+_INFRA_EXC_TYPES = frozenset({
+    # stdlib transport
+    "HTTPError", "URLError", "ContentTooShortError", "RemoteDisconnected",
+    "IncompleteRead", "TimeoutError", "socket.timeout", "gaierror",
+    "ConnectionError", "ConnectionResetError", "ConnectionRefusedError",
+    "ConnectionAbortedError", "BrokenPipeError", "OSError",
+    "SSLError", "SSLEOFError", "SSLZeroReturnError", "SSLCertVerificationError",
+    # parse / shape
+    "JSONDecodeError", "ValueError", "TypeError", "KeyError", "IndexError",
+    "AttributeError", "UnicodeDecodeError", "UnicodeEncodeError",
+    # import / runtime / scheduling
+    "ImportError", "ModuleNotFoundError", "RuntimeError", "RecursionError",
+    "MemoryError", "AssertionError", "NotImplementedError", "StopIteration",
+    "CancelledError", "InvalidStateError", "BrokenExecutor",
+    "BrokenThreadPool", "BrokenProcessPool",
+    # injection_scanner
+    "KeyConfigError", "SmokeFailure",
+    # Anthropic / OpenAI SDK
+    "APIError", "APIConnectionError", "APITimeoutError", "APIStatusError",
+    "APIResponseValidationError", "AuthenticationError", "PermissionDeniedError",
+    "NotFoundError", "BadRequestError", "ConflictError",
+    "UnprocessableEntityError", "RateLimitError", "InternalServerError",
+    "OverloadedError", "LengthFinishReasonError",
+    "ContentFilterFinishReasonError",
+})
+
+# HTTP status range, matching injection_scanner.http_status.bounded_status
+# on the sibling `feat/http-status-in-reason` branch. A RANGE, not an
+# allowlist: real deployments emit codes no RFC defines (nginx 444/499,
+# Cloudflare 520-530) and those are exactly what an operator debugging a
+# proxy needs. Anything outside it is a bug or a rebound attribute, and is
+# dropped rather than reported.
+_INFRA_MIN_HTTP_STATUS = 100
+_INFRA_MAX_HTTP_STATUS = 599
+
+
+def _infra_segments(reason: str) -> list[str]:
+    """Split a reason into tokens, dropping the `+skipped=N/M` suffix.
+
+    honeypot appends `+skipped=<n>/<total>` to its top-line reason, which
+    would otherwise glue itself to the last token (e.g. `429+skipped=1/6`)
+    and defeat both the exception-name and the status-code match.
+    """
+    return [seg.split("+", 1)[0] for seg in reason.split(":")]
+
+
+def _looks_like_exc_token(seg: str) -> bool:
+    """Whether `seg` sits where an exception type name would.
+
+    Only ever used to choose between the two literals "other" and None —
+    the segment itself is never emitted — so this heuristic cannot leak.
+    Keeps `exc_type` absent for `lakera_unavailable:no-key` (there was no
+    exception) while still reporting "other" for an unrecognised type.
+    """
+    return bool(seg) and seg.isascii() and seg.isidentifier() and seg[:1].isupper()
+
+
+def _is_infra_reason(reason) -> bool:
+    """True iff `reason` is a positively-recognised setup/infra outage code.
+
+    Default is False: an unrecognised or malformed reason is treated as
+    content-derived and stays opaque. Matching is anchored at the head
+    segment (or at segment 1 behind a known wrapper prefix), never a
+    substring search — `secret_shape:thing_unavailable` is a rule name, not
+    an outage.
+    """
+    if not isinstance(reason, str) or not reason:
+        return False
+    segments = _infra_segments(reason)
+    if segments[0].endswith(_INFRA_REASON_HEAD_SUFFIX):
+        return True
+    if (
+        segments[0] in _INFRA_WRAPPER_PREFIXES
+        and len(segments) > 1
+        and segments[1].endswith(_INFRA_REASON_HEAD_SUFFIX)
+    ):
+        return True
+    return reason in _INFRA_BARE_REASONS
+
+
+def _infra_diagnosis(reason: str) -> dict:
+    """Cast an infra reason into a closed vocabulary. Never returns free text.
+
+    Every string in the result is an `_InfraLayer` / `_InfraCondition`
+    member value or the literal "other"; `http_status` is a real `int`
+    inside [100, 599] or the key is absent. Nothing is passed through from
+    the input — a token that is not a recognised member maps to a
+    fallback, it is never echoed, truncated, or interpolated. That is the
+    whole point: even if a future upstream change starts putting data in
+    `reason`, there is no field here for it to ride out on.
+
+    Total by construction — every branch ends in a declared member — so a
+    malformed reason degrades to `{layer: other, condition: other}` rather
+    than raising on the reject path.
+
+    Call only on a reason `_is_infra_reason` accepted.
+    """
+    segments = _infra_segments(reason)
+
+    # Layer: the `<layer>_unavailable` head, possibly behind a wrapper.
+    head = ""
+    if segments[0].endswith(_INFRA_REASON_HEAD_SUFFIX):
+        head = segments[0]
+    elif (
+        segments[0] in _INFRA_WRAPPER_PREFIXES
+        and len(segments) > 1
+        and segments[1].endswith(_INFRA_REASON_HEAD_SUFFIX)
+    ):
+        head = segments[1]
+    try:
+        layer = _InfraLayer(head[: -len(_INFRA_REASON_HEAD_SUFFIX)]) if head else _InfraLayer.OTHER
+    except ValueError:
+        layer = _InfraLayer.OTHER
+
+    # Condition: a recognised setup token anywhere in the tail, else the
+    # generic outage when the head said `*_unavailable`, else OTHER.
+    condition = _InfraCondition.UNAVAILABLE if head else _InfraCondition.OTHER
+    for seg in segments:
+        if seg in _INFRA_CONDITION_TOKENS:
+            condition = _INFRA_CONDITION_TOKENS[seg]
+            break
+
+    out: dict = {"layer": layer.value, "condition": condition.value}
+
+    # Exception type: last whitelisted name wins. "other" only when some
+    # segment sat in exception position without being recognised; absent
+    # when there was no exception at all (e.g. `lakera_unavailable:no-key`).
+    exc_type = None
+    for seg in reversed(segments):
+        if seg in _INFRA_EXC_TYPES:
+            exc_type = seg
+            break
+    if exc_type is None and any(_looks_like_exc_token(s) for s in segments):
+        exc_type = "other"
+    if exc_type is not None:
+        out["exc_type"] = exc_type
+
+    # HTTP status: only from a pure-ASCII-digit trailing token, coerced to
+    # int and range-checked. `isdigit()` alone accepts non-ASCII digits, so
+    # gate on `isascii()` too; `int()` also accepts `4_2_9`, which
+    # `isdigit()` already rejects.
+    tail = segments[-1] if segments else ""
+    if tail.isascii() and tail.isdigit():
+        status = int(tail)
+        if _INFRA_MIN_HTTP_STATUS <= status <= _INFRA_MAX_HTTP_STATUS:
+            out["http_status"] = status
+    return out
+
+
 def _reject_response(
-    report_id: str, agent_ms: int, t_received: float, t_scan_start: float
+    report_id: str,
+    agent_ms: int,
+    t_received: float,
+    t_scan_start: float,
+    reason: str | None = None,
 ) -> dict:
-    """Generic reject return. No reason, no snippet, no layer info.
+    """Generic reject return. No snippet, no layer info, no report bytes.
 
     Scan timing is bucketized to prevent side-channel fingerprinting of
     which scanner layer rejected.
+
+    `reason` is the raw Verdict reason. It never leaves this function. It
+    is classified, and only when `_is_infra_reason` says it is a
+    setup/infra outage is it cast — via `_infra_diagnosis` — into a closed
+    vocabulary that gets attached under `scanner_infra`. An operator's
+    agent needs to see "Lakera is down"; it does not need, and must not
+    get, a free-form string. A detection reason is dropped on the floor
+    and the payload is byte-identical to the no-reason case.
+
+    Fail-closed is UNCHANGED either way: the caller never gets the report,
+    and the content is quarantined by `_scan_and_deliver` regardless. Only
+    the diagnosis becomes visible. The full raw reason still reaches the
+    isolation-zone audit record for a human.
+
+    The payload is built by naming safe fields explicitly. Never populate
+    it by filtering a Verdict / layers dict — `api_error_detail`,
+    `honeypot_api_errors`, `raw_excerpt` and `sanitized_text` carry
+    provider error bodies that can echo request fragments (they are
+    audit-only for that reason), and a field added upstream tomorrow must
+    default to invisible.
     """
     t_done = time.monotonic()
     raw_scan_ms = int((t_done - t_scan_start) * 1000)
-    return {
+    out = {
         "status": "error",
         "error": "scanner rejected report (quarantined)",
         "report_id": report_id,
@@ -1645,6 +2001,24 @@ def _reject_response(
             "total": int((t_done - t_received) * 1000),
         },
     }
+    if _is_infra_reason(reason):
+        diagnosis = _infra_diagnosis(reason)  # type: ignore[arg-type]
+        # Log the SAME closed-vocabulary value, not the raw reason: no free
+        # text crosses onto this path, into the response or into server.log.
+        # (The boot smoke logs its own raw reason on a different code path;
+        # that is deliberate and untouched.)
+        _LOG.error(
+            "research infra-reject id=%s layer=%s condition=%s exc_type=%s "
+            "http_status=%s — report quarantined fail-closed; fix the named "
+            "scanner dependency and retry",
+            report_id,
+            diagnosis["layer"],
+            diagnosis["condition"],
+            diagnosis.get("exc_type"),
+            diagnosis.get("http_status"),
+        )
+        out[_INFRA_KEY] = diagnosis
+    return out
 
 
 def _scan_error_verdict(exc: BaseException):
@@ -1726,7 +2100,9 @@ def _scan_and_deliver(
                 f"research-agent: quarantine mkdir failed for {report_id}: {e}",
                 file=sys.stderr,
             )
-            return _reject_response(report_id, agent_ms, t_received, t_scan_start)
+            return _reject_response(
+                report_id, agent_ms, t_received, t_scan_start, verdict.reason
+            )
         # Oversized rejects: skip the quarantine-file write and keep the
         # audit-row text field to a fixed ceiling so repeated oversized
         # rejects can't fill the disk.
@@ -1749,7 +2125,9 @@ def _scan_and_deliver(
         _write_quarantine_audit(report_id, prompt, verdict, audit_content)
         from mcp_server.artifact_gate import discard_artifacts
         discard_artifacts(report_id)
-        return _reject_response(report_id, agent_ms, t_received, t_scan_start)
+        return _reject_response(
+            report_id, agent_ms, t_received, t_scan_start, verdict.reason
+        )
 
     dst = REPORTS_DIR / f"{report_id}.md"
     dst.unlink(missing_ok=True)
@@ -1954,8 +2332,112 @@ def _maybe_update_scanner() -> None:
 # finds the scanner healthy again. Fail-closed guarantee preserved (a
 # regressed OR unavailable scanner delivers nothing); reconnect requirement
 # removed; recovery is automatic.
-_SCANNER_HEALTH: dict = {"ok": True, "reason": "", "last_check": 0.0}
-_SCANNER_RECHECK_SECS = float(os.environ.get("RESEARCH_SCANNER_RECHECK_SECS", "60"))
+#
+# The warmup that establishes health now runs on a background thread instead
+# of before mcp.run() (see `_scanner_warmup` / `main`), so it RACES the first
+# tool call. Health therefore starts DEGRADED, not healthy: fail-closed from
+# t=0, and only a passing smoke flips it. Initialising it healthy would open
+# exactly the window this design exists to close — a research() arriving
+# before the first smoke would run against an unverified scanner.
+_SCANNER_HEALTH: dict = {"ok": False, "reason": "warming up", "last_check": 0.0}
+
+# How often a DEGRADED server re-runs the self-test. This is the knob the
+# whole self-healing property hangs on, so both bounds are load bearing:
+#
+#   lo=1 s   — a zero or negative interval makes `now - last_check >= interval`
+#              true on every single call, so every refused research() pays for
+#              a full smoke (~6 live API calls, p50 4.0 s). That is a
+#              self-inflicted DoS on the provider quota and on the caller's
+#              latency, for no extra safety: the gate is already refusing.
+#   hi=3600 s — an absurd interval (a typo'd 60000) leaves the server refusing
+#              for the rest of its life. Auto-recovery-without-a-reconnect is
+#              the reason this gate exists; an hour is already far past any
+#              transient hiccup it is meant to ride out.
+_SCANNER_RECHECK_SECS = _read_secs(
+    os.environ.get("RESEARCH_SCANNER_RECHECK_SECS"),
+    60.0,
+    lo=1.0,
+    hi=3600.0,
+    name="RESEARCH_SCANNER_RECHECK_SECS",
+)
+
+# Set once the warmup thread has resolved, pass or fail. Unset at import so a
+# gate call that beats the warmup can wait for it rather than refuse.
+_SCANNER_WARMUP_DONE = threading.Event()
+
+# Serialises every `run_smoke()` call in this process. Two concurrent smokes
+# would double the API spend (~6 live calls each) and can interleave their
+# writes to `_SCANNER_HEALTH`, publishing a stale verdict last.
+_SCANNER_SMOKE_LOCK = threading.Lock()
+
+# Set while a smoke that outlived `_SCANNER_SMOKE_TIMEOUT_SECS` is STILL
+# running on its worker thread. We abandoned its verdict, but the thread is
+# still holding sockets and making live calls, so starting another smoke on
+# top of it re-creates exactly the double-spend `_SCANNER_SMOKE_LOCK`
+# prevents — and at one re-check a minute would leak a thread per minute for
+# as long as the provider stays wedged. Cleared by the worker itself when it
+# finally returns, so the next re-check runs a fresh smoke and the server
+# still heals by itself.
+_SCANNER_SMOKE_ORPHANED = threading.Event()
+
+# How long a research() call arriving mid-warmup blocks for the verdict before
+# refusing. Sized off the measured boot smoke (2026-09-05: p50 4.0 s, p90
+# 10.1 s, max 22.4 s) so the steady state waits rather than refuses; the
+# tail that exceeds it is the scanner-reinstall path, where refusing with
+# "warming up" beats holding the call open for a 120 s `uv pip install`.
+#
+# lo=0 s is deliberate: "never wait, refuse immediately" is a coherent and
+# still fail-closed operator choice. hi=300 s is the warmup's own worst case
+# (the 120 s `uv pip install` cap at _maybe_update_scanner plus a bounded
+# smoke, with slack) — waiting longer than the warmup can possibly take
+# cannot change the answer, it only holds the tool call open.
+_SCANNER_WARMUP_WAIT_SECS = _read_secs(
+    os.environ.get("RESEARCH_SCANNER_WARMUP_WAIT_SECS"),
+    30.0,
+    lo=0.0,
+    hi=300.0,
+    name="RESEARCH_SCANNER_WARMUP_WAIT_SECS",
+)
+
+# Wall-clock bound on one `run_smoke()`.
+#
+# `injection_scanner.smoke` makes ~6 live HTTP calls and passes no timeout to
+# any of them (verified 2026-09-05: `grep -c timeout` over the installed
+# smoke.py returns 0). An unresponsive provider therefore parks the smoke
+# indefinitely. On the warmup thread that means `_SCANNER_WARMUP_DONE` is
+# never set and every research() is refused "warming up" forever, while the
+# refusal message tells the caller to retry shortly; on the re-check path it
+# means the next gate call blocks on `_SCANNER_SMOKE_LOCK` for as long as the
+# provider stays wedged, hanging the tool call.
+#
+#   lo=1 s   — a sub-second bound would time out every honest smoke and pin
+#              the server degraded permanently. Fail-closed, but uselessly.
+#   hi=600 s — past this the bound is not bounding anything a caller would
+#              wait for; the MCP would look hung either way.
+# Default 120 s ≈ 5x the measured max (22.4 s), so a slow-but-alive provider
+# still completes rather than being killed and reported as a false failure.
+_SCANNER_SMOKE_TIMEOUT_SECS = _read_secs(
+    os.environ.get("RESEARCH_SCANNER_SMOKE_TIMEOUT_SECS"),
+    120.0,
+    lo=1.0,
+    hi=600.0,
+    name="RESEARCH_SCANNER_SMOKE_TIMEOUT_SECS",
+)
+
+# How long a caller waits for `_SCANNER_SMOKE_LOCK` before refusing outright.
+# Same measured basis and same trade as `_SCANNER_WARMUP_WAIT_SECS`: a peer's
+# in-flight smoke normally publishes well inside this, and adopting its
+# verdict beats making the caller retry. Past it we refuse promptly with an
+# accurate reason rather than sitting on the lock for the peer's full budget
+# (which can be `_SCANNER_SMOKE_TIMEOUT_SECS` — far longer than a tool call
+# should ever block).
+_SCANNER_SMOKE_LOCK_WAIT_SECS = _read_secs(
+    os.environ.get("RESEARCH_SCANNER_SMOKE_LOCK_WAIT_SECS"),
+    30.0,
+    lo=0.0,
+    hi=300.0,
+    name="RESEARCH_SCANNER_SMOKE_LOCK_WAIT_SECS",
+)
 
 
 def _run_boot_smoke_once() -> tuple[bool, str]:
@@ -1980,17 +2462,133 @@ def _run_boot_smoke_once() -> tuple[bool, str]:
     return True, ""
 
 
-def _boot_smoke() -> None:
-    """Run the scanner self-test at startup — non-fatal.
+def _run_smoke_bounded() -> tuple[bool, str]:
+    """`_run_boot_smoke_once()` with a wall-clock bound. Never raises.
 
-    On failure the server starts DEGRADED (see `_SCANNER_HEALTH`) rather
-    than exiting: it binds stdio and stays connected, but `research()`
-    rejects every call fail-closed until `_scanner_health_gate` re-checks
-    and finds the scanner healthy again. Costs one Anthropic + two OpenAI
-    round-trips at boot.
+    `run_smoke()` sets no timeout on its own HTTP calls, so the only way to
+    bound it from out here is to run it somewhere we can walk away from.
+    A daemon worker thread + `join(timeout)` does that. Deliberately NOT
+    `signal.alarm`: signals are main-thread-only and every caller of this
+    (the warmup thread, a FastMCP request thread) is not the main thread.
+
+    Timing out ABANDONS the worker rather than cancelling it — Python has no
+    safe way to kill a thread parked in a socket read. The worker is a daemon
+    so it can never hold the process open, and `_SCANNER_SMOKE_ORPHANED`
+    keeps a later caller from stacking a second smoke on top of it.
+
+    Fail-closed in every branch: a timeout, a raise, and a worker that
+    finished without leaving a verdict all return (False, reason). Nothing
+    here can return True without a passing smoke behind it.
     """
-    ok, reason = _run_boot_smoke_once()
-    _SCANNER_HEALTH.update(ok=ok, reason=reason, last_check=time.monotonic())
+    if _SCANNER_SMOKE_ORPHANED.is_set():
+        # A previous smoke blew its budget and is still out there. Refusing
+        # is both cheaper and more honest than racing it.
+        _LOG.warning("previous scanner smoke still running — refusing fail-closed")
+        return False, "smoke_timeout:previous check still running"
+
+    verdict: dict[str, tuple[bool, str]] = {}
+    # Set BEFORE the worker starts, cleared by the worker itself. Ordering
+    # matters: the worker's `finally` runs before the thread terminates, and
+    # `join()` returns only after termination, so a worker we successfully
+    # joined has always already cleared the flag. Setting it after a failed
+    # join instead would race a worker that finished in that same window and
+    # leave the flag stuck set forever.
+    _SCANNER_SMOKE_ORPHANED.set()
+
+    def _worker() -> None:
+        try:
+            verdict["v"] = _run_boot_smoke_once()
+        except Exception as e:  # unavailable == degraded; never raised at a caller
+            _LOG.exception("boot smoke raised — treating scanner as unavailable")
+            verdict["v"] = (False, f"scanner_unavailable:{type(e).__name__}")
+        finally:
+            _SCANNER_SMOKE_ORPHANED.clear()
+
+    t = threading.Thread(target=_worker, name="scanner-smoke", daemon=True)
+    try:
+        t.start()
+    except RuntimeError:
+        # Could not spawn (fd/thread exhaustion). Nothing will ever clear the
+        # flag we just set, and a stuck flag refuses every future smoke — the
+        # server would never heal again. Clear it here and refuse this one.
+        _SCANNER_SMOKE_ORPHANED.clear()
+        _LOG.exception("could not start the smoke worker — refusing fail-closed")
+        return False, "scanner_unavailable:RuntimeError"
+    t.join(_SCANNER_SMOKE_TIMEOUT_SECS)
+
+    got = verdict.get("v")
+    if got is None:
+        _LOG.error(
+            "scanner smoke exceeded %.0fs — abandoning it and refusing fail-closed",
+            _SCANNER_SMOKE_TIMEOUT_SECS,
+        )
+        return False, f"smoke_timeout:{_SCANNER_SMOKE_TIMEOUT_SECS:g}s"
+    return got
+
+
+def _smoke_and_publish(
+    seen_last_check: float | None = None,
+    lock_wait: float | None = None,
+) -> tuple[bool, str]:
+    """Run the self-test under `_SCANNER_SMOKE_LOCK` and publish the verdict.
+
+    Every path that runs a smoke goes through here, so the warmup thread and
+    any number of concurrent `_scanner_health_gate()` callers can never be
+    inside `run_smoke()` at the same time.
+
+    `seen_last_check` is the `last_check` the caller observed BEFORE it
+    queued for the lock. If it has moved by the time the lock is acquired, a
+    peer already refreshed while we waited and we adopt their result instead
+    of paying for a second smoke — double-checked locking, compared by value
+    rather than by elapsed time so it does not depend on where
+    `time.monotonic()` happens to start on this platform.
+
+    `lock_wait` bounds the queueing itself (default
+    `_SCANNER_SMOKE_LOCK_WAIT_SECS`). An unbounded `with _SCANNER_SMOKE_LOCK`
+    made a gate call inherit the peer's entire smoke budget, so one wedged
+    provider hung the tool call instead of refusing it. Failing to acquire is
+    a refusal with its own reason, and publishes nothing — we never checked,
+    so we must not overwrite what the last real check concluded.
+
+    An unexpected exception (an unimportable or broken scanner package) is
+    mapped to a degraded verdict by `_run_smoke_bounded`, not raised:
+    unavailable is refused exactly like regressed, and a gate call must never
+    surface a traceback in place of a fail-closed refusal.
+    """
+    if lock_wait is None:
+        lock_wait = _SCANNER_SMOKE_LOCK_WAIT_SECS
+    # acquire(timeout=0) is rejected by threading.Lock; -1 means "block
+    # forever", which is the thing we are removing. Map a zero budget onto a
+    # genuine non-blocking try.
+    if lock_wait > 0:
+        acquired = _SCANNER_SMOKE_LOCK.acquire(timeout=lock_wait)
+    else:
+        acquired = _SCANNER_SMOKE_LOCK.acquire(blocking=False)
+    if not acquired:
+        _LOG.warning(
+            "scanner smoke lock busy after %.2fs — refusing fail-closed", lock_wait
+        )
+        return False, "scanner_check_in_progress"
+    try:
+        if seen_last_check is not None and _SCANNER_HEALTH["last_check"] != seen_last_check:
+            return _SCANNER_HEALTH["ok"], _SCANNER_HEALTH["reason"]
+        ok, reason = _run_smoke_bounded()
+        _SCANNER_HEALTH.update(ok=ok, reason=reason, last_check=time.monotonic())
+    finally:
+        _SCANNER_SMOKE_LOCK.release()
+    return ok, reason
+
+
+def _boot_smoke() -> None:
+    """Run the scanner self-test — non-fatal.
+
+    Runs on the warmup thread now, not before `mcp.run()`. On failure the
+    server stays DEGRADED (see `_SCANNER_HEALTH`): it is bound and connected,
+    but `research()` rejects every call fail-closed until
+    `_scanner_health_gate` re-checks and finds the scanner healthy again.
+    Costs one Anthropic + two OpenAI round-trips.
+    """
+    ok, reason = _smoke_and_publish()
     if not ok:
         import logging
         logging.getLogger("research-agent.boot").error(
@@ -2004,21 +2602,92 @@ def _boot_smoke() -> None:
 def _scanner_health_gate() -> tuple[bool, str]:
     """Whether the scanner is healthy enough to serve a research call.
 
-    Healthy path is a no-op (boot smoke already verified it; per-scan
+    Healthy path is a no-op (the warmup smoke verified it; per-scan
     fail-closed covers the rest). When degraded, re-run the self-test at
     most once per `_SCANNER_RECHECK_SECS` so the server auto-heals without
     a reconnect. Returns (ok, reason).
+
+    CONCURRENCY DECISION — a call arriving during warmup BLOCKS for the
+    verdict (bounded by `_SCANNER_WARMUP_WAIT_SECS`), it does not refuse
+    immediately and it does not start a second smoke.
+
+    Why blocking rather than refusing outright: the warmup now races the
+    first tool call, and the measured smoke is p50 4 s / p90 10 s against a
+    research() that runs 1.5-3 minutes. Waiting ten seconds is invisible;
+    an immediate refusal costs the caller a failed tool call and a manual
+    retry for a server that was about to be fine.
+
+    Why not simply fall through to the throttled re-check: `last_check` is
+    0.0 at import, so `now - last_check >= _SCANNER_RECHECK_SECS` is true on
+    the very first call. Without this wait the first gate call would fire
+    its own smoke alongside the warmup thread's — the exact double-smoke the
+    lock exists to prevent, just moved one layer out. Waiting on the event
+    makes the gate reuse the warmup's result instead of racing it.
+
+    Fail-closed is preserved in every branch: if the wait expires with the
+    warmup still running we refuse with "warming up" rather than proceed; if
+    the re-check cannot get the smoke lock inside its budget, or the smoke
+    itself blows its budget, we refuse with that reason; and we never return
+    True without a passing smoke behind it.
     """
     if _SCANNER_HEALTH["ok"]:
         return True, ""
-    now = time.monotonic()
-    if now - _SCANNER_HEALTH["last_check"] >= _SCANNER_RECHECK_SECS:
-        ok, reason = _run_boot_smoke_once()
-        _SCANNER_HEALTH.update(ok=ok, reason=reason, last_check=now)
+
+    if not _SCANNER_WARMUP_DONE.is_set():
+        _SCANNER_WARMUP_DONE.wait(timeout=_SCANNER_WARMUP_WAIT_SECS)
+        if _SCANNER_HEALTH["ok"]:
+            return True, ""
+        if not _SCANNER_WARMUP_DONE.is_set():
+            # Still warming past the budget — a scanner reinstall, say.
+            # Refuse with a clear reason instead of holding the call open.
+            _LOG.warning(
+                "scanner still warming after %.0fs — refusing fail-closed",
+                _SCANNER_WARMUP_WAIT_SECS,
+            )
+            return False, _SCANNER_HEALTH["reason"]
+
+    seen = _SCANNER_HEALTH["last_check"]
+    # `_read_secs` guarantees a finite, positive interval, which is what keeps
+    # this comparison meaningful — a NaN here would make it False forever and
+    # the re-check would never fire again. Note the direction of that failure
+    # is still closed (we fall through to the refusal below), so the clamp
+    # buys self-healing, not safety.
+    if time.monotonic() - seen >= _SCANNER_RECHECK_SECS:
+        ok, reason = _smoke_and_publish(seen_last_check=seen)
         if ok:
             _LOG.info("scanner recovered — resuming normal service")
             return True, ""
+        return False, reason
     return False, _SCANNER_HEALTH["reason"]
+
+
+def _scanner_warmup() -> None:
+    """Boot work moved off the MCP pre-handshake path.
+
+    `_maybe_update_scanner()` (a `git ls-remote`, and on a bump a 120 s
+    `uv pip install`) plus `_boot_smoke()` (~6 live API calls) used to run
+    before `mcp.run()` bound stdio. The client enforces a hard 30 s startup
+    deadline, and those round-trips were burning p90 16 s of it — 3.3% of
+    spawns died on CONNECT_TIMEOUT (measured 2026-09-05, 3708 spawns).
+
+    Running them here instead means the handshake completes immediately and
+    the scanner is verified concurrently. `_SCANNER_HEALTH` starts degraded
+    so nothing is served while this is in flight.
+
+    Never raises: this is a daemon thread with no one to catch for it, and a
+    thread that dies before setting `_SCANNER_WARMUP_DONE` would strand every
+    gate call on the full wait. The update is best-effort (a stale scanner
+    still has to pass the smoke below); a smoke that blows up is published as
+    degraded by `_smoke_and_publish`.
+    """
+    try:
+        try:
+            _maybe_update_scanner()
+        except Exception:  # best-effort; the smoke below is the real gate
+            _LOG.exception("scanner update failed — continuing with installed version")
+        _boot_smoke()
+    finally:
+        _SCANNER_WARMUP_DONE.set()
 
 
 def _log_credentials_state() -> None:
@@ -2054,10 +2723,19 @@ def main() -> None:
     "mcp_server.server:main"` and produce a binary on PATH. Lets the
     Nix wrapper at `home/research-agent.nix` shell out without having
     to know the project layout.
+
+    Nothing that touches the network may run before `mcp.run()` — stdio
+    only binds there, and the client gives the whole startup 30 s. The
+    scanner update and self-test go to a daemon thread (`_scanner_warmup`)
+    that runs alongside the bound server; `_log_credentials_state` stays
+    because it is a local `os.stat`. Fail-closed is unaffected:
+    `_SCANNER_HEALTH` starts degraded, so the server is connected but
+    refusing until the warmup publishes a passing smoke.
     """
     _log_credentials_state()
-    _maybe_update_scanner()
-    _boot_smoke()
+    threading.Thread(
+        target=_scanner_warmup, name="scanner-warmup", daemon=True
+    ).start()
     mcp.run()
 
 

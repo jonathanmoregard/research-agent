@@ -3,11 +3,56 @@ of killing it, research() refuses fail-closed while degraded, and the
 gate auto-heals on recovery without a reconnect."""
 from __future__ import annotations
 
+import math
+import threading
+import time
+
+import pytest
+
 import mcp_server.server as server
 
 
 def _reset_health():
     server._SCANNER_HEALTH.update(ok=True, reason="", last_check=0.0)
+    # These cases are all about steady-state behaviour, after the background
+    # warmup has resolved. Without this the gate would (correctly) sit on
+    # _SCANNER_WARMUP_WAIT_SECS waiting for a warmup that never runs here.
+    # Warmup-window behaviour is covered by tests/test_lazy_boot_warmup.py.
+    server._SCANNER_WARMUP_DONE.set()
+
+
+@pytest.fixture(autouse=True)
+def _restore_module_state():
+    """Leave the module settled, healthy and warmup-finished so no case here
+    can contaminate a later test that calls research() without its own reset.
+
+    `test_gate_throttles_recheck` in particular used to exit leaving
+    _SCANNER_HEALTH degraded with a fresh last_check, which refuses every
+    later research() that does not reset for itself — order-dependent
+    contamination that only shows up when the suite is resharded.
+
+    Same fixture as tests/test_lazy_boot_warmup.py — these two files are the
+    only ones that mutate the live scanner-health globals, and they must
+    restore identically or the order they happen to run in becomes load
+    bearing.
+    """
+    yield
+    server._SCANNER_HEALTH.update(ok=True, reason="", last_check=0.0)
+    server._SCANNER_WARMUP_DONE.set()
+    server._SCANNER_SMOKE_ORPHANED.clear()
+
+
+def _stale_last_check() -> float:
+    """A monotonic timestamp old enough that any admissible recheck interval
+    has already elapsed.
+
+    Not 0.0: `time.monotonic()` is CLOCK_MONOTONIC, which on Linux counts
+    from boot. On a fresh CI microVM or container 0.0 is roughly *now*, so
+    `now - 0.0 >= _SCANNER_RECHECK_SECS` is False and the throttle is not
+    bypassed at all — the probe never runs and the test fails for a reason
+    that has nothing to do with the gate.
+    """
+    return time.monotonic() - 86_400.0
 
 
 def test_boot_smoke_failure_is_non_fatal(monkeypatch):
@@ -36,7 +81,9 @@ def test_research_refused_while_degraded_without_running_agent(monkeypatch):
 def test_gate_auto_heals_after_recheck(monkeypatch):
     _reset_health()
     # Degraded, last check long ago so a re-check is due.
-    server._SCANNER_HEALTH.update(ok=False, reason="honeypot_unavailable:x", last_check=0.0)
+    server._SCANNER_HEALTH.update(
+        ok=False, reason="honeypot_unavailable:x", last_check=_stale_last_check()
+    )
     monkeypatch.setattr(server, "_run_boot_smoke_once", lambda: (True, ""))
     ok, reason = server._scanner_health_gate()
     assert ok is True
@@ -63,3 +110,107 @@ def test_healthy_gate_is_noop(monkeypatch):
     )
     ok, reason = server._scanner_health_gate()
     assert ok is True and reason == ""
+
+
+# --- tolerant parsing of the seconds knobs -----------------------------------
+#
+# These are parsed at module scope, before stdio is bound, so a bare float()
+# turns an operator typo into a server that dies during the MCP handshake.
+# Worse, float() accepts "nan": every comparison against NaN is False, so
+# `now - last_check >= nan` never fires and a degraded server silently stops
+# self-healing. Mirrors tests/test_vm_lock.py::test_read_slots_parsing.
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, 60.0),        # unset -> documented default
+        ("", 60.0),          # `export X=` means "unset", not "force empty"
+        ("30", 30.0),
+        ("30.5", 30.5),
+        ("  45 ", 45.0),
+        ("abc", 60.0),       # malformed -> default, never ValueError at import
+        ("nan", 60.0),       # parses as a float and then poisons every compare
+        ("inf", 60.0),
+        ("-inf", 60.0),
+        ("1e400", 60.0),     # overflows to inf
+        ("0", 1.0),          # a zero interval re-smokes on every single call
+        ("-5", 1.0),
+        ("999999", 3600.0),  # an absurd interval stops self-healing entirely
+    ],
+)
+def test_read_secs_parsing(raw, expected):
+    assert server._read_secs(raw, 60.0, lo=1.0, hi=3600.0, name="X") == expected
+
+
+def test_scanner_seconds_knobs_are_finite_and_usable():
+    """Whatever the environment said, the live constants must be values the
+    gate can actually act on — a non-finite recheck interval would leave a
+    degraded server refusing forever."""
+    assert math.isfinite(server._SCANNER_RECHECK_SECS)
+    assert server._SCANNER_RECHECK_SECS > 0
+    assert math.isfinite(server._SCANNER_WARMUP_WAIT_SECS)
+    assert server._SCANNER_WARMUP_WAIT_SECS >= 0
+    assert math.isfinite(server._SCANNER_SMOKE_TIMEOUT_SECS)
+    assert server._SCANNER_SMOKE_TIMEOUT_SECS > 0
+
+
+def test_a_nan_recheck_interval_cannot_wedge_the_gate(monkeypatch):
+    """Belt and braces on the clamp: even if a NaN reached the interval, the
+    gate must refuse rather than return healthy."""
+    _reset_health()
+    server._SCANNER_HEALTH.update(
+        ok=False, reason="degraded", last_check=_stale_last_check()
+    )
+    monkeypatch.setattr(server, "_SCANNER_RECHECK_SECS", float("nan"))
+    monkeypatch.setattr(server, "_run_boot_smoke_once", lambda: (True, ""))
+    ok, _ = server._scanner_health_gate()
+    assert ok is False, "a poisoned interval must fail closed, never open"
+
+
+# --- the smoke is bounded ----------------------------------------------------
+#
+# injection_scanner.smoke.run_smoke() makes ~6 live HTTP calls and passes no
+# timeout to any of them (verified: `grep -c timeout` over the installed
+# smoke.py returns 0). A wedged provider therefore parks the smoke forever
+# while it holds _SCANNER_SMOKE_LOCK.
+
+
+def test_gate_refuses_promptly_when_a_peer_smoke_holds_the_lock(monkeypatch):
+    """A gate call that cannot get the smoke lock inside its budget must
+    refuse fail-closed, not block on the lock for as long as the peer runs."""
+    _reset_health()
+    server._SCANNER_HEALTH.update(
+        ok=False, reason="degraded", last_check=_stale_last_check()
+    )
+    monkeypatch.setattr(server, "_SCANNER_SMOKE_LOCK_WAIT_SECS", 0.05)
+    monkeypatch.setattr(
+        server, "_run_boot_smoke_once",
+        lambda: (_ for _ in ()).throw(AssertionError("must not smoke behind the lock")),
+    )
+
+    release = threading.Event()
+    holding = threading.Event()
+
+    def _squat():
+        with server._SCANNER_SMOKE_LOCK:
+            holding.set()
+            release.wait(30)
+
+    t = threading.Thread(target=_squat, daemon=True)
+    t.start()
+    try:
+        assert holding.wait(5), "helper never took the lock"
+        t0 = time.monotonic()
+        ok, reason = server._scanner_health_gate()
+        elapsed = time.monotonic() - t0
+    finally:
+        release.set()
+        t.join(10)
+
+    assert ok is False
+    assert reason, "a refusal must carry a reason the caller can act on"
+    assert elapsed < 5.0, (
+        f"gate blocked {elapsed:.1f}s on a held smoke lock — the acquisition "
+        "is still unbounded"
+    )
