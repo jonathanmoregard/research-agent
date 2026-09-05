@@ -1954,8 +1954,33 @@ def _maybe_update_scanner() -> None:
 # finds the scanner healthy again. Fail-closed guarantee preserved (a
 # regressed OR unavailable scanner delivers nothing); reconnect requirement
 # removed; recovery is automatic.
-_SCANNER_HEALTH: dict = {"ok": True, "reason": "", "last_check": 0.0}
+#
+# The warmup that establishes health now runs on a background thread instead
+# of before mcp.run() (see `_scanner_warmup` / `main`), so it RACES the first
+# tool call. Health therefore starts DEGRADED, not healthy: fail-closed from
+# t=0, and only a passing smoke flips it. Initialising it healthy would open
+# exactly the window this design exists to close — a research() arriving
+# before the first smoke would run against an unverified scanner.
+_SCANNER_HEALTH: dict = {"ok": False, "reason": "warming up", "last_check": 0.0}
 _SCANNER_RECHECK_SECS = float(os.environ.get("RESEARCH_SCANNER_RECHECK_SECS", "60"))
+
+# Set once the warmup thread has resolved, pass or fail. Unset at import so a
+# gate call that beats the warmup can wait for it rather than refuse.
+_SCANNER_WARMUP_DONE = threading.Event()
+
+# Serialises every `run_smoke()` call in this process. Two concurrent smokes
+# would double the API spend (~6 live calls each) and can interleave their
+# writes to `_SCANNER_HEALTH`, publishing a stale verdict last.
+_SCANNER_SMOKE_LOCK = threading.Lock()
+
+# How long a research() call arriving mid-warmup blocks for the verdict before
+# refusing. Sized off the measured boot smoke (2026-09-05: p50 4.0 s, p90
+# 10.1 s, max 22.4 s) so the steady state waits rather than refuses; the
+# tail that exceeds it is the scanner-reinstall path, where refusing with
+# "warming up" beats holding the call open for a 120 s `uv pip install`.
+_SCANNER_WARMUP_WAIT_SECS = float(
+    os.environ.get("RESEARCH_SCANNER_WARMUP_WAIT_SECS", "30")
+)
 
 
 def _run_boot_smoke_once() -> tuple[bool, str]:
@@ -1980,17 +2005,47 @@ def _run_boot_smoke_once() -> tuple[bool, str]:
     return True, ""
 
 
-def _boot_smoke() -> None:
-    """Run the scanner self-test at startup — non-fatal.
+def _smoke_and_publish(seen_last_check: float | None = None) -> tuple[bool, str]:
+    """Run the self-test under `_SCANNER_SMOKE_LOCK` and publish the verdict.
 
-    On failure the server starts DEGRADED (see `_SCANNER_HEALTH`) rather
-    than exiting: it binds stdio and stays connected, but `research()`
-    rejects every call fail-closed until `_scanner_health_gate` re-checks
-    and finds the scanner healthy again. Costs one Anthropic + two OpenAI
-    round-trips at boot.
+    Every path that runs a smoke goes through here, so the warmup thread and
+    any number of concurrent `_scanner_health_gate()` callers can never be
+    inside `run_smoke()` at the same time.
+
+    `seen_last_check` is the `last_check` the caller observed BEFORE it
+    queued for the lock. If it has moved by the time the lock is acquired, a
+    peer already refreshed while we waited and we adopt their result instead
+    of paying for a second smoke — double-checked locking, compared by value
+    rather than by elapsed time so it does not depend on where
+    `time.monotonic()` happens to start on this platform.
+
+    An unexpected exception (an unimportable or broken scanner package) is
+    mapped to a degraded verdict, not raised: unavailable is refused exactly
+    like regressed, and a gate call must never surface a traceback in place
+    of a fail-closed refusal.
     """
-    ok, reason = _run_boot_smoke_once()
-    _SCANNER_HEALTH.update(ok=ok, reason=reason, last_check=time.monotonic())
+    with _SCANNER_SMOKE_LOCK:
+        if seen_last_check is not None and _SCANNER_HEALTH["last_check"] != seen_last_check:
+            return _SCANNER_HEALTH["ok"], _SCANNER_HEALTH["reason"]
+        try:
+            ok, reason = _run_boot_smoke_once()
+        except Exception as e:  # unavailable == degraded; never raise past the gate
+            ok, reason = False, f"scanner_unavailable:{type(e).__name__}"
+            _LOG.exception("boot smoke raised — treating scanner as unavailable")
+        _SCANNER_HEALTH.update(ok=ok, reason=reason, last_check=time.monotonic())
+    return ok, reason
+
+
+def _boot_smoke() -> None:
+    """Run the scanner self-test — non-fatal.
+
+    Runs on the warmup thread now, not before `mcp.run()`. On failure the
+    server stays DEGRADED (see `_SCANNER_HEALTH`): it is bound and connected,
+    but `research()` rejects every call fail-closed until
+    `_scanner_health_gate` re-checks and finds the scanner healthy again.
+    Costs one Anthropic + two OpenAI round-trips.
+    """
+    ok, reason = _smoke_and_publish()
     if not ok:
         import logging
         logging.getLogger("research-agent.boot").error(
@@ -2004,21 +2059,85 @@ def _boot_smoke() -> None:
 def _scanner_health_gate() -> tuple[bool, str]:
     """Whether the scanner is healthy enough to serve a research call.
 
-    Healthy path is a no-op (boot smoke already verified it; per-scan
+    Healthy path is a no-op (the warmup smoke verified it; per-scan
     fail-closed covers the rest). When degraded, re-run the self-test at
     most once per `_SCANNER_RECHECK_SECS` so the server auto-heals without
     a reconnect. Returns (ok, reason).
+
+    CONCURRENCY DECISION — a call arriving during warmup BLOCKS for the
+    verdict (bounded by `_SCANNER_WARMUP_WAIT_SECS`), it does not refuse
+    immediately and it does not start a second smoke.
+
+    Why blocking rather than refusing outright: the warmup now races the
+    first tool call, and the measured smoke is p50 4 s / p90 10 s against a
+    research() that runs 1.5-3 minutes. Waiting ten seconds is invisible;
+    an immediate refusal costs the caller a failed tool call and a manual
+    retry for a server that was about to be fine.
+
+    Why not simply fall through to the throttled re-check: `last_check` is
+    0.0 at import, so `now - last_check >= _SCANNER_RECHECK_SECS` is true on
+    the very first call. Without this wait the first gate call would fire
+    its own smoke alongside the warmup thread's — the exact double-smoke the
+    lock exists to prevent, just moved one layer out. Waiting on the event
+    makes the gate reuse the warmup's result instead of racing it.
+
+    Fail-closed is preserved in every branch: if the wait expires with the
+    warmup still running we refuse with "warming up" rather than proceed,
+    and we never return True without a passing smoke behind it.
     """
     if _SCANNER_HEALTH["ok"]:
         return True, ""
-    now = time.monotonic()
-    if now - _SCANNER_HEALTH["last_check"] >= _SCANNER_RECHECK_SECS:
-        ok, reason = _run_boot_smoke_once()
-        _SCANNER_HEALTH.update(ok=ok, reason=reason, last_check=now)
+
+    if not _SCANNER_WARMUP_DONE.is_set():
+        _SCANNER_WARMUP_DONE.wait(timeout=_SCANNER_WARMUP_WAIT_SECS)
+        if _SCANNER_HEALTH["ok"]:
+            return True, ""
+        if not _SCANNER_WARMUP_DONE.is_set():
+            # Still warming past the budget — a scanner reinstall, say.
+            # Refuse with a clear reason instead of holding the call open.
+            _LOG.warning(
+                "scanner still warming after %.0fs — refusing fail-closed",
+                _SCANNER_WARMUP_WAIT_SECS,
+            )
+            return False, _SCANNER_HEALTH["reason"]
+
+    seen = _SCANNER_HEALTH["last_check"]
+    if time.monotonic() - seen >= _SCANNER_RECHECK_SECS:
+        ok, reason = _smoke_and_publish(seen_last_check=seen)
         if ok:
             _LOG.info("scanner recovered — resuming normal service")
             return True, ""
+        return False, reason
     return False, _SCANNER_HEALTH["reason"]
+
+
+def _scanner_warmup() -> None:
+    """Boot work moved off the MCP pre-handshake path.
+
+    `_maybe_update_scanner()` (a `git ls-remote`, and on a bump a 120 s
+    `uv pip install`) plus `_boot_smoke()` (~6 live API calls) used to run
+    before `mcp.run()` bound stdio. The client enforces a hard 30 s startup
+    deadline, and those round-trips were burning p90 16 s of it — 3.3% of
+    spawns died on CONNECT_TIMEOUT (measured 2026-09-05, 3708 spawns).
+
+    Running them here instead means the handshake completes immediately and
+    the scanner is verified concurrently. `_SCANNER_HEALTH` starts degraded
+    so nothing is served while this is in flight.
+
+    Never raises: this is a daemon thread with no one to catch for it, and a
+    thread that dies before setting `_SCANNER_WARMUP_DONE` would strand every
+    gate call on the full wait. The update is best-effort (a stale scanner
+    still has to pass the smoke below); a smoke that blows up is published as
+    degraded by `_smoke_and_publish`.
+    """
+    try:
+        try:
+            _maybe_update_scanner()
+        except Exception:  # best-effort; the smoke below is the real gate
+            _LOG.exception("scanner update failed — continuing with installed version")
+        _boot_smoke()
+    finally:
+        _SCANNER_WARMUP_DONE.set()
 
 
 def _log_credentials_state() -> None:
@@ -2054,10 +2173,19 @@ def main() -> None:
     "mcp_server.server:main"` and produce a binary on PATH. Lets the
     Nix wrapper at `home/research-agent.nix` shell out without having
     to know the project layout.
+
+    Nothing that touches the network may run before `mcp.run()` — stdio
+    only binds there, and the client gives the whole startup 30 s. The
+    scanner update and self-test go to a daemon thread (`_scanner_warmup`)
+    that runs alongside the bound server; `_log_credentials_state` stays
+    because it is a local `os.stat`. Fail-closed is unaffected:
+    `_SCANNER_HEALTH` starts degraded, so the server is connected but
+    refusing until the warmup publishes a passing smoke.
     """
     _log_credentials_state()
-    _maybe_update_scanner()
-    _boot_smoke()
+    threading.Thread(
+        target=_scanner_warmup, name="scanner-warmup", daemon=True
+    ).start()
     mcp.run()
 
 

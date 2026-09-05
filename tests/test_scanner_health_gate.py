@@ -8,6 +8,11 @@ import mcp_server.server as server
 
 def _reset_health():
     server._SCANNER_HEALTH.update(ok=True, reason="", last_check=0.0)
+    # These cases are all about steady-state behaviour, after the background
+    # warmup has resolved. Without this the gate would (correctly) sit on
+    # _SCANNER_WARMUP_WAIT_SECS waiting for a warmup that never runs here.
+    # Warmup-window behaviour is covered by tests/test_lazy_boot_warmup.py.
+    server._SCANNER_WARMUP_DONE.set()
 
 
 def test_boot_smoke_failure_is_non_fatal(monkeypatch):
