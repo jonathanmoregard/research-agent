@@ -8,11 +8,11 @@ Exposes one tool:
 Flow per call:
   1. Host MCP server receives prompt.
   2. ssh into the long-running research-agent microvm on 127.0.0.1:2223
-     (port-forwarded by microvm.nix from the guest's port 22). Six
-     null-terminated fields (claude_token, exa, tavily, euipo_client_id,
-     euipo_client_secret, prompt_body) ship over stdin; a guest-side
-     inline bash writes the prompt to a tmp file under the agent user's
-     $HOME and execs scripts/run-agent.sh.
+     (port-forwarded by microvm.nix from the guest's port 22). Seven
+     null-terminated fields (claude_token, codex_auth_json, exa, tavily,
+     euipo_client_id, euipo_client_secret, prompt_body) ship over stdin; a
+     guest-side inline bash writes the prompt to a tmp file under the agent
+     user's $HOME and execs scripts/run-agent.sh.
   3. scripts/run-agent.sh spawns a fresh bubblewrap jail — new tmpfs
      $HOME, new tmpfs /tmp, read-only system, writable-only to one
      pre-created report file under /out/<uuid>.md (virtiofs share of
@@ -282,6 +282,10 @@ _CLAUDE_CREDENTIALS_PATH = Path(
     os.environ.get("CLAUDE_CREDENTIALS_FILE")
     or (Path.home() / ".claude" / ".credentials.json")
 )
+_CODEX_AUTH_PATH = Path(
+    os.environ.get("CODEX_AUTH_FILE")
+    or (Path.home() / ".codex" / "auth.json")
+)
 # Read at import-time on purpose. Same convention as `_LOG_PATH`,
 # `REPORTS_DIR`, `AGENT_TIMEOUT` — values that must be stable for the
 # server's lifetime so concurrent callers see a single agreed path.
@@ -352,6 +356,59 @@ def _load_claude_credentials_token() -> str | None:
     return None
 
 
+def _load_codex_auth_json() -> str | None:
+    """Read a bounded, regular Codex auth file for the ephemeral guest.
+
+    The complete JSON document is required because ChatGPT authentication uses
+    a refresh token as well as the short-lived access token.  It is never
+    logged or cached and is re-read for each call so Codex token rotation is
+    picked up.  The same O_NOFOLLOW and size discipline as the Claude
+    credential loader prevents symlink redirection and unbounded reads.
+    """
+    max_bytes = 64 * 1024
+    try:
+        fd = os.open(
+            _CODEX_AUTH_PATH,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if (
+            not stat_mod.S_ISREG(st.st_mode)
+            or st.st_uid != os.getuid()
+            or (st.st_mode & 0o077) != 0
+            or st.st_size > max_bytes
+        ):
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            fd = -1
+            raw = f.read(max_bytes + 1)
+    except UnicodeError:
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw.encode("utf-8")) > max_bytes:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    # Accept both ChatGPT-token and API-key auth shapes supported by Codex,
+    # while rejecting an arbitrary or type-confused JSON document.
+    tokens = parsed.get("tokens")
+    api_key = parsed.get("OPENAI_API_KEY")
+    has_tokens = isinstance(tokens, dict) and bool(tokens)
+    has_api_key = isinstance(api_key, str) and bool(api_key)
+    if not (has_tokens or has_api_key):
+        return None
+    return raw
+
+
 def _resolve_secret(name: str) -> str | None:
     """Resolve one secret. For `claude-token` the credentials file
     wins over the env var; for all other secrets, env-first.
@@ -393,9 +450,7 @@ def _resolve_secret(name: str) -> str | None:
 
 
 def _secrets() -> dict[str, str]:
-    """Load secrets per server startup and re-resolve `claude-token`
-    per call so token refreshes by `claude /login` are picked up
-    without a server respawn.
+    """Cache static tool secrets and re-read provider auth per call.
 
     Cache scope: the long-lived secrets (`exa-api-key`,
     `tavily-api-key`) are populated once and held in
@@ -403,9 +458,10 @@ def _secrets() -> dict[str, str]:
     Claude Code rewrites `~/.claude/.credentials.json` whenever it
     refreshes the access token (typically every 8 hours), and a
     process-lifetime cache would pin research-agent to a token that
-    has since expired.
+    has since expired. Codex's complete auth JSON is likewise re-read so its
+    access and refresh-token rotation is picked up.
 
-    Tokens never touch disk inside this process. The values flow
+    Provider credentials never touch a new disk file inside this process. The values flow
     straight into the ssh stdin payload to the microvm and from
     there into the agent's environment via `--setenv`.
 
@@ -413,7 +469,7 @@ def _secrets() -> dict[str, str]:
     `claude-token`, `~/.claude/.credentials.json` → GNOME keyring.
 
     Scope: this function returns secrets needed by the *agent-side*
-    paths (`claude-token`, `exa-api-key`, `tavily-api-key`).
+    paths (`claude-token`, `codex-auth-json`, `exa-api-key`, `tavily-api-key`).
     Scanner keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) are read
     directly from `os.environ` inside `injection_scanner.honeypot`
     and don't pass through here.
@@ -427,6 +483,11 @@ def _secrets() -> dict[str, str]:
         out["claude-token"] = tok
     elif "claude-token" in out:
         out.pop("claude-token")
+    codex_auth = _load_codex_auth_json()
+    if codex_auth:
+        out["codex-auth-json"] = codex_auth
+    else:
+        out.pop("codex-auth-json", None)
     for name in (
         "exa-api-key",
         "tavily-api-key",
@@ -461,13 +522,29 @@ _SSH_WAIT_SECS = int(os.environ.get("RESEARCH_SSH_WAIT_SECS", "200"))
 _LIMIT_FALLBACK_MODEL = os.environ.get(
     "RESEARCH_LIMIT_FALLBACK_MODEL", "claude-opus-4-7"
 )
+# Cross-provider fallback after Claude quota exhaustion.  `codex` is the only
+# supported value; an empty string disables it.  This remains operator config,
+# not an MCP argument, so untrusted callers cannot select a new executable.
+_LIMIT_FALLBACK_PROVIDER = os.environ.get(
+    "RESEARCH_LIMIT_FALLBACK_PROVIDER", "codex"
+)
+if _LIMIT_FALLBACK_PROVIDER not in ("", "codex"):
+    _LOG.warning(
+        "ignoring invalid RESEARCH_LIMIT_FALLBACK_PROVIDER=%r",
+        _LIMIT_FALLBACK_PROVIDER,
+    )
+    _LIMIT_FALLBACK_PROVIDER = ""
 # stderr / stdout substrings that identify "your subscription is out of
 # budget", case-insensitive contains-match. Kept narrow: only phrases
 # claude-code uses for the org-monthly limit specifically (verified
 # 2026-07-30 incident: "You've hit your org's monthly usage limit").
 # Rate-limit / 429 / transient errors are NOT in scope — those retry
 # via the ssh rc=255 path or surface to the caller as-is.
-_LIMIT_MARKERS = ("usage limit",)
+_LIMIT_MARKERS = (
+    "you've hit your org's monthly usage limit",
+    "you've hit your org's monthly spend limit",
+)
+_ORG_SPEND_LIMIT_MARKERS = ("you've hit your org's monthly spend limit",)
 
 
 def _hit_usage_limit(output: str) -> bool:
@@ -481,6 +558,14 @@ def _hit_usage_limit(output: str) -> bool:
         return False
     low = output.lower()
     return any(m in low for m in _LIMIT_MARKERS)
+
+
+def _hit_org_spend_limit(output: str) -> bool:
+    """True iff the rejection is organization-wide, not model-bucket local."""
+    if not output:
+        return False
+    low = output.lower()
+    return any(m in low for m in _ORG_SPEND_LIMIT_MARKERS)
 
 
 # stdout substrings that identify a provider-side Usage Policy refusal —
@@ -994,10 +1079,21 @@ PROMPT_TEMPLATE = (
     "Research prompt:\n\n{prompt}\n"
 )
 
+CODEX_PROMPT_TEMPLATE = (
+    "You are the research-agent. Today's date is {today}. Investigate the "
+    "following prompt using only the configured web MCP tools (exa, tavily, "
+    "render, trademark, bolagsverket, prv). Do not run shell commands, use "
+    "native web tools, or write files. Return the complete cited Markdown "
+    "report as your final response; the launcher captures that response into "
+    "the single permitted report file.\n\n"
+    "{depth_guidance}\n\n"
+    "Research prompt:\n\n{prompt}\n"
+)
 
-# Guest-side inline bash run by sshd inside the microvm. Reads six
-# null-terminated fields from stdin (claude_token, exa, tavily,
-# euipo_client_id, euipo_client_secret, prompt_body), writes the prompt
+
+# Guest-side inline bash run by sshd inside the microvm. Reads seven
+# null-terminated fields from stdin (claude_token, codex_auth_json, exa,
+# tavily, euipo_client_id, euipo_client_secret, prompt_body), writes the prompt
 # to a tmp file under $HOME, then exec's run-agent.sh with (uuid,
 # prompt_file). The EXIT trap cleans the tmp file even if SSH
 # disconnects mid-call.
@@ -1011,12 +1107,13 @@ PROMPT_TEMPLATE = (
 _GUEST_SCRIPT = (
     "set -euo pipefail; "
     "IFS= read -r -d '' CLAUDE_CODE_OAUTH_TOKEN; "
+    "IFS= read -r -d '' CODEX_AUTH_JSON; "
     "IFS= read -r -d '' EXA_API_KEY; "
     "IFS= read -r -d '' TAVILY_API_KEY; "
     "IFS= read -r -d '' EUIPO_CLIENT_ID; "
     "IFS= read -r -d '' EUIPO_CLIENT_SECRET; "
     "IFS= read -r -d '' PROMPT_BODY; "
-    "export CLAUDE_CODE_OAUTH_TOKEN EXA_API_KEY TAVILY_API_KEY"
+    "export CLAUDE_CODE_OAUTH_TOKEN CODEX_AUTH_JSON EXA_API_KEY TAVILY_API_KEY"
     " EUIPO_CLIENT_ID EUIPO_CLIENT_SECRET; "
     'TMP=$(mktemp -p "$HOME" research-prompt.XXXXXX); '
     'chmod 600 "$TMP"; '
@@ -1029,44 +1126,71 @@ _GUEST_SCRIPT = (
 def _run_agent(
     prompt: str, report_id: str, depth: Depth, model: str | None = None
 ) -> tuple[int, str]:
-    """Run a research call, with automatic Opus fallback on usage-limit hit.
+    """Run a research call with bounded Claude-model and Codex fallbacks.
 
     Wraps `_dial_agent` (which owns the ssh dial + rc=255 transport
     retry). If the dial returns non-zero with a usage-limit marker in
     the output AND the caller didn't specify a model AND a fallback
-    model is configured, re-dials once with `_LIMIT_FALLBACK_MODEL`.
-    Fallback fires at most once per call — the second dial passes the
-    fallback model explicitly so the recursion guard trips on the
-    reinvocation and no further fallback is attempted.
+    model is configured, re-dials once with `_LIMIT_FALLBACK_MODEL`. If that
+    quota is also exhausted, or the first error is the organization-wide spend
+    limit, one Codex dial is allowed. Explicit caller model pins never cross
+    providers.
     """
-    rc, out = _dial_agent(prompt, report_id, depth, model)
-    if (
-        rc != 0
-        and model is None
-        and _LIMIT_FALLBACK_MODEL
-        and _hit_usage_limit(out)
-    ):
+    rc, out = _dial_agent(prompt, report_id, depth, model, provider="claude")
+    # An explicit Claude model is a caller pin, so never silently cross vendors.
+    if rc == 0 or model is not None or not _hit_usage_limit(out):
+        return rc, out
+
+    # A monthly spend cap is organization-wide; trying another Claude model
+    # only burns latency.  Model-bucket usage limits retain the existing single
+    # Claude fallback before crossing providers.
+    if _LIMIT_FALLBACK_MODEL and not _hit_org_spend_limit(out):
         _LOG.warning(
             "agent usage-limit id=%s — retrying with model=%s (default quota exhausted)",
             report_id, _LIMIT_FALLBACK_MODEL,
         )
-        return _dial_agent(prompt, report_id, depth, _LIMIT_FALLBACK_MODEL)
+        rc, out = _dial_agent(
+            prompt,
+            report_id,
+            depth,
+            _LIMIT_FALLBACK_MODEL,
+            provider="claude",
+        )
+        if rc == 0 or not _hit_usage_limit(out):
+            return rc, out
+
+    if _LIMIT_FALLBACK_PROVIDER == "codex":
+        _LOG.warning(
+            "agent usage-limit id=%s — retrying with provider=codex",
+            report_id,
+        )
+        return _dial_agent(prompt, report_id, depth, None, provider="codex")
     return rc, out
 
 
 def _dial_agent(
-    prompt: str, report_id: str, depth: Depth, model: str | None = None
+    prompt: str,
+    report_id: str,
+    depth: Depth,
+    model: str | None = None,
+    provider: str = "claude",
 ) -> tuple[int, str]:
     """One ssh dial to the microvm (with rc=255 transport retry).
 
     Connects to the agent's sshd on RESEARCH_SSH_HOST:RESEARCH_SSH_PORT,
-    streams six null-terminated fields over stdin (five secrets +
+    streams seven null-terminated fields over stdin (six secrets +
     prompt body), and waits for run-agent.sh inside the VM to complete.
 
     Returns (exit_code, combined_output).
     """
+    if provider not in ("claude", "codex"):
+        raise ValueError("unsupported research provider")
+
     scratch_path = f"/scratch/{report_id}.md"
-    full_prompt = PROMPT_TEMPLATE.format(
+    prompt_template = (
+        CODEX_PROMPT_TEMPLATE if provider == "codex" else PROMPT_TEMPLATE
+    )
+    full_prompt = prompt_template.format(
         today=time.strftime("%Y-%m-%d"),
         scratch_path=scratch_path,
         depth_guidance=DEPTH_GUIDANCE[depth],
@@ -1074,17 +1198,19 @@ def _dial_agent(
     )
 
     secrets = _secrets()
-    # Six null-terminated fields. Mirrors the docker-era contract but
+
+    # Seven null-terminated fields. Mirrors the docker-era contract but
     # carries the prompt body as the last field — eliminates the
     # separate docker-cp step. Order MUST match the reader in
-    # `_GUEST_SCRIPT` exactly (claude, exa, tavily, euipo-id,
+    # `_GUEST_SCRIPT` exactly (claude, codex auth, exa, tavily, euipo-id,
     # euipo-secret, prompt). Missing secrets are sent as empty strings
     # so the wire format stays stable; downstream shims fail cleanly
     # on auth rather than the protocol desynchronising.
     stdin_payload = "".join(
         s + "\0"
         for s in (
-            secrets.get("claude-token", ""),
+            secrets.get("claude-token", "") if provider == "claude" else "",
+            secrets.get("codex-auth-json", "") if provider == "codex" else "",
             secrets.get("exa-api-key", ""),
             secrets.get("tavily-api-key", ""),
             secrets.get("euipo-client-id", ""),
@@ -1099,7 +1225,10 @@ def _dial_agent(
     # The remote command is one shell-joined string: ssh joins all argv
     # after user@host with spaces and re-parses on the remote side.
     # Quote each piece explicitly so the script source survives intact.
-    env_assignments = [f"RESEARCH_DEPTH={shlex.quote(str(depth))}"]
+    env_assignments = [
+        f"RESEARCH_DEPTH={shlex.quote(str(depth))}",
+        f"RESEARCH_PROVIDER={shlex.quote(provider)}",
+    ]
     if model:
         # Pre-validated by the tool layer (MODEL_ID_RE); run-agent.sh
         # re-checks guest-side before the value reaches claude's argv.
@@ -1125,8 +1254,8 @@ def _dial_agent(
     )
 
     _LOG.info(
-        "agent dial id=%s depth=%s model=%s host=%s port=%s user=%s",
-        report_id, depth, model or "default", ssh["host"], ssh["port"], ssh["user"],
+        "agent dial id=%s depth=%s provider=%s model=%s host=%s port=%s user=%s",
+        report_id, depth, provider, model or "default", ssh["host"], ssh["port"], ssh["user"],
     )
 
     ssh_cmd = [

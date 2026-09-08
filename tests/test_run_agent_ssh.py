@@ -4,8 +4,8 @@ Mocks subprocess.run so we can assert the exact ssh argv and stdin
 protocol without needing a running VM. Verifies:
 
 - ssh is invoked (not docker)
-- exactly six null-terminated fields land on stdin, in order:
-    claude_token, exa_api_key, tavily_api_key,
+- exactly seven null-terminated fields land on stdin, in order:
+    claude_token, codex_auth_json, exa_api_key, tavily_api_key,
     euipo_client_id, euipo_client_secret, prompt_body
 - RESEARCH_DEPTH is set on the remote command
 - uuid is passed as a positional arg
@@ -37,6 +37,11 @@ def _env(monkeypatch):
     monkeypatch.setattr(
         server,
         "_CLAUDE_CREDENTIALS_PATH",
+        server.Path("/dev/null/does-not-exist-for-tests"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_CODEX_AUTH_PATH",
         server.Path("/dev/null/does-not-exist-for-tests"),
     )
     yield
@@ -77,7 +82,7 @@ def test_run_agent_uses_ssh_not_docker():
     assert "RESEARCH_DEPTH=normal" in joined
 
 
-def test_run_agent_stdin_is_six_null_terminated_fields():
+def test_run_agent_stdin_is_seven_null_terminated_fields():
     server = _import_server()
     captured = {}
 
@@ -96,13 +101,44 @@ def test_run_agent_stdin_is_six_null_terminated_fields():
     parts = data.split("\0")
     assert parts[-1] == ""
     fields = parts[:-1]
-    assert len(fields) == 6, f"expected 6 fields, got {len(fields)}: {fields!r}"
+    assert len(fields) == 7
     assert fields[0] == "ct-test"
-    assert fields[1] == "exa-test-key"
-    assert fields[2] == "tav-test-key"
-    assert fields[3] == "euipo-id-test"
-    assert fields[4] == "euipo-secret-test"
-    assert "the prompt body" in fields[5]
+    assert fields[1] == ""
+    assert fields[2] == "exa-test-key"
+    assert fields[3] == "tav-test-key"
+    assert fields[4] == "euipo-id-test"
+    assert fields[5] == "euipo-secret-test"
+    assert "the prompt body" in fields[6]
+
+
+def test_each_provider_receives_only_its_own_auth(monkeypatch):
+    server = _import_server()
+    monkeypatch.setattr(
+        server,
+        "_secrets",
+        lambda: {
+            "claude-token": "claude-private",
+            "codex-auth-json": '{"tokens":{"access_token":"codex-private"}}',
+            "exa-api-key": "exa",
+            "tavily-api-key": "tavily",
+        },
+    )
+    payloads = []
+
+    def fake_run(argv, **kwargs):
+        payloads.append(kwargs.get("input", ""))
+        return MagicMock(returncode=0, stdout="DONE\n", stderr="")
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        server._dial_agent("x", "a" * 32, "normal", provider="claude")
+        server._dial_agent("x", "b" * 32, "normal", provider="codex")
+
+    claude_fields = payloads[0].split("\0")[:-1]
+    codex_fields = payloads[1].split("\0")[:-1]
+    assert claude_fields[0] == "claude-private"
+    assert claude_fields[1] == ""
+    assert codex_fields[0] == ""
+    assert "codex-private" in codex_fields[1]
 
 
 def test_run_agent_uuid_passed_as_argv():
@@ -135,10 +171,10 @@ def test_run_agent_timeout_propagates():
             server._run_agent(prompt="x", report_id="0" * 32, depth="normal")
 
 
-def test_run_agent_empty_secrets_still_ships_six_fields(monkeypatch):
-    """If _secrets() returns {} the stdin payload still has exactly six
-    NUL-terminated fields (empty strings for the five missing secrets,
-    then the prompt). The guest-side bash reads six fields regardless;
+def test_run_agent_empty_secrets_still_ships_seven_fields(monkeypatch):
+    """If _secrets() returns {} the stdin payload still has exactly seven
+    NUL-terminated fields (empty strings for the six missing secrets,
+    then the prompt). The guest-side bash reads seven fields regardless;
     auth then fails inside the agent layer with a clear per-tool error
     rather than silently desynchronising the stdin protocol."""
     monkeypatch.delenv("EXA_API_KEY", raising=False)
@@ -152,6 +188,7 @@ def test_run_agent_empty_secrets_still_ships_six_fields(monkeypatch):
     # the cache and the wire-format check sees a true empty payload.
     monkeypatch.setattr(server, "_keyring_lookup", lambda key: None)
     monkeypatch.setattr(server, "_load_claude_credentials_token", lambda: None)
+    monkeypatch.setattr(server, "_load_codex_auth_json", lambda: None)
     server.SECRETS_CACHE.clear()
 
     captured = {}
@@ -170,13 +207,14 @@ def test_run_agent_empty_secrets_still_ships_six_fields(monkeypatch):
     parts = captured["input"].split("\0")
     assert parts[-1] == ""
     fields = parts[:-1]
-    assert len(fields) == 6, f"expected 6 fields with empty secrets, got {len(fields)}"
+    assert len(fields) == 7
     assert fields[0] == ""  # claude
-    assert fields[1] == ""  # exa
-    assert fields[2] == ""  # tavily
-    assert fields[3] == ""  # euipo-client-id
-    assert fields[4] == ""  # euipo-client-secret
-    assert "hello world" in fields[5]
+    assert fields[1] == ""  # codex auth JSON
+    assert fields[2] == ""  # exa
+    assert fields[3] == ""  # tavily
+    assert fields[4] == ""  # euipo-client-id
+    assert fields[5] == ""  # euipo-client-secret
+    assert "hello world" in fields[6]
 
 
 def test_ssh_settings_empty_env_falls_through_to_default(monkeypatch):

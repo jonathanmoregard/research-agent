@@ -94,9 +94,10 @@ def test_non_limit_failure_does_not_fall_back(monkeypatch):
 
 
 def test_fallback_disabled_via_empty_env(monkeypatch):
-    """Empty _LIMIT_FALLBACK_MODEL disables fallback (opt-out for tests / ops)."""
+    """Empty model and provider settings disable all quota fallback."""
     _env(monkeypatch)
     monkeypatch.setattr(server, "_LIMIT_FALLBACK_MODEL", "")
+    monkeypatch.setattr(server, "_LIMIT_FALLBACK_PROVIDER", "")
     calls: list[int] = []
 
     def _run(*a, **k):
@@ -110,7 +111,8 @@ def test_fallback_disabled_via_empty_env(monkeypatch):
 
 
 def test_hit_usage_limit_matches_case_insensitively():
-    assert server._hit_usage_limit("Usage Limit reached") is True
-    assert server._hit_usage_limit("USAGE LIMIT") is True
+    assert server._hit_usage_limit("You've hit your org's monthly usage limit") is True
+    assert server._hit_usage_limit("YOU'VE HIT YOUR ORG'S MONTHLY SPEND LIMIT") is True
+    assert server._hit_usage_limit("usage limit") is False
     assert server._hit_usage_limit("no such marker here") is False
     assert server._hit_usage_limit("") is False

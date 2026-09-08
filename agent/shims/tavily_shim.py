@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
 from curl_cffi import requests as cfrequests  # type: ignore
@@ -18,6 +19,10 @@ from curl_cffi import requests as cfrequests  # type: ignore
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 TAVILY_BASE = "https://api.tavily.com"
 IMPERSONATE = "chrome"
+_UNTRUSTED_TAG = re.compile(
+    r"<(?=\s*/?\s*(?:untrusted_external_content|system-reminder)\b)",
+    re.IGNORECASE,
+)
 
 
 def _post(path: str, payload: dict) -> dict:
@@ -35,8 +40,14 @@ def _post(path: str, payload: dict) -> dict:
         timeout=30,
     )
     if r.status_code >= 400:
-        raise RuntimeError(f"Tavily HTTP {r.status_code}: {r.text[:500]}")
+        raise RuntimeError(f"Tavily HTTP {r.status_code}")
     return r.json()
+
+
+def _wrap_untrusted(text: str) -> str:
+    """Mark provider-controlled text and prevent it from closing the wrapper."""
+    safe = _UNTRUSTED_TAG.sub("&lt;", text)
+    return f'<untrusted_external_content source="tavily">\n{safe}\n</untrusted_external_content>'
 
 TOOLS = [
     {
@@ -92,7 +103,8 @@ def _tool_tavily_search(args: dict) -> str:
         url = r.get("url") or ""
         snippet = (r.get("content") or "")[:1000]
         lines.append(f"Title: {title}\nURL: {url}\n\n{snippet}\n\n---")
-    return "\n".join(lines) if lines else "(no results)"
+    text = "\n".join(lines) if lines else "(no results)"
+    return _wrap_untrusted(text)
 
 
 def _tool_tavily_extract(args: dict) -> str:
@@ -109,7 +121,8 @@ def _tool_tavily_extract(args: dict) -> str:
         lines.append(f"URL: {url}\n\n{content}\n\n---")
     for f in resp.get("failed_results", []) or []:
         lines.append(f"FAILED: {f.get('url')}: {f.get('error')}")
-    return "\n".join(lines) if lines else "(no results)"
+    text = "\n".join(lines) if lines else "(no results)"
+    return _wrap_untrusted(text)
 
 
 TOOL_IMPL = {

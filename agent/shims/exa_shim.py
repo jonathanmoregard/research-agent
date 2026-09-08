@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
 from curl_cffi import requests as cfrequests  # type: ignore
@@ -20,6 +21,10 @@ from curl_cffi import requests as cfrequests  # type: ignore
 EXA_API_KEY = os.environ.get("EXA_API_KEY", "")
 EXA_BASE = "https://api.exa.ai"
 IMPERSONATE = "chrome"
+_UNTRUSTED_TAG = re.compile(
+    r"<(?=\s*/?\s*(?:untrusted_external_content|system-reminder)\b)",
+    re.IGNORECASE,
+)
 
 TOOLS = [
     {
@@ -69,8 +74,14 @@ def _post(path: str, payload: dict) -> dict:
         timeout=30,
     )
     if r.status_code >= 400:
-        raise RuntimeError(f"Exa HTTP {r.status_code}: {r.text[:500]}")
+        raise RuntimeError(f"Exa HTTP {r.status_code}")
     return r.json()
+
+
+def _wrap_untrusted(text: str) -> str:
+    """Mark provider-controlled text and prevent it from closing the wrapper."""
+    safe = _UNTRUSTED_TAG.sub("&lt;", text)
+    return f'<untrusted_external_content source="exa">\n{safe}\n</untrusted_external_content>'
 
 
 def _format_result(r: dict) -> str:
@@ -97,7 +108,8 @@ def _tool_web_search_exa(args: dict) -> str:
             "contents": {"highlights": True},
         },
     )
-    return "\n".join(_format_result(r) for r in (body.get("results") or [])) or "(no results)"
+    text = "\n".join(_format_result(r) for r in (body.get("results") or [])) or "(no results)"
+    return _wrap_untrusted(text)
 
 
 def _tool_web_fetch_exa(args: dict) -> str:
@@ -107,7 +119,8 @@ def _tool_web_fetch_exa(args: dict) -> str:
     if not isinstance(urls, list):
         raise RuntimeError("urls must be a string or list of strings")
     body = _post("/contents", {"urls": urls, "text": True})
-    return "\n".join(_format_result(r) for r in (body.get("results") or [])) or "(no results)"
+    text = "\n".join(_format_result(r) for r in (body.get("results") or [])) or "(no results)"
+    return _wrap_untrusted(text)
 
 
 TOOL_IMPL = {

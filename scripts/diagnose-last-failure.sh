@@ -47,7 +47,7 @@ classify() {
   if grep -qE 'claude.*not found|command not found'      <<<"$t"; then echo "agent:claude-missing"; return; fi
   if grep -qE 'model.*not available|invalid model'       <<<"$t"; then echo "agent:model-not-available"; return; fi
   if grep -qE 'run.*claude /login|Please run.*login'     <<<"$t"; then echo "agent:claude-needs-login"; return; fi
-  if grep -qE 'credit balance|usage limit|account.*limit' <<<"$t"; then echo "agent:claude-credit"; return; fi
+  if grep -qE 'credit balance|usage limit|spend limit|account.*limit' <<<"$t"; then echo "agent:claude-credit"; return; fi
   if grep -qE 'EXA_API_KEY|TAVILY_API_KEY'               <<<"$t"; then echo "agent:web-key-missing"; return; fi
   if grep -qE 'run-agent:'                               <<<"$t"; then echo "agent:run-agent-script-error"; return; fi
   if grep -qE 'Permission denied'                        <<<"$t"; then echo "fs:permission-denied"; return; fi
