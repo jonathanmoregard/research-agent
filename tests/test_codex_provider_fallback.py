@@ -196,7 +196,11 @@ class CodexProviderFallbackTests(unittest.TestCase):
         self.assertIn('--sandbox read-only', runner)
         self.assertIn('approval_policy = "never"', config)
         self.assertIn('--perms 0600', runner)
-        self.assertIn('--ro-bind-data "${CODEX_AUTH_FD}"', runner)
+        self.assertIn(
+            '--bind-data "${CODEX_AUTH_FD}" "/home/agent/.codex/auth.json"',
+            runner,
+        )
+        self.assertNotIn('--ro-bind-data "${CODEX_AUTH_FD}"', runner)
         self.assertIn("printf '{}\\n' > \"${RENDERED_MCP}\"", runner)
         self.assertNotIn('"${CODEX_AUTH_JSON}" > "${CODEX_STATE_DIR}/auth.json"', runner)
 

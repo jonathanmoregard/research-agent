@@ -209,7 +209,8 @@ if [[ "${PROVIDER}" == "codex" ]]; then
   esac
   chmod 700 "${CODEX_STATE_DIR}"
   # Keep the credential out of every persistent or tmpfs-backed file. bwrap
-  # materializes this anonymous pipe as a read-only auth.json inside the jail.
+  # materializes this anonymous pipe as a writable auth.json only inside the
+  # jail, allowing Codex to persist an in-call token refresh.
   : > "${CODEX_STATE_DIR}/auth.json"
   exec {CODEX_AUTH_FD}< <(printf '%s' "${CODEX_AUTH_JSON}")
   cp "${AGENT_DIR}/codex-config.toml" "${CODEX_STATE_DIR}/config.toml"
@@ -218,7 +219,7 @@ if [[ "${PROVIDER}" == "codex" ]]; then
     --dir "/home/agent/.codex"
     --bind "${CODEX_STATE_DIR}" "/home/agent/.codex"
     --perms 0600
-    --ro-bind-data "${CODEX_AUTH_FD}" "/home/agent/.codex/auth.json"
+    --bind-data "${CODEX_AUTH_FD}" "/home/agent/.codex/auth.json"
     --setenv CODEX_HOME "/home/agent/.codex"
   )
   # The Codex child gets its auth from the file above. Do not leave either
