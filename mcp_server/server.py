@@ -1666,7 +1666,8 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             detection: {"layer": "lakera"|"honeypot"|"judge"|
             "unicode_sanitize"|"secret_shapes"|"decode"|"other",
             "condition": "unavailable"|"no_key"|"key_config_error"|
-            "bad_response"|"lib_missing"|"other", "exc_type"?: str,
+            "bad_response"|"lib_missing"|"throttled"|"limiter_error"|
+            "service_unavailable"|"other", "exc_type"?: str,
             "http_status"?: int}. Every value is drawn from a closed
             vocabulary — it is a diagnosis, never text from the report or
             the provider. Fix the named dependency, then retry. The
