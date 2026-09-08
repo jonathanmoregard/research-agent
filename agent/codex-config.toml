@@ -1,0 +1,69 @@
+# Ephemeral research-agent profile. The outer bubblewrap jail is the hard
+# filesystem boundary; Codex adds a read-only tool sandbox and exposes only the
+# pre-existing, rate-controlled research MCP shims.
+approval_policy = "never"
+sandbox_mode = "read-only"
+web_search = "disabled"
+
+[features]
+apps = false
+auth_elicitation = false
+browser_use = false
+browser_use_external = false
+browser_use_full_cdp_access = false
+computer_use = false
+goals = false
+guardian_approval = false
+hooks = false
+image_generation = false
+in_app_browser = false
+in_app_updates = false
+memories = false
+multi_agent = false
+plugin_sharing = false
+plugins = false
+remote_plugin = false
+shell_snapshot = false
+shell_tool = false
+skill_mcp_dependency_install = false
+skill_search = false
+tool_call_mcp_elicitation = false
+tool_suggest = false
+code_mode_host = false
+unified_exec = false
+workspace_dependencies = false
+
+[mcp_servers.exa]
+command = "python3"
+args = ["/workspace/agent/shims/exa_shim.py"]
+env_vars = ["EXA_API_KEY"]
+enabled_tools = ["web_search_exa", "web_fetch_exa"]
+
+[mcp_servers.tavily-remote-mcp]
+command = "python3"
+args = ["/workspace/agent/shims/tavily_shim.py"]
+env_vars = ["TAVILY_API_KEY"]
+enabled_tools = ["tavily_search", "tavily_extract"]
+
+[mcp_servers.render]
+command = "python3"
+args = ["/workspace/agent/shims/render_shim.py"]
+env_vars = ["RESEARCH_RUN_ID"]
+enabled_tools = ["render_page", "intercept_page", "browse_open", "browse_act", "browse_screenshot", "browse_save_screenshot", "browse_close"]
+
+[mcp_servers.trademark]
+command = "python3"
+args = ["/workspace/agent/shims/trademark_shim.py"]
+env_vars = ["EUIPO_CLIENT_ID", "EUIPO_CLIENT_SECRET"]
+enabled_tools = ["trademark_search"]
+
+[mcp_servers.bolagsverket]
+command = "python3"
+args = ["/workspace/agent/shims/bolagsverket_shim.py"]
+enabled_tools = ["bolagsverket_search"]
+
+[mcp_servers.prv]
+command = "python3"
+args = ["/workspace/agent/shims/prv_shim.py"]
+env_vars = ["PRV_CACHE_DIR"]
+enabled_tools = ["prv_search"]

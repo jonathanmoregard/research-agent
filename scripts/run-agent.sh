@@ -34,6 +34,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPORT_UUID="${1:?uuid required}"
 PROMPT_FILE="${2:?prompt file required}"
 DEPTH="${RESEARCH_DEPTH:-normal}"
+PROVIDER="${RESEARCH_PROVIDER:-claude}"
 
 # Defense-in-depth: gate the uuid to 32 lowercase hex chars before it
 # reaches any path expansion below (touch / bwrap --bind / mktemp).
@@ -44,6 +45,10 @@ if ! [[ "${REPORT_UUID}" =~ ^[a-f0-9]{32}$ ]]; then
   echo "run-agent: invalid REPORT_UUID '${REPORT_UUID}'" >&2
   exit 4
 fi
+case "${PROVIDER}" in
+  claude|codex) ;;
+  *) echo "run-agent: invalid RESEARCH_PROVIDER=${PROVIDER}" >&2; exit 7 ;;
+esac
 
 # Per-depth tool allowlist. The prompt tells the agent *how* to use these;
 # we restrict *which* are callable at all.
@@ -170,13 +175,65 @@ case "${RENDERED_MCP}" in
   *) echo "run-agent: refusing to render .mcp.json outside /tmp (got ${RENDERED_MCP})" >&2; exit 3 ;;
 esac
 chmod 600 "${RENDERED_MCP}"
-# RESEARCH_RUN_ID follows the same dual path as EXA_API_KEY: baked into the
-# rendered .mcp.json (so shims that read it at startup see it) AND passed via
-# --setenv below (so the running agent process and its children see it too).
+# RESEARCH_RUN_ID follows the same dual path as EXA_API_KEY for Claude: baked
+# into the rendered .mcp.json and passed via --setenv below. Codex reads the
+# tool environment from codex-config.toml, so its placeholder deliberately
+# contains no copied credentials.
 export RESEARCH_RUN_ID="${REPORT_UUID}"
-python3 -c 'import os,sys; sys.stdout.write(os.path.expandvars(sys.stdin.read()))' \
-  < "${AGENT_DIR}/.mcp.json" > "${RENDERED_MCP}"
-trap 'rm -f "${RENDERED_MCP}"' EXIT
+if [[ "${PROVIDER}" == "claude" ]]; then
+  python3 -c 'import os,sys; sys.stdout.write(os.path.expandvars(sys.stdin.read()))' \
+    < "${AGENT_DIR}/.mcp.json" > "${RENDERED_MCP}"
+else
+  printf '{}\n' > "${RENDERED_MCP}"
+fi
+
+# Codex auth and state live in a fresh directory on the guest's /tmp.  The
+# directory is bind-mounted into the already-ephemeral bwrap home, then removed
+# when this call exits.  The auth JSON arrived over ssh stdin, never argv.
+CODEX_STATE_DIR=""
+CODEX_AUTH_FD=""
+CODEX_BIND_ARGS=()
+if [[ "${PROVIDER}" == "codex" ]]; then
+  command -v codex >/dev/null 2>&1 || {
+    echo "run-agent: codex provider requested but codex is not installed" >&2
+    exit 8
+  }
+  [[ -n "${CODEX_AUTH_JSON:-}" ]] || {
+    echo "run-agent: codex provider requested but auth is unavailable" >&2
+    exit 9
+  }
+  CODEX_STATE_DIR=$(mktemp -d --suffix=.codex-home)
+  case "${CODEX_STATE_DIR}" in
+    /tmp/*) ;;
+    *) echo "run-agent: refusing Codex state outside /tmp" >&2; exit 10 ;;
+  esac
+  chmod 700 "${CODEX_STATE_DIR}"
+  # Keep the credential out of every persistent or tmpfs-backed file. bwrap
+  # materializes this anonymous pipe as a read-only auth.json inside the jail.
+  : > "${CODEX_STATE_DIR}/auth.json"
+  exec {CODEX_AUTH_FD}< <(printf '%s' "${CODEX_AUTH_JSON}")
+  cp "${AGENT_DIR}/codex-config.toml" "${CODEX_STATE_DIR}/config.toml"
+  chmod 600 "${CODEX_STATE_DIR}/auth.json" "${CODEX_STATE_DIR}/config.toml"
+  CODEX_BIND_ARGS=(
+    --dir "/home/agent/.codex"
+    --bind "${CODEX_STATE_DIR}" "/home/agent/.codex"
+    --perms 0600
+    --ro-bind-data "${CODEX_AUTH_FD}" "/home/agent/.codex/auth.json"
+    --setenv CODEX_HOME "/home/agent/.codex"
+  )
+  # The Codex child gets its auth from the file above. Do not leave either
+  # provider credential in the process environment inherited by its tools.
+  unset CODEX_AUTH_JSON CLAUDE_CODE_OAUTH_TOKEN
+else
+  unset CODEX_AUTH_JSON
+fi
+cleanup() {
+  rm -f "${RENDERED_MCP}"
+  if [[ -n "${CODEX_STATE_DIR}" ]]; then
+    rm -rf -- "${CODEX_STATE_DIR}"
+  fi
+}
+trap cleanup EXIT
 
 # Build the bwrap invocation. Each run = fresh ephemeral FS.
 #
@@ -249,6 +306,26 @@ if [[ "${MEM_CAP}" != "off" ]]; then
   fi
 fi
 
+if [[ "${PROVIDER}" == "codex" ]]; then
+  AGENT_ARGV=(
+    codex exec
+    --strict-config
+    --skip-git-repo-check
+    --sandbox read-only
+    --ephemeral
+    --cd "${AGENT_DIR}"
+    --output-last-message "${SCRATCH_FILE}"
+    -- "${PROMPT_CONTENT}"
+  )
+else
+  AGENT_ARGV=(
+    claude -p "${PROMPT_CONTENT}"
+    --add-dir /scratch
+    "${MODEL_FLAGS[@]}"
+    --allowed-tools "${ALLOWED_TOOLS}"
+  )
+fi
+
 "${MEMGUARD_ARGV[@]}" \
 bwrap \
   --ro-bind /nix/store /nix/store \
@@ -264,6 +341,7 @@ bwrap \
   --tmpfs "${HOME_DIR}" \
   --ro-bind "${AGENT_DIR}" "${AGENT_DIR}" \
   --ro-bind "${RENDERED_MCP}" "${AGENT_DIR}/.mcp.json" \
+  "${CODEX_BIND_ARGS[@]}" \
   --bind "${FINAL_FILE}" "${SCRATCH_FILE}" \
   --unshare-user \
   --unshare-pid \
@@ -284,7 +362,4 @@ bwrap \
   "${CACHE_ARGS[@]}" \
   --setenv CLAUDE_STREAM_IDLE_TIMEOUT_MS "1800000" \
   -- \
-  claude -p "${PROMPT_CONTENT}" \
-    --add-dir /scratch \
-    "${MODEL_FLAGS[@]}" \
-    --allowed-tools "${ALLOWED_TOOLS}"
+  "${AGENT_ARGV[@]}"
