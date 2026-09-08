@@ -1914,6 +1914,9 @@ class _InfraCondition(Enum):
     KEY_CONFIG_ERROR = "key_config_error"  # credential present but unloadable
     BAD_RESPONSE = "bad_response"    # provider answered, shape unusable
     LIB_MISSING = "lib_missing"      # provider SDK not installed
+    THROTTLED = "throttled"          # shared quota budget unavailable
+    LIMITER_ERROR = "limiter_error"  # cross-process limiter unusable
+    SERVICE_UNAVAILABLE = "service_unavailable"  # provider 503 breaker
     OTHER = "other"
 
 
@@ -1928,6 +1931,9 @@ _INFRA_CONDITION_TOKENS: dict[str, "_InfraCondition"] = {
     "no-openai-api-key": _InfraCondition.NO_KEY,
     "key-config-error": _InfraCondition.KEY_CONFIG_ERROR,
     "bad-response": _InfraCondition.BAD_RESPONSE,
+    "throttled": _InfraCondition.THROTTLED,
+    "limiter-error": _InfraCondition.LIMITER_ERROR,
+    "service-unavailable": _InfraCondition.SERVICE_UNAVAILABLE,
     "anthropic-lib-missing": _InfraCondition.LIB_MISSING,
     "openai-lib-missing": _InfraCondition.LIB_MISSING,
 }

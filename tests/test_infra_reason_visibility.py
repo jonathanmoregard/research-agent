@@ -130,6 +130,9 @@ INFRA_REASONS = [
     "lakera_unavailable:key-config-error",
     "lakera_unavailable:bad-response",
     "lakera_unavailable:HTTPError:429",
+    "lakera_unavailable:throttled",
+    "lakera_unavailable:limiter-error",
+    "lakera_unavailable:service-unavailable",
     "lakera_unavailable:HTTPError",
     "lakera_unavailable:TimeoutError",
     "unicode_sanitize_unavailable:unhandled:ValueError",
@@ -216,6 +219,18 @@ def test_predicate_rejects_non_strings():
         (
             "lakera_unavailable:bad-response",
             {"layer": "lakera", "condition": "bad_response"},
+        ),
+        (
+            "lakera_unavailable:throttled",
+            {"layer": "lakera", "condition": "throttled"},
+        ),
+        (
+            "lakera_unavailable:limiter-error",
+            {"layer": "lakera", "condition": "limiter_error"},
+        ),
+        (
+            "lakera_unavailable:service-unavailable",
+            {"layer": "lakera", "condition": "service_unavailable"},
         ),
         (
             "unicode_sanitize_unavailable:unhandled:ValueError",
