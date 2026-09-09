@@ -1666,7 +1666,8 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             detection: {"layer": "lakera"|"honeypot"|"judge"|
             "unicode_sanitize"|"secret_shapes"|"decode"|"other",
             "condition": "unavailable"|"no_key"|"key_config_error"|
-            "bad_response"|"lib_missing"|"other", "exc_type"?: str,
+            "bad_response"|"lib_missing"|"throttled"|"limiter_error"|
+            "service_unavailable"|"other", "exc_type"?: str,
             "http_status"?: int}. Every value is drawn from a closed
             vocabulary — it is a diagnosis, never text from the report or
             the provider. Fix the named dependency, then retry. The
@@ -1914,6 +1915,9 @@ class _InfraCondition(Enum):
     KEY_CONFIG_ERROR = "key_config_error"  # credential present but unloadable
     BAD_RESPONSE = "bad_response"    # provider answered, shape unusable
     LIB_MISSING = "lib_missing"      # provider SDK not installed
+    THROTTLED = "throttled"          # shared quota budget unavailable
+    LIMITER_ERROR = "limiter_error"  # cross-process limiter unusable
+    SERVICE_UNAVAILABLE = "service_unavailable"  # provider 503 breaker
     OTHER = "other"
 
 
@@ -1928,6 +1932,9 @@ _INFRA_CONDITION_TOKENS: dict[str, "_InfraCondition"] = {
     "no-openai-api-key": _InfraCondition.NO_KEY,
     "key-config-error": _InfraCondition.KEY_CONFIG_ERROR,
     "bad-response": _InfraCondition.BAD_RESPONSE,
+    "throttled": _InfraCondition.THROTTLED,
+    "limiter-error": _InfraCondition.LIMITER_ERROR,
+    "service-unavailable": _InfraCondition.SERVICE_UNAVAILABLE,
     "anthropic-lib-missing": _InfraCondition.LIB_MISSING,
     "openai-lib-missing": _InfraCondition.LIB_MISSING,
 }
@@ -2350,6 +2357,43 @@ _SCANNER_SHA_CACHE = Path.home() / ".cache" / "research-agent" / "scanner-sha"
 _SCANNER_INSTALL_LOCK = Path.home() / ".cache" / "research-agent" / "scanner-install.lock"
 
 
+def _configured_scanner_sha() -> str | None:
+    """Return an immutable SHA requested by the installed distribution.
+
+    `uv sync` records the lockfile's requested Git revision and resolved
+    commit in PEP 610 `direct_url.json`. Trust it only when both are the same
+    full hexadecimal SHA. A branch such as `main`, a short SHA, malformed
+    metadata, or disagreement between request and installed commit returns
+    `None` and leaves the legacy remote-main updater in charge.
+    """
+    try:
+        from importlib import metadata
+
+        dist = metadata.distribution("injection-scanner")
+        relative = next(
+            path
+            for path in (dist.files or ())
+            if str(path).endswith(".dist-info/direct_url.json")
+        )
+        obj = json.loads(dist.locate_file(relative).read_text(encoding="utf-8"))
+        vcs = obj["vcs_info"]
+        revision = vcs["requested_revision"]
+        commit = vcs["commit_id"]
+        if not isinstance(revision, str) or not isinstance(commit, str):
+            return None
+        revision = revision.lower()
+        commit = commit.lower()
+        if (
+            len(revision) != 40
+            or any(char not in "0123456789abcdef" for char in revision)
+            or commit != revision
+        ):
+            return None
+        return revision
+    except Exception:  # noqa: BLE001 — metadata absence means use legacy path
+        return None
+
+
 def _resolve_scanner_remote_sha(log) -> str | None:
     """Return origin/main SHA via `git ls-remote`. None on offline or
     network failure — caller treats that as "skip update, keep installed
@@ -2374,11 +2418,23 @@ def _resolve_scanner_remote_sha(log) -> str | None:
     return sha
 
 
+def _resolve_scanner_target_sha(log) -> str | None:
+    """Resolve the configured immutable revision, else current remote main.
+
+    The project lock is authoritative. Without this guard, the boot updater
+    can overwrite an intentionally pinned scanner with an older `main` after
+    a fresh cache or any unrelated main-branch movement.
+    """
+    return _configured_scanner_sha() or _resolve_scanner_remote_sha(log)
+
+
 def _maybe_update_scanner() -> None:
-    """Refresh the injection-scanner package from origin/main if its head
-    has moved since the last successful install on this machine. Cheap
-    on the steady state (one ls-remote + a sha-file read) and bounded
-    on the bumped state (uv pip install --force-reinstall in the venv).
+    """Refresh injection-scanner to the project-configured target SHA.
+
+    An immutable revision installed from the lockfile wins. Mutable installs
+    retain the legacy origin/main lookup. The steady state is one metadata or
+    ls-remote check plus a SHA-file read; a bump is bounded by the uv install
+    timeout.
 
     Concurrency: 4+ research-agent processes can spawn from parallel
     Claude Code tool calls. We hold a flock around the install so two
@@ -2399,9 +2455,9 @@ def _maybe_update_scanner() -> None:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 
     t_remote = time.monotonic()
-    remote_sha = _resolve_scanner_remote_sha(log)
+    remote_sha = _resolve_scanner_target_sha(log)
     _LOG.info(
-        "boot scanner-ls-remote took_ms=%d resolved=%s",
+        "boot scanner-resolve took_ms=%d resolved=%s",
         int((time.monotonic() - t_remote) * 1000), remote_sha or "none",
     )
     if remote_sha is None:
