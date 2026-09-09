@@ -1656,6 +1656,15 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             <untrusted_external_content>/<system-reminder> tags so the
             caller can inline it directly. `report_path` points at the
             same content on disk for retry / re-reading.
+            When Lakera quota pressure forced the strict fallback, success
+            also carries `scanner_advisory`: {"layer": "lakera",
+            "condition": "throttled",
+            "fallback": "strict_honeypot_unanimous_judges",
+            "action": "warn_user"}. The calling model must tell the user
+            that Lakera did not scan this report because quota/rate limiting
+            was active and that strict honeypot + unanimous judges were used
+            instead. Every value is fixed vocabulary; no report or provider
+            text appears in this advisory.
         On failure: {"status": "error", "error": str, "report_id"?: str,
                      "timings_ms": {...}}.
             When `error` is "scanner rejected report (quarantined)",
@@ -1895,6 +1904,19 @@ _INFRA_BARE_REASONS = frozenset({"no-key", "key-config-error", "bad-response"})
 
 # The single key the infra path is allowed to add to a reject response.
 _INFRA_KEY = "scanner_infra"
+
+# A successful scan can still be degraded when exact Lakera quota pressure
+# activates injection-scanner's strict honeypot + unanimous-judge fallback.
+# These are the only two upstream literals eligible for that path. Exact
+# membership prevents another outage, malformed provider reply, or
+# attacker-shaped suffix from being presented as quota pressure.
+_SCANNER_ADVISORY_KEY = "scanner_advisory"
+_LAKERA_QUOTA_ADVISORY_REASONS = frozenset(
+    {
+        "lakera_unavailable:HTTPError:429",
+        "lakera_unavailable:throttled",
+    }
+)
 
 
 class _InfraLayer(Enum):
@@ -2268,9 +2290,35 @@ def _scan_and_deliver(
     dst = REPORTS_DIR / f"{report_id}.md"
     dst.unlink(missing_ok=True)
     from mcp_server.artifact_gate import gate_artifacts, rewrite_artifact_links
+
+    # Artifacts pass through the same scanner after the report. Track exact
+    # quota fallback across both surfaces so a report-body Lakera pass cannot
+    # hide degraded coverage on a saved screenshot. Only the boolean crosses
+    # this closure; no layer map or OCR/report bytes reach the response.
+    layers = verdict.layers if isinstance(verdict.layers, dict) else {}
+    quota_degraded = layers.get("lakera") in _LAKERA_QUOTA_ADVISORY_REASONS
+
+    def _scan_artifact_with_advisory(content: str):
+        nonlocal quota_degraded
+        artifact_verdict = _scan_text(content)
+        artifact_layers = (
+            artifact_verdict.layers
+            if isinstance(artifact_verdict.layers, dict)
+            else {}
+        )
+        if (
+            artifact_verdict.ok
+            and artifact_layers.get("lakera") in _LAKERA_QUOTA_ADVISORY_REASONS
+        ):
+            quota_degraded = True
+        return artifact_verdict
+
     t_art = time.monotonic()
     saved, quarantined = gate_artifacts(
-        report_id, REPORTS_DIR, _scan_text, audit_fn=_write_artifact_audit
+        report_id,
+        REPORTS_DIR,
+        _scan_artifact_with_advisory,
+        audit_fn=_write_artifact_audit,
     )
     artifacts_ms = int((time.monotonic() - t_art) * 1000)
     text = rewrite_artifact_links(
@@ -2279,7 +2327,7 @@ def _scan_and_deliver(
     wrapped = _wrap_content(report_id, text)
     _atomic_write_excl(dst, wrapped)
     t_done = time.monotonic()
-    return {
+    out = {
         "status": "done",
         "report_path": str(dst),
         "report": wrapped,
@@ -2291,6 +2339,19 @@ def _scan_and_deliver(
             "total": int((t_done - t_received) * 1000),
         },
     }
+    # Name every output field and value. Never copy the Verdict or its layers:
+    # future scanner fields, provider errors, and attacker-shaped report data
+    # must default to invisible at this boundary. `verdict.ok` plus either
+    # exact reason can only be produced by the pinned scanner after strict
+    # honeypot success and unanimous cross-family benign arbitration.
+    if quota_degraded:
+        out[_SCANNER_ADVISORY_KEY] = {
+            "layer": "lakera",
+            "condition": "throttled",
+            "fallback": "strict_honeypot_unanimous_judges",
+            "action": "warn_user",
+        }
+    return out
 
 
 @mcp.tool()
