@@ -116,3 +116,28 @@ def test_hit_usage_limit_matches_case_insensitively():
     assert server._hit_usage_limit("usage limit") is False
     assert server._hit_usage_limit("no such marker here") is False
     assert server._hit_usage_limit("") is False
+
+
+def test_quota_diagnosis_is_closed_and_explains_model_pin():
+    output = (
+        "You've hit your org's monthly spend limit. "
+        "ATTACKER_CONTROLLED_OUTPUT_CANARY"
+    )
+    assert server._agent_quota_diagnosis(output, model_pinned=True) == {
+        "layer": "provider",
+        "provider": "claude",
+        "condition": "quota_exhausted",
+        "fallback": "blocked_by_model_pin",
+    }
+    assert server._agent_quota_diagnosis(output, model_pinned=False) == {
+        "layer": "provider",
+        "provider": "claude",
+        "condition": "quota_exhausted",
+        "fallback": "unavailable",
+    }
+
+
+def test_quota_diagnosis_does_not_label_generic_failure():
+    assert server._agent_quota_diagnosis(
+        "Traceback: ATTACKER_CONTROLLED_OUTPUT_CANARY", model_pinned=True
+    ) is None

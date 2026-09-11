@@ -11,6 +11,8 @@ Covered:
   2b. Provider usage-policy  — refusal gets its own fixed error string, still
       refusal                   with zero captures; markers stay narrow enough
                                 not to fire on ordinary security research.
+  2c. Provider quota         — quota exhaustion gets a closed diagnosis that
+                                explains when an explicit model blocked fallback.
   3. Agent invocation raise  — exception message must not leak.
   4. Fast-mode Exa HTTP err  — response body bytes must not leak.
   5. Fast-mode Exa generic   — exception stringification must not leak.
@@ -139,6 +141,8 @@ def case_agent_failure_no_leak(tmp: Path) -> list[str]:
         failures.append(f"expected status=error, got {result}")
     if result.get("error") != "agent failed":
         failures.append(f"expected generic 'agent failed', got {result.get('error')!r}")
+    if "agent_failure" in result:
+        failures.append(f"generic failure gained a false diagnosis: {result!r}")
     if "report_id" not in result:
         failures.append("report_id missing")
     log_path = tmp / "_quarantine" / "agent_failures.jsonl"
@@ -148,6 +152,90 @@ def case_agent_failure_no_leak(tmp: Path) -> list[str]:
         log = log_path.read_text(encoding="utf-8")
         if CANARY_AGENT_OUTPUT not in log:
             failures.append("agent_failures.jsonl missing the output — operator can't diagnose")
+    return failures
+
+
+def case_agent_quota_diagnosis_no_leak(tmp: Path) -> list[str]:
+    """Quota failure is actionable without exposing provider output."""
+    srv.REPORTS_DIR = tmp
+    quota_output = (
+        "You've hit your org's monthly spend limit. "
+        f"{CANARY_AGENT_OUTPUT}"
+    )
+
+    def fake_run_agent(prompt, report_id, depth, model=None):
+        return 1, quota_output
+
+    o1 = _with(srv, "_run_agent", fake_run_agent)
+    o2 = _with(srv, "_scanner_health_gate", lambda: (True, "ok"))
+    try:
+        result = srv.research(
+            prompt="x", depth="normal", model="claude-opus-5"
+        )
+    finally:
+        srv._run_agent = o1
+        srv._scanner_health_gate = o2
+
+    failures: list[str] = []
+    blob = json.dumps(result)
+    if CANARY_AGENT_OUTPUT in blob:
+        failures.append(f"quota diagnosis leaked output canary: {blob}")
+    expected_error = (
+        "agent failed: Claude quota exhausted; retry without model override "
+        "to allow automatic fallback"
+    )
+    if result.get("error") != expected_error:
+        failures.append(
+            f"expected fixed quota error {expected_error!r}, got {result.get('error')!r}"
+        )
+    expected_diagnosis = {
+        "layer": "provider",
+        "provider": "claude",
+        "condition": "quota_exhausted",
+        "fallback": "blocked_by_model_pin",
+    }
+    if result.get("agent_failure") != expected_diagnosis:
+        failures.append(
+            f"expected closed quota diagnosis {expected_diagnosis!r}, "
+            f"got {result.get('agent_failure')!r}"
+        )
+    return failures
+
+
+def case_agent_refusal_precedes_quota_marker(tmp: Path) -> list[str]:
+    """Attacker-shaped quota text cannot relabel a policy refusal."""
+    srv.REPORTS_DIR = tmp
+    mixed_output = (
+        "Provider usage policy refusal. "
+        "You've hit your org's monthly spend limit. "
+        f"{CANARY_AGENT_OUTPUT}"
+    )
+
+    def fake_run_agent(prompt, report_id, depth, model=None):
+        return 1, mixed_output
+
+    o1 = _with(srv, "_run_agent", fake_run_agent)
+    o2 = _with(srv, "_scanner_health_gate", lambda: (True, "ok"))
+    try:
+        result = srv.research(
+            prompt="x", depth="normal", model="claude-opus-5"
+        )
+    finally:
+        srv._run_agent = o1
+        srv._scanner_health_gate = o2
+
+    failures: list[str] = []
+    blob = json.dumps(result)
+    if CANARY_AGENT_OUTPUT in blob:
+        failures.append(f"mixed-marker refusal leaked output canary: {blob}")
+    if result.get("error") != srv._REFUSAL_ERROR:
+        failures.append(
+            f"mixed-marker refusal was relabeled: {result.get('error')!r}"
+        )
+    if "agent_failure" in result:
+        failures.append(
+            f"mixed-marker refusal gained quota diagnosis: {result['agent_failure']!r}"
+        )
     return failures
 
 
@@ -493,6 +581,8 @@ def main() -> int:
     cases = [
         ("scanner_reject_no_leak", case_scanner_reject_no_leak),
         ("agent_failure_no_leak", case_agent_failure_no_leak),
+        ("agent_quota_diagnosis_no_leak", case_agent_quota_diagnosis_no_leak),
+        ("agent_refusal_precedes_quota_marker", case_agent_refusal_precedes_quota_marker),
         ("agent_refusal_no_leak", case_agent_refusal_no_leak),
         ("agent_refusal_markers_narrow", case_agent_refusal_markers_narrow),
         ("agent_exception_no_leak", case_agent_exception_no_leak),
