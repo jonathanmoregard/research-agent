@@ -568,6 +568,30 @@ def _hit_org_spend_limit(output: str) -> bool:
     return any(m in low for m in _ORG_SPEND_LIMIT_MARKERS)
 
 
+# Fixed, closed-set response for quota exhaustion. Agent stdout/stderr is
+# attacker-influenceable, so diagnosis may preserve only hardcoded enum values
+# selected by `_hit_usage_limit`; no output substring may cross this boundary.
+_QUOTA_PINNED_ERROR = (
+    "agent failed: Claude quota exhausted; retry without model override "
+    "to allow automatic fallback"
+)
+_QUOTA_FALLBACK_ERROR = (
+    "agent failed: Claude quota exhausted; automatic fallback unavailable"
+)
+
+
+def _agent_quota_diagnosis(output: str, *, model_pinned: bool) -> dict | None:
+    """Cast a quota rejection into a closed, caller-safe vocabulary."""
+    if not _hit_usage_limit(output):
+        return None
+    return {
+        "layer": "provider",
+        "provider": "claude",
+        "condition": "quota_exhausted",
+        "fallback": "blocked_by_model_pin" if model_pinned else "unavailable",
+    }
+
+
 # stdout substrings that identify a provider-side Usage Policy refusal —
 # Anthropic's API classifier declining the request BEFORE the agent runs
 # any search. Same discipline as _LIMIT_MARKERS above: kept deliberately
@@ -1446,8 +1470,9 @@ def _log_agent_failure(report_id: str, exit_code: int, output: str) -> None:
 
     Full agent stdout+stderr stays in reports/_quarantine/agent_failures.jsonl
     — which is deny-listed for Read/Edit/Write/Grep via .claude settings.
-    The caller only sees a generic error + report_id; operators inspect the
-    log from a bare terminal outside any Claude Code session.
+    The caller sees only fixed errors / closed diagnoses + report_id;
+    operators inspect raw output from a bare terminal outside any Claude Code
+    session.
     """
     import datetime
     quarantine_dir = REPORTS_DIR / "_quarantine"
@@ -1646,6 +1671,9 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
         model: Optional Claude model id override for the in-jail agent
             (e.g. 'claude-fable-5', 'claude-sonnet-5'). Empty string uses
             the default pinned in run-agent.sh (currently claude-opus-5).
+            Supplying a model is a hard Claude pin and disables automatic
+            Claude-model and Codex-provider fallback. Omit it unless strict
+            model identity matters.
             Not valid with depth='fast' — the fast path is a direct Exa
             call with no agent, so no model runs at all.
 
@@ -1675,6 +1703,12 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             something in the report itself; that reason stays opaque and
             quarantine-only by design. The report is withheld and
             quarantined either way.
+            Claude quota failures also carry `agent_failure`, containing
+            only closed values: {"layer": "provider", "provider":
+            "claude", "condition": "quota_exhausted", "fallback":
+            "blocked_by_model_pin"|"unavailable"}. Retry without `model`
+            when fallback was blocked by the pin. Provider output remains
+            quarantine-only.
     """
     if depth not in VALID_DEPTHS:
         return {
@@ -1779,28 +1813,48 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             # ANY of it to the caller; log the full tail to the quarantine
             # zone so an operator can diagnose from a bare terminal.
             #
-            # One bit of classification survives the suppression: whether
-            # the provider's Usage Policy classifier refused the request
-            # before the agent ran. That distinction is otherwise invisible
-            # to the caller ("agent failed" after ~60s looks like a crash),
-            # and it is the difference between "retry" and "rephrase". The
-            # bit selects between two module constants — see _REFUSAL_ERROR
-            # for the no-leak / no-auto-retry invariants.
+            # Two closed classifications survive suppression: provider quota
+            # exhaustion and a Usage Policy refusal. Both select only module
+            # constants / hardcoded enums; no output capture crosses into the
+            # response. Refusal takes precedence so attacker-shaped quota
+            # text cannot relabel a provider policy block as retryable.
             refused = _hit_refusal(_output)
+            quota_diagnosis = (
+                None
+                if refused
+                else _agent_quota_diagnosis(_output, model_pinned=bool(model))
+            )
             _LOG.warning(
                 "research agent-fail id=%s rc=%d agent_ms=%d refused=%s "
+                "quota=%s fallback=%s "
                 "(see agent_failures.jsonl in quarantine for output)",
-                report_id, _code, agent_ms, refused,
+                report_id,
+                _code,
+                agent_ms,
+                refused,
+                quota_diagnosis is not None,
+                quota_diagnosis["fallback"] if quota_diagnosis else None,
             )
             _log_agent_failure(report_id, _code, _output)
             report_path.unlink(missing_ok=True)
             total_ms = int((time.monotonic() - t_received) * 1000)
-            return {
+            result = {
                 "status": "error",
-                "error": _REFUSAL_ERROR if refused else "agent failed",
+                "error": (
+                    _QUOTA_PINNED_ERROR
+                    if quota_diagnosis and model
+                    else _QUOTA_FALLBACK_ERROR
+                    if quota_diagnosis
+                    else _REFUSAL_ERROR
+                    if refused
+                    else "agent failed"
+                ),
                 "report_id": report_id,
                 "timings_ms": {"agent": agent_ms, "scan": 0, "total": total_ms},
             }
+            if quota_diagnosis:
+                result["agent_failure"] = quota_diagnosis
+            return result
         if report_path.stat().st_size == 0:
             _LOG.warning("research empty-output id=%s rc=%d", report_id, _code)
             report_path.unlink(missing_ok=True)
