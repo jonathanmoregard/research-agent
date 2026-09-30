@@ -92,6 +92,23 @@ def _clip(value, limit: int = MAX_TITLE_CHARS) -> str:
     return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
+MAX_URL_CHARS = 2000
+_URL_RX = re.compile(r"^https://[^\s<>\"']+$")
+
+
+def _url(value) -> str:
+    """A listing URL exactly as the API gave it, or nothing.
+
+    The agent is told to report URLs verbatim, so a shortened URL would be
+    passed on as a broken link. Anything that is not a plain https URL of
+    sane length is dropped rather than repaired.
+    """
+    s = value if isinstance(value, str) else ""
+    if len(s) > MAX_URL_CHARS or not _URL_RX.match(s):
+        return ""
+    return s
+
+
 # --- rate safety ------------------------------------------------------------
 
 class RefusedError(RuntimeError):
@@ -152,9 +169,17 @@ class _Gate:
 # --- HTTP -------------------------------------------------------------------
 
 class ApiError(RuntimeError):
+    """The API answered with an error status.
+
+    The response body is kept apart from the message: it is remote text
+    (and can echo a seller's or a caller's string), so it only ever reaches
+    the agent inside the untrusted wrap — see `_error_text`.
+    """
+
     def __init__(self, status: int, body: str):
-        super().__init__(f"HTTP {status}: {body[:300]}")
+        super().__init__(f"HTTP {status}")
         self.status = status
+        self.body = body
 
 
 def _http_json(method: str, url: str, headers: dict, data: bytes | None = None):
@@ -382,7 +407,7 @@ def format_ebay_items(body) -> str:
                 f"({_clip(seller.get('feedbackScore'), 10)})"
             )
         lines.append("- " + " | ".join(parts)
-                     + f"\n    {_clip(it.get('itemWebUrl'), 300)}")
+                     + f"\n    {_url(it.get('itemWebUrl')) or '(no usable URL)'}")
     return "\n".join(lines)
 
 
@@ -589,7 +614,7 @@ def format_tradera_items(body) -> str:
         if h["id"] is not None:
             parts.append(f"item id {_clip(h['id'], 20)}")
         lines.append("- " + " | ".join(parts)
-                     + (f"\n    {_clip(h['url'], 300)}" if h["url"] else ""))
+                     + (f"\n    {_url(h['url'])}" if _url(h["url"]) else ""))
     return "\n".join(lines)
 
 
@@ -654,6 +679,15 @@ SERVER_INFO = {"name": "shopping-shim", "version": "1.0.0"}
 CAPABILITIES = {"tools": {"listChanged": False}}
 
 
+def _error_text(tool: str, e: Exception) -> str:
+    if isinstance(e, ApiError):
+        detail = _clip(e.body, 300)
+        return f"ERROR: {tool}: the API answered HTTP {e.status}." + (
+            "\n" + _wrap_untrusted(f"{tool}-error-body", detail) if detail else ""
+        )
+    return f"ERROR: {e}"
+
+
 def _respond(msg_id, result=None, error=None):
     out: dict = {"jsonrpc": "2.0", "id": msg_id}
     if error is not None:
@@ -697,7 +731,8 @@ def _handle(msg: dict) -> None:
         except Exception as e:
             _respond(
                 msg_id,
-                result={"content": [{"type": "text", "text": f"ERROR: {e}"}], "isError": True},
+                result={"content": [{"type": "text", "text": _error_text(name, e)}],
+                        "isError": True},
             )
         return
     if msg_id is not None:

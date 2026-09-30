@@ -1116,7 +1116,7 @@ PROMPT_TEMPLATE = (
 CODEX_PROMPT_TEMPLATE = (
     "You are the research-agent. Today's date is {today}. Investigate the "
     "following prompt using only the configured web MCP tools (exa, tavily, "
-    "render, trademark, bolagsverket, prv). Do not run shell commands, use "
+    "render, trademark, bolagsverket, prv, shopping). Do not run shell commands, use "
     "native web tools, or write files. Return the complete cited Markdown "
     "report as your final response; the launcher captures that response into "
     "the single permitted report file.\n\n"

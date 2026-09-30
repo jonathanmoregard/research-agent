@@ -62,3 +62,20 @@ def test_completion_rubric_protocol():
 def test_retrac_state_buffer():
     for marker in ("STATE block", "DEAD-ENDS:", "CONFIRMED:", "PLAN:"):
         assert marker in AGENT_MD
+
+
+def test_codex_prompt_names_every_configured_tool_family():
+    """The Codex prompt says "using only the configured web MCP tools (...)".
+    A server configured for Codex but missing from that list is one the
+    fallback provider is told not to use."""
+    import re
+    import sys
+    import tomllib
+    sys.path.insert(0, str(REPO))
+    from mcp_server.server import CODEX_PROMPT_TEMPLATE
+    config = tomllib.loads((REPO / "agent" / "codex-config.toml").read_text())
+    listed = re.search(r"web MCP tools \(([^)]*)\)", CODEX_PROMPT_TEMPLATE).group(1)
+    named = {n.strip() for n in listed.split(",")}
+    for server in config["mcp_servers"]:
+        family = server.split("-")[0]  # tavily-remote-mcp -> tavily
+        assert family in named, f"{server} is configured but not named in the Codex prompt"
