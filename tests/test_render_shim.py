@@ -24,6 +24,9 @@ os.environ["SCRAPER_TOKEN_FILE"] = str(_TOKEN_FILE)
 
 from agent.shims import render_shim  # noqa: E402
 
+# Captured before any test swaps in the stub, for the transport tests.
+_REAL_POST_SCRAPER = render_shim._post_scraper
+
 
 def _assert(cond: bool, msg: str) -> None:
     if not cond:
@@ -190,6 +193,83 @@ def test_render_page_payload_shape():
     _assert("<p>hi</p>" in out, f"render output wrong: {out!r}")
 
 
+# ----- render_page transport cap (real HTTP, no _post_scraper stub) -----
+
+def _serve_once(envelope: bytes):
+    """Local stand-in for the scraper's /render: replies with `envelope`."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(envelope)))
+            self.end_headers()
+            self.wfile.write(envelope)
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _scraper_envelope(html: str, truncated: bool) -> bytes:
+    # Same encoding the scraper uses: json.dumps(...).encode("utf-8").
+    import json
+    return json.dumps({
+        "status": "ok",
+        "requested_url": "https://shop.example/s?k=x",
+        "final_url": "https://shop.example/s?k=x",
+        "http_status": 200,
+        "title": "Results",
+        "html": html,
+        "truncated": truncated,
+    }).encode("utf-8")
+
+
+def test_render_page_accepts_scraper_truncated_page():
+    """A page the scraper truncated to its own HTML ceiling must reach the
+    agent. The JSON envelope is always larger than the HTML it carries
+    (escaping + fields), so a transport cap equal to the HTML cap rejects
+    every heavy page — which is what shop search pages are."""
+    # Quotes double under JSON escaping: worst realistic case for markup.
+    html = '"' * render_shim.MAX_BODY_BYTES
+    srv = _serve_once(_scraper_envelope(html, truncated=True))
+    render_shim._post_scraper = _REAL_POST_SCRAPER
+    saved_url = render_shim.API_URL
+    render_shim.API_URL = f"http://127.0.0.1:{srv.server_address[1]}/render"
+    try:
+        out = render_shim._tool_render_page({"url": "https://shop.example/s?k=x"})
+    finally:
+        render_shim.API_URL = saved_url
+        srv.shutdown()
+    _assert("HTTP-Status: 200" in out, "truncated page did not reach the agent")
+    _assert("[scraper-truncated]" in out, "truncation marker missing")
+    _assert(html in out, "page body was not forwarded intact")
+
+
+def test_render_page_still_rejects_runaway_response():
+    """The transport cap still bounds what the shim will buffer."""
+    html = "a" * (render_shim.MAX_RENDER_TRANSPORT_BYTES + 1)
+    srv = _serve_once(_scraper_envelope(html, truncated=False))
+    render_shim._post_scraper = _REAL_POST_SCRAPER
+    saved_url = render_shim.API_URL
+    render_shim.API_URL = f"http://127.0.0.1:{srv.server_address[1]}/render"
+    try:
+        try:
+            render_shim._tool_render_page({"url": "https://shop.example/s?k=x"})
+            _assert(False, "runaway response was accepted")
+        except RuntimeError as e:
+            _assert("too large" in str(e), f"wrong error: {e}")
+    finally:
+        render_shim.API_URL = saved_url
+        srv.shutdown()
+
+
 def main() -> int:
     tests = [
         test_intercept_missing_url,
@@ -200,6 +280,8 @@ def main() -> int:
         test_intercept_formats_capture,
         test_intercept_propagates_scraper_error,
         test_render_page_payload_shape,
+        test_render_page_accepts_scraper_truncated_page,
+        test_render_page_still_rejects_runaway_response,
     ]
     for t in tests:
         t()
