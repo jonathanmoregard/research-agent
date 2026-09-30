@@ -75,6 +75,10 @@ BOLAGSVERKET_TOOLS="mcp__bolagsverket__bolagsverket_search"
 # /tool-cache bind below (888 MiB full-extract index; rebuilding per-jail
 # is impractical — see shim header).
 PRV_TOOLS="mcp__prv__prv_search"
+# Shopping search on the marketplaces' own read-only APIs (eBay Buy Browse,
+# Tradera REST v4). Same inert-without-creds behaviour as TRADEMARK_TOOLS.
+# Search only — neither shim can bid, buy or message.
+SHOPPING_TOOLS="mcp__shopping__ebay_search,mcp__shopping__tradera_search"
 
 # Default model for BOTH agent depths (fast runs no agent at all — it is
 # a direct server-side Exa call, so no model applies there). Single
@@ -95,11 +99,11 @@ DEFAULT_MODEL="claude-opus-5"
 
 case "${DEPTH}" in
   normal)
-    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},${BROWSE_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},${PRV_TOOLS},Write"
+    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},${BROWSE_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},${PRV_TOOLS},${SHOPPING_TOOLS},Write"
     MODEL="${DEFAULT_MODEL}"
     ;;
   deep)
-    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},${BROWSE_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},${PRV_TOOLS},Write"
+    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},${BROWSE_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},${PRV_TOOLS},${SHOPPING_TOOLS},Write"
     MODEL="${DEFAULT_MODEL}"
     ;;
   *)
@@ -360,6 +364,10 @@ bwrap \
   --setenv TAVILY_API_KEY "${TAVILY_API_KEY}" \
   --setenv EUIPO_CLIENT_ID "${EUIPO_CLIENT_ID:-}" \
   --setenv EUIPO_CLIENT_SECRET "${EUIPO_CLIENT_SECRET:-}" \
+  --setenv EBAY_CLIENT_ID "${EBAY_CLIENT_ID:-}" \
+  --setenv EBAY_CLIENT_SECRET "${EBAY_CLIENT_SECRET:-}" \
+  --setenv TRADERA_APP_ID "${TRADERA_APP_ID:-}" \
+  --setenv TRADERA_APP_KEY "${TRADERA_APP_KEY:-}" \
   "${CACHE_ARGS[@]}" \
   --setenv CLAUDE_STREAM_IDLE_TIMEOUT_MS "1800000" \
   -- \

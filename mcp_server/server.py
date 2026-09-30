@@ -8,9 +8,11 @@ Exposes one tool:
 Flow per call:
   1. Host MCP server receives prompt.
   2. ssh into the long-running research-agent microvm on 127.0.0.1:2223
-     (port-forwarded by microvm.nix from the guest's port 22). Seven
+     (port-forwarded by microvm.nix from the guest's port 22). Eleven
      null-terminated fields (claude_token, codex_auth_json, exa, tavily,
-     euipo_client_id, euipo_client_secret, prompt_body) ship over stdin; a
+     euipo_client_id, euipo_client_secret, ebay_client_id,
+     ebay_client_secret, tradera_app_id, tradera_app_key, prompt_body)
+     ship over stdin; a
      guest-side inline bash writes the prompt to a tmp file under the agent
      user's $HOME and execs scripts/run-agent.sh.
   3. scripts/run-agent.sh spawns a fresh bubblewrap jail — new tmpfs
@@ -275,6 +277,10 @@ _SECRET_ENV = {
     "tavily-api-key": "TAVILY_API_KEY",
     "euipo-client-id": "EUIPO_CLIENT_ID",
     "euipo-client-secret": "EUIPO_CLIENT_SECRET",
+    "ebay-client-id": "EBAY_CLIENT_ID",
+    "ebay-client-secret": "EBAY_CLIENT_SECRET",
+    "tradera-app-id": "TRADERA_APP_ID",
+    "tradera-app-key": "TRADERA_APP_KEY",
 }
 
 
@@ -493,6 +499,10 @@ def _secrets() -> dict[str, str]:
         "tavily-api-key",
         "euipo-client-id",
         "euipo-client-secret",
+        "ebay-client-id",
+        "ebay-client-secret",
+        "tradera-app-id",
+        "tradera-app-key",
     ):
         if name in SECRETS_CACHE:
             continue
@@ -1115,9 +1125,10 @@ CODEX_PROMPT_TEMPLATE = (
 )
 
 
-# Guest-side inline bash run by sshd inside the microvm. Reads seven
+# Guest-side inline bash run by sshd inside the microvm. Reads eleven
 # null-terminated fields from stdin (claude_token, codex_auth_json, exa,
-# tavily, euipo_client_id, euipo_client_secret, prompt_body), writes the prompt
+# tavily, euipo_client_id, euipo_client_secret, ebay_client_id,
+# ebay_client_secret, tradera_app_id, tradera_app_key, prompt_body), writes the prompt
 # to a tmp file under $HOME, then exec's run-agent.sh with (uuid,
 # prompt_file). The EXIT trap cleans the tmp file even if SSH
 # disconnects mid-call.
@@ -1136,9 +1147,14 @@ _GUEST_SCRIPT = (
     "IFS= read -r -d '' TAVILY_API_KEY; "
     "IFS= read -r -d '' EUIPO_CLIENT_ID; "
     "IFS= read -r -d '' EUIPO_CLIENT_SECRET; "
+    "IFS= read -r -d '' EBAY_CLIENT_ID; "
+    "IFS= read -r -d '' EBAY_CLIENT_SECRET; "
+    "IFS= read -r -d '' TRADERA_APP_ID; "
+    "IFS= read -r -d '' TRADERA_APP_KEY; "
     "IFS= read -r -d '' PROMPT_BODY; "
     "export CLAUDE_CODE_OAUTH_TOKEN CODEX_AUTH_JSON EXA_API_KEY TAVILY_API_KEY"
-    " EUIPO_CLIENT_ID EUIPO_CLIENT_SECRET; "
+    " EUIPO_CLIENT_ID EUIPO_CLIENT_SECRET"
+    " EBAY_CLIENT_ID EBAY_CLIENT_SECRET TRADERA_APP_ID TRADERA_APP_KEY; "
     'TMP=$(mktemp -p "$HOME" research-prompt.XXXXXX); '
     'chmod 600 "$TMP"; '
     "trap 'rm -f \"$TMP\"' EXIT; "
@@ -1202,7 +1218,7 @@ def _dial_agent(
     """One ssh dial to the microvm (with rc=255 transport retry).
 
     Connects to the agent's sshd on RESEARCH_SSH_HOST:RESEARCH_SSH_PORT,
-    streams seven null-terminated fields over stdin (six secrets +
+    streams eleven null-terminated fields over stdin (ten secrets +
     prompt body), and waits for run-agent.sh inside the VM to complete.
 
     Returns (exit_code, combined_output).
@@ -1223,11 +1239,11 @@ def _dial_agent(
 
     secrets = _secrets()
 
-    # Seven null-terminated fields. Mirrors the docker-era contract but
+    # Eleven null-terminated fields. Mirrors the docker-era contract but
     # carries the prompt body as the last field — eliminates the
     # separate docker-cp step. Order MUST match the reader in
     # `_GUEST_SCRIPT` exactly (claude, codex auth, exa, tavily, euipo-id,
-    # euipo-secret, prompt). Missing secrets are sent as empty strings
+    # euipo-secret, ebay-id, ebay-secret, tradera-id, tradera-key, prompt). Missing secrets are sent as empty strings
     # so the wire format stays stable; downstream shims fail cleanly
     # on auth rather than the protocol desynchronising.
     stdin_payload = "".join(
@@ -1239,6 +1255,10 @@ def _dial_agent(
             secrets.get("tavily-api-key", ""),
             secrets.get("euipo-client-id", ""),
             secrets.get("euipo-client-secret", ""),
+            secrets.get("ebay-client-id", ""),
+            secrets.get("ebay-client-secret", ""),
+            secrets.get("tradera-app-id", ""),
+            secrets.get("tradera-app-key", ""),
             full_prompt,
         )
     )

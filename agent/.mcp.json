@@ -29,6 +29,16 @@
         "EUIPO_CLIENT_SECRET": "${EUIPO_CLIENT_SECRET}"
       }
     },
+    "shopping": {
+      "command": "python3",
+      "args": ["/workspace/agent/shims/shopping_shim.py"],
+      "env": {
+        "EBAY_CLIENT_ID": "${EBAY_CLIENT_ID}",
+        "EBAY_CLIENT_SECRET": "${EBAY_CLIENT_SECRET}",
+        "TRADERA_APP_ID": "${TRADERA_APP_ID}",
+        "TRADERA_APP_KEY": "${TRADERA_APP_KEY}"
+      }
+    },
     "bolagsverket": {
       "command": "python3",
       "args": ["/workspace/agent/shims/bolagsverket_shim.py"]

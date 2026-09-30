@@ -57,6 +57,12 @@ args = ["/workspace/agent/shims/trademark_shim.py"]
 env_vars = ["EUIPO_CLIENT_ID", "EUIPO_CLIENT_SECRET"]
 enabled_tools = ["trademark_search"]
 
+[mcp_servers.shopping]
+command = "python3"
+args = ["/workspace/agent/shims/shopping_shim.py"]
+env_vars = ["EBAY_CLIENT_ID", "EBAY_CLIENT_SECRET", "TRADERA_APP_ID", "TRADERA_APP_KEY"]
+enabled_tools = ["ebay_search", "tradera_search"]
+
 [mcp_servers.bolagsverket]
 command = "python3"
 args = ["/workspace/agent/shims/bolagsverket_shim.py"]
