@@ -39,6 +39,15 @@ TOKEN_FILE = os.environ.get("SCRAPER_TOKEN_FILE", "/etc/scraper/token")
 # HTML from a malicious target.
 MAX_BODY_BYTES = 512 * 1024
 
+# Read cap for the /render reply. That reply is a JSON envelope around the
+# HTML, and JSON escaping expands it (a quote doubles; a control or
+# non-ASCII character becomes a 6-byte \uXXXX), so the envelope for a page
+# at the scraper's HTML ceiling is always bigger than the ceiling itself.
+# Reading with MAX_BODY_BYTES rejected every such page as "too large"
+# before the truncation below could run. 6x is the worst-case expansion;
+# the extra 64 KiB covers the other envelope fields.
+MAX_RENDER_TRANSPORT_BYTES = 6 * MAX_BODY_BYTES + 64 * 1024
+
 
 def _load_token() -> str:
     try:
@@ -377,7 +386,8 @@ def _tool_render_page(args: dict) -> str:
     timeout_ms = args.get("timeout_ms") or 30000
     if not isinstance(timeout_ms, int):
         timeout_ms = 30000
-    out = _post_scraper(API_URL, {"url": url, "timeout_ms": timeout_ms}, timeout_ms)
+    out = _post_scraper(API_URL, {"url": url, "timeout_ms": timeout_ms}, timeout_ms,
+                        max_bytes=MAX_RENDER_TRANSPORT_BYTES)
     html = out.get("html") or ""
     if len(html.encode("utf-8", errors="replace")) > MAX_BODY_BYTES:
         html = html.encode("utf-8", errors="replace")[:MAX_BODY_BYTES].decode(
