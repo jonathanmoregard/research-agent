@@ -4,9 +4,10 @@ Mocks subprocess.run so we can assert the exact ssh argv and stdin
 protocol without needing a running VM. Verifies:
 
 - ssh is invoked (not docker)
-- exactly seven null-terminated fields land on stdin, in order:
+- exactly eleven null-terminated fields land on stdin, in order:
     claude_token, codex_auth_json, exa_api_key, tavily_api_key,
-    euipo_client_id, euipo_client_secret, prompt_body
+    euipo_client_id, euipo_client_secret, ebay_client_id,
+    ebay_client_secret, tradera_app_id, tradera_app_key, prompt_body
 - RESEARCH_DEPTH is set on the remote command
 - uuid is passed as a positional arg
 - timeout propagates
@@ -30,6 +31,10 @@ def _env(monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "ct-test")
     monkeypatch.setenv("EUIPO_CLIENT_ID", "euipo-id-test")
     monkeypatch.setenv("EUIPO_CLIENT_SECRET", "euipo-secret-test")
+    monkeypatch.setenv("EBAY_CLIENT_ID", "ebay-id-test")
+    monkeypatch.setenv("EBAY_CLIENT_SECRET", "ebay-secret-test")
+    monkeypatch.setenv("TRADERA_APP_ID", "tradera-id-test")
+    monkeypatch.setenv("TRADERA_APP_KEY", "tradera-key-test")
     # Point the credentials-file source at a non-existent path. Without
     # this the file source wins (file > env for claude-token) and these
     # wire-format tests would read the developer's real ~/.claude/.credentials.json.
@@ -82,7 +87,7 @@ def test_run_agent_uses_ssh_not_docker():
     assert "RESEARCH_DEPTH=normal" in joined
 
 
-def test_run_agent_stdin_is_seven_null_terminated_fields():
+def test_run_agent_stdin_is_eleven_null_terminated_fields():
     server = _import_server()
     captured = {}
 
@@ -101,14 +106,18 @@ def test_run_agent_stdin_is_seven_null_terminated_fields():
     parts = data.split("\0")
     assert parts[-1] == ""
     fields = parts[:-1]
-    assert len(fields) == 7
+    assert len(fields) == 11
     assert fields[0] == "ct-test"
     assert fields[1] == ""
     assert fields[2] == "exa-test-key"
     assert fields[3] == "tav-test-key"
     assert fields[4] == "euipo-id-test"
     assert fields[5] == "euipo-secret-test"
-    assert "the prompt body" in fields[6]
+    assert fields[6] == "ebay-id-test"
+    assert fields[7] == "ebay-secret-test"
+    assert fields[8] == "tradera-id-test"
+    assert fields[9] == "tradera-key-test"
+    assert "the prompt body" in fields[10]
 
 
 def test_each_provider_receives_only_its_own_auth(monkeypatch):
@@ -171,10 +180,10 @@ def test_run_agent_timeout_propagates():
             server._run_agent(prompt="x", report_id="0" * 32, depth="normal")
 
 
-def test_run_agent_empty_secrets_still_ships_seven_fields(monkeypatch):
-    """If _secrets() returns {} the stdin payload still has exactly seven
-    NUL-terminated fields (empty strings for the six missing secrets,
-    then the prompt). The guest-side bash reads seven fields regardless;
+def test_run_agent_empty_secrets_still_ships_eleven_fields(monkeypatch):
+    """If _secrets() returns {} the stdin payload still has exactly eleven
+    NUL-terminated fields (empty strings for the ten missing secrets,
+    then the prompt). The guest-side bash reads eleven fields regardless;
     auth then fails inside the agent layer with a clear per-tool error
     rather than silently desynchronising the stdin protocol."""
     monkeypatch.delenv("EXA_API_KEY", raising=False)
@@ -182,6 +191,9 @@ def test_run_agent_empty_secrets_still_ships_seven_fields(monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.delenv("EUIPO_CLIENT_ID", raising=False)
     monkeypatch.delenv("EUIPO_CLIENT_SECRET", raising=False)
+    for name in ("EBAY_CLIENT_ID", "EBAY_CLIENT_SECRET",
+                 "TRADERA_APP_ID", "TRADERA_APP_KEY"):
+        monkeypatch.delenv(name, raising=False)
 
     server = _import_server()
     # Stub keyring + claude-credentials lookups so no secrets land in
@@ -207,14 +219,9 @@ def test_run_agent_empty_secrets_still_ships_seven_fields(monkeypatch):
     parts = captured["input"].split("\0")
     assert parts[-1] == ""
     fields = parts[:-1]
-    assert len(fields) == 7
-    assert fields[0] == ""  # claude
-    assert fields[1] == ""  # codex auth JSON
-    assert fields[2] == ""  # exa
-    assert fields[3] == ""  # tavily
-    assert fields[4] == ""  # euipo-client-id
-    assert fields[5] == ""  # euipo-client-secret
-    assert "hello world" in fields[6]
+    assert len(fields) == 11
+    assert fields[:10] == [""] * 10  # every secret slot present and empty
+    assert "hello world" in fields[10]
 
 
 def test_ssh_settings_empty_env_falls_through_to_default(monkeypatch):

@@ -227,6 +227,7 @@ class CodexProviderFallbackTests(unittest.TestCase):
                 "browse_close",
             },
             "trademark": {"trademark_search"},
+            "shopping": {"ebay_search", "tradera_search"},
             "bolagsverket": {"bolagsverket_search"},
             "prv": {"prv_search"},
         }
