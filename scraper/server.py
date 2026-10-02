@@ -73,6 +73,15 @@ _VISIBLE_TEXT_JS = r"""
     "NAV", "OL", "P", "PRE", "SECTION", "TABLE", "TR", "UL"]);
   const out = [];
   const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+  // Tracking and ad-redirect URLs run to kilobytes (Amazon) and pushed the
+  // listings out of the agent's first slice. Long URLs lose their query;
+  // a path that is still huge is an opaque redirect token, elided.
+  const shortHref = (href) => {
+    if (href.length <= 150) return href;
+    const u = new URL(href);
+    const bare = u.origin + u.pathname;
+    return bare.length <= 300 ? bare : u.origin + "/…(long link elided)";
+  };
   const hidden = (el) => {
     const cs = window.getComputedStyle(el);
     return cs.display === "none" || cs.visibility === "hidden";
@@ -84,9 +93,11 @@ _VISIBLE_TEXT_JS = r"""
     if (SKIP.has(tag) || hidden(node)) return;
     if (tag === "A" && node.href && !node.href.startsWith("javascript:")) {
       const img = node.querySelector("img[alt]");
+      // Card overlays (Vinted) are empty anchors whose title attribute
+      // carries the whole listing: title, brand, condition, price.
       const label = clean(node.innerText) || clean(node.getAttribute("aria-label"))
-        || clean(img && img.getAttribute("alt"));
-      if (label) out.push(` [${label}](${node.href}) `);
+        || clean(node.getAttribute("title")) || clean(img && img.getAttribute("alt"));
+      if (label) out.push(` [${label}](${shortHref(node.href)}) `);
       return;
     }
     const block = BLOCK.has(tag);
