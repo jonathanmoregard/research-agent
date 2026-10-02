@@ -57,6 +57,14 @@ MAX_RENDER_TRANSPORT_BYTES = 6 * (MAX_BODY_BYTES + MAX_SCRAPER_TEXT_BYTES) + 64 
 # 40 KiB stays well inside the clients' ~25k-token tool-result limit.
 # Longer pages are read in slices via render_page's `offset`.
 AGENT_OUTPUT_BYTES = 40 * 1024
+# intercept_page lists each capture's URLs and request body; clip them so
+# a capture's metadata cannot eat the answer budget.
+MAX_LISTED_URL = 300
+MAX_LISTED_REQ_BODY = 512
+
+
+def _clip(s: str, n: int) -> str:
+    return s if len(s) <= n else s[:n] + "…"
 
 
 def _load_token() -> str:
@@ -418,7 +426,11 @@ def _slice_utf8(content: str, offset: int, cap: int) -> tuple[str, int | None]:
     """
     data = content.encode("utf-8", errors="replace")
     offset = max(0, min(offset, len(data)))
-    chunk = data[offset:offset + cap]
+    end = min(offset + cap, len(data))
+    # Never cut inside a multi-byte character: back off continuation bytes.
+    while offset < end < len(data) and (data[end] & 0xC0) == 0x80:
+        end -= 1
+    chunk = data[offset:end]
     if offset + len(chunk) < len(data):
         nl = chunk.rfind(b"\n")
         if nl > cap // 2:
@@ -492,32 +504,40 @@ def _tool_intercept_page(args: dict) -> str:
     }
     out = _post_scraper(INTERCEPT_URL, payload, timeout_ms)
     captured = out.get("captured") or []
-    lines = [
-        f"Requested-URL: {out.get('requested_url') or url}",
-        f"Final-URL: {out.get('final_url') or url}",
+    header = [
+        f"Requested-URL: {_clip(out.get('requested_url') or url, MAX_LISTED_URL)}",
+        f"Final-URL: {_clip(out.get('final_url') or url, MAX_LISTED_URL)}",
         f"Captured: {len(captured)} response(s)",
         "",
     ]
-    # Split the answer budget across captures; ~1.5 KiB per capture goes to
-    # the request line, request body and headers of the listing.
-    body_share = max(
-        2048, (AGENT_OUTPUT_BYTES // max(1, len(captured))) - 1536
-    )
+    # Metadata first (URLs and request bodies clipped), then split what is
+    # left of the answer budget across the response bodies, so the whole
+    # answer stays inside AGENT_OUTPUT_BYTES however many captures there are.
+    metas = []
     for i, cap in enumerate(captured):
         req = cap.get("request") or {}
         resp = cap.get("response") or {}
-        lines.append(f"--- Capture #{i + 1} ---")
-        lines.append(
-            f"Request : {req.get('method', '?')} {req.get('url', '?')}"
-        )
+        meta = [
+            f"--- Capture #{i + 1} ---",
+            f"Request : {req.get('method', '?')} "
+            f"{_clip(req.get('url') or '?', MAX_LISTED_URL)}",
+        ]
         req_body = req.get("body") or ""
         if req_body:
-            body_cap = req_body[:1024]
             trailer = " [truncated]" if req.get("body_truncated") else ""
-            lines.append(f"Req-Body: {body_cap}{trailer}")
-        lines.append(
-            f"Response: HTTP {resp.get('status', 0)} (url={resp.get('url', '?')})"
+            meta.append(f"Req-Body: {_clip(req_body, MAX_LISTED_REQ_BODY)}{trailer}")
+        meta.append(
+            f"Response: HTTP {resp.get('status', 0)} "
+            f"(url={_clip(resp.get('url') or '?', MAX_LISTED_URL)})"
         )
+        metas.append((meta, resp))
+    used = sum(len(ln.encode()) + 1 for ln in header)
+    used += sum(len(ln.encode()) + 1 for meta, _ in metas for ln in meta)
+    used += 160 * len(metas)  # body separator lines and truncation notes
+    body_share = max(0, AGENT_OUTPUT_BYTES - used) // max(1, len(metas))
+    lines = list(header)
+    for meta, resp in metas:
+        lines.extend(meta)
         body = resp.get("body") or ""
         trailer = " [truncated]" if resp.get("body_truncated") else ""
         body_bytes = len(body.encode("utf-8", errors="replace"))

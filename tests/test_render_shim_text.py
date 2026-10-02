@@ -92,6 +92,30 @@ def test_render_without_scraper_text_falls_back_to_html(monkeypatch):
     assert "<html>raw</html>" in out
 
 
+def test_slices_split_on_character_boundaries():
+    content = "ö" * 30000  # 2-byte chars on one line: no newline to back up to
+    first, nxt = render_shim._slice_utf8(content, 0, 40961)
+    second, end = render_shim._slice_utf8(content, nxt, 40961)
+    assert end is None
+    assert len(first) + len(second) == len(content)
+    assert nxt == len(first.encode())
+
+
+def test_intercept_many_captures_with_long_urls_fit_budget(monkeypatch):
+    url = "https://api.example/search?" + "q" * 4000
+    cap = {
+        "request": {"method": "POST", "url": url, "body": "x" * 4000,
+                    "body_truncated": False},
+        "response": {"status": 200, "url": url, "body": "y" * 50000,
+                     "body_truncated": False},
+    }
+    _stub(monkeypatch, {"status": "ok", "requested_url": "https://s.example",
+                        "final_url": "https://s.example", "captured": [cap] * 16})
+    out = render_shim._tool_intercept_page({"url": "https://s.example"})
+    assert len(out.encode()) <= CAP + 2048
+    assert out.count("--- Capture #") == 16
+
+
 def test_intercept_output_fits_agent_budget(monkeypatch):
     body = '{"hits":[' + ",".join(['{"title":"Kettle","price":249}'] * 20000) + "]}"
     cap = {
