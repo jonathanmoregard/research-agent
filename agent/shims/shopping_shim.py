@@ -522,15 +522,24 @@ TRADERA_SEARCH_URL = "https://api.tradera.com/v4/search"
 
 _tradera_gate = _Gate("Tradera")
 
-# CAVEAT — Tradera's published OpenAPI spec declares the search response
-# (`SearchResult`) as an empty object, and the docs carry no example. The
-# keys below are the documented `Item` schema plus the spellings a result
-# wrapper plausibly uses. The formatter is defensive on purpose: if it
-# recognises nothing it returns a capped raw dump, so the first live call
-# shows the real shape. Tighten `_tradera_records` / `normalize_tradera_item`
-# once one has been seen.
-_TRADERA_LIST_KEYS = ("items", "searchResult", "results", "hits", "data")
-_TRADERA_TOTAL_KEYS = ("totalNumberOfItems", "totalCount", "total", "count")
+# Response shape. The OpenAPI spec declares `SearchResult` as an empty object
+# and publishes no example, so the field names come from Tradera's class
+# documentation for the same contract (Tradera.Api.Library.ContractData.
+# Version4.Search), mapped to camelCase per the REST docs ("JSON with
+# camelCase property names", https://api.tradera.com/llms-full.txt):
+#   SearchResult: items, totalNumberOfItems, totalNumberOfPages, errors
+#   SearchItem:   id, shortDescription, itemUrl ("The url to this item on
+#                 www.tradera.com"), buyItNowPrice, maxBid, nextBid, hasBids,
+#                 bidCount, endDate, isEnded, sellerAlias, itemType, ...
+# https://api.tradera.com/v3/documentation/classdocumentation.aspx?name=T%3ATradera.Api.Library.ContractData.Version4.Search.SearchItem
+# A few fallbacks read the sibling `Item` schema (GET /v4/items/{id}:
+# itemLink, totalBids, seller.alias), which names the same facts differently.
+# Tradera documents no way to build a listing URL from an item id, so none is
+# built: the URL is whatever `itemUrl` says, or nothing. Unrecognised shapes
+# are dumped raw (capped) rather than hidden.
+_TRADERA_LIST_KEY = "items"
+_TRADERA_TOTAL_KEY = "totalNumberOfItems"
+TRADERA_WEB_ORIGIN = "https://www.tradera.com"
 
 
 def build_tradera_request(args: dict) -> str:
@@ -546,14 +555,35 @@ def build_tradera_request(args: dict) -> str:
 
 
 def _tradera_records(body) -> list:
-    if isinstance(body, list):
-        return body
-    if isinstance(body, dict):
-        for key in _TRADERA_LIST_KEYS:
-            v = body.get(key)
-            if isinstance(v, list):
-                return v
+    if isinstance(body, dict) and isinstance(body.get(_TRADERA_LIST_KEY), list):
+        return body[_TRADERA_LIST_KEY]
     return []
+
+
+def _tradera_listing_url(value) -> str:
+    """The listing URL Tradera returned, as a usable https link, or nothing.
+
+    Accepts only links on tradera.com. An http link is upgraded to https and
+    a site-relative path ("/item/...") is joined to the www origin — both are
+    the same address Tradera gave, not one invented from an id. Anything
+    else (other hosts, credentials or ports in the authority, junk) is
+    dropped.
+    """
+    if not isinstance(value, str):
+        return ""
+    s = value.strip()
+    if s.startswith("/") and not s.startswith("//"):
+        s = TRADERA_WEB_ORIGIN + s
+    try:
+        parts = urllib.parse.urlsplit(s)
+    except ValueError:
+        return ""
+    host = (parts.hostname or "").lower()
+    if (parts.scheme.lower() not in ("http", "https")
+            or not (host == "tradera.com" or host.endswith(".tradera.com"))
+            or parts.netloc.lower() != host):
+        return ""
+    return _url(urllib.parse.urlunsplit(("https",) + tuple(parts)[1:]))
 
 
 def _present(d: dict, *keys: str):
@@ -568,16 +598,20 @@ def normalize_tradera_item(rec) -> dict:
     if not isinstance(rec, dict):
         return {}
     seller = rec.get("seller") if isinstance(rec.get("seller"), dict) else {}
+    # A buy-now listing can carry maxBid equal to its price with no bids;
+    # when the API says there are no bids, there is no leading bid.
+    no_bids = rec.get("hasBids") is False
     return {
-        "title": _present(rec, "shortDescription", "title", "name"),
+        "title": _present(rec, "shortDescription"),
         "buy_now": _present(rec, "buyItNowPrice"),
-        "bid": _present(rec, "maxBid", "currentBid", "price"),
+        "bid": None if no_bids else _present(rec, "maxBid"),
         "next_bid": _present(rec, "nextBid"),
-        "bids": _present(rec, "totalBids", "bidCount"),
+        "bids": _present(rec, "bidCount", "totalBids"),
         "ends": _present(rec, "endDate"),
-        "url": _present(rec, "itemLink", "itemUrl", "url"),
-        "id": _present(rec, "id", "itemId"),
-        "seller": _present(seller, "alias", "name"),
+        "ended": rec.get("isEnded") is True,
+        "url": _tradera_listing_url(_present(rec, "itemUrl", "itemLink")),
+        "id": _present(rec, "id"),
+        "seller": _present(rec, "sellerAlias") or _present(seller, "alias"),
     }
 
 
@@ -586,12 +620,13 @@ def format_tradera_items(body) -> str:
     if not records:
         raw = json.dumps(body, ensure_ascii=False)[:4000]
         return f"(no recognised result list)\n--- raw (capped) ---\n{raw}"
-    total = _present(body, *_TRADERA_TOTAL_KEYS) if isinstance(body, dict) else None
+    total = _present(body, _TRADERA_TOTAL_KEY)
     lines = [
         f"{min(len(records), MAX_ITEMS)} shown"
         + (f" of {total} total" if total is not None else "")
         + " (prices in SEK):\n"
     ]
+    any_url = False
     for rec in records[:MAX_ITEMS]:
         h = normalize_tradera_item(rec)
         if not any(h.values()):
@@ -607,14 +642,24 @@ def format_tradera_items(body) -> str:
             parts.append(f"next bid {_clip(h['next_bid'], 12)} kr")
         if h["bids"] is not None:
             parts.append(f"{_clip(h['bids'], 8)} bids")
-        if h["ends"]:
+        if h["ended"]:
+            parts.append("ENDED")
+        elif h["ends"]:
             parts.append(f"ends {_clip(h['ends'], 30)}")
         if h["seller"]:
             parts.append(f"seller {_clip(h['seller'], 40)}")
         if h["id"] is not None:
             parts.append(f"item id {_clip(h['id'], 20)}")
         lines.append("- " + " | ".join(parts)
-                     + (f"\n    {_url(h['url'])}" if _url(h["url"]) else ""))
+                     + (f"\n    {h['url']}" if h["url"] else ""))
+        any_url = any_url or bool(h["url"])
+    if not any_url:
+        # The documented itemUrl was missing or unusable on every record:
+        # show one record raw so the actual shape is visible, instead of
+        # silently listing items nobody can open.
+        lines.append(
+            "(no usable listing URL in this response; first record raw: "
+            + json.dumps(records[0], ensure_ascii=False)[:1500] + ")")
     return "\n".join(lines)
 
 
