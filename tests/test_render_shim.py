@@ -249,7 +249,9 @@ def test_render_page_accepts_scraper_truncated_page():
         srv.shutdown()
     _assert("HTTP-Status: 200" in out, "truncated page did not reach the agent")
     _assert("[scraper-truncated]" in out, "truncation marker missing")
-    _assert(html in out, "page body was not forwarded intact")
+    _assert(html[:render_shim.AGENT_OUTPUT_BYTES] in out,
+            "first slice of the page body was not forwarded intact")
+    _assert("offset=" in out, "no offset given for the rest of the page")
 
 
 def test_render_page_still_rejects_runaway_response():
