@@ -1690,7 +1690,7 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             ~1.5-3min, deep ~10-15min.
         model: Optional Claude model id override for the in-jail agent
             (e.g. 'claude-fable-5', 'claude-sonnet-5'). Empty string uses
-            the default pinned in run-agent.sh (currently claude-opus-5).
+            the default pinned in run-agent.sh (currently claude-opus-5-5).
             Supplying a model is a hard Claude pin and disables automatic
             Claude-model and Codex-provider fallback. Omit it unless strict
             model identity matters.
