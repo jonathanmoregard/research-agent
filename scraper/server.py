@@ -53,6 +53,66 @@ DEFAULT_TIMEOUT_MS = 30_000
 # context. Truncation marker appended when hit; the agent gets a clear
 # signal rather than silent loss.
 MAX_HTML_BYTES = 512 * 1024
+# Visible text of the rendered page (links inlined as [text](href)). Taken
+# from the live DOM, so it is not cut short by MAX_HTML_BYTES — shop pages
+# carry hundreds of KB of inline JSON ahead of the product grid.
+MAX_TEXT_BYTES = 256 * 1024
+# After `load`, how long render() waits for the network to go quiet.
+SETTLE_TIMEOUT_MS = 5_000
+
+# Walks the rendered DOM and returns visible text. Block elements become
+# line breaks; anchors become `[text](absolute href)` so a product card
+# keeps its title, price and link together on one line.
+_VISIBLE_TEXT_JS = r"""
+() => {
+  const SKIP = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "SVG",
+                        "IFRAME", "CANVAS", "HEAD", "META", "LINK"]);
+  const BLOCK = new Set(["ADDRESS", "ARTICLE", "ASIDE", "BLOCKQUOTE", "BR",
+    "DD", "DIV", "DL", "DT", "FIELDSET", "FIGCAPTION", "FIGURE", "FOOTER",
+    "FORM", "H1", "H2", "H3", "H4", "H5", "H6", "HEADER", "HR", "LI", "MAIN",
+    "NAV", "OL", "P", "PRE", "SECTION", "TABLE", "TR", "UL"]);
+  const out = [];
+  const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+  // Tracking and ad-redirect URLs run to kilobytes (Amazon) and pushed the
+  // listings out of the agent's first slice. Long URLs lose their query;
+  // a path that is still huge is an opaque redirect token, elided.
+  const shortHref = (href) => {
+    if (href.length <= 150) return href;
+    const u = new URL(href);
+    const bare = u.origin + u.pathname;
+    return bare.length <= 300 ? bare : u.origin + "/…(long link elided)";
+  };
+  const hidden = (el) => {
+    const cs = window.getComputedStyle(el);
+    return cs.display === "none" || cs.visibility === "hidden";
+  };
+  const walk = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) { out.push(node.nodeValue); return; }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const tag = node.tagName.toUpperCase();
+    if (SKIP.has(tag) || hidden(node)) return;
+    if (tag === "A" && node.href && !node.href.startsWith("javascript:")) {
+      const img = node.querySelector("img[alt]");
+      // Card overlays (Vinted) are empty anchors whose title attribute
+      // carries the whole listing: title, brand, condition, price.
+      const label = clean(node.innerText) || clean(node.getAttribute("aria-label"))
+        || clean(node.getAttribute("title")) || clean(img && img.getAttribute("alt"));
+      if (label) out.push(` [${label}](${shortHref(node.href)}) `);
+      return;
+    }
+    const block = BLOCK.has(tag);
+    if (block) out.push("\n");
+    for (const child of node.childNodes) walk(child);
+    if (block) out.push("\n");
+  };
+  if (document.body) walk(document.body);
+  return out.join("")
+    .replace(/[ \t\u00a0]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
+}
+"""
 
 
 def _clamp_timeout(v) -> int:
@@ -173,6 +233,9 @@ MAX_INTERCEPT_BODY_BYTES = 256 * 1024
 MAX_INTERCEPT_CAPTURED = 16
 MAX_INTERCEPT_ACTIONS = 32
 MAX_INTERCEPT_PATTERNS = 8
+# Response URLs remembered for wait_for_response; bounds memory on pages
+# that stream thousands of requests.
+MAX_SEEN_RESPONSES = 4096
 _VALID_ACTION_TYPES = {
     "wait_for_selector",
     "wait_for_load_state",
@@ -207,6 +270,14 @@ def _validate_intercept_inputs(
         t = action.get("type")
         if t not in _VALID_ACTION_TYPES:
             return f"action {i} has unknown type {t!r}"
+        if t == "wait_for_response":
+            p = action.get("url_pattern")
+            if not isinstance(p, str) or not p:
+                return f"action {i} needs a url_pattern string"
+            try:
+                re.compile(p)
+            except re.error:
+                return f"action {i} url_pattern is not a valid regex"
     if not isinstance(capture_patterns, list):
         return "capture_patterns must be a list"
     if len(capture_patterns) > MAX_INTERCEPT_PATTERNS:
@@ -227,9 +298,20 @@ def _validate_intercept_inputs(
     return None
 
 
-def _do_action(page, action: dict, default_timeout_ms: int) -> None:
+_RESPONSE_POLL_MS = 100
+
+
+def _do_action(page, action: dict, default_timeout_ms: int,
+               seen_urls: list[str] | None = None) -> None:
     """Apply one action. Raises Playwright errors on failure — the caller
     catches them and returns a structured error to the API client.
+
+    `seen_urls` is the running list of response URLs the page has received
+    (filled by the caller's response listener). `wait_for_response` checks
+    it rather than registering a fresh waiter: Python Playwright has no
+    `page.wait_for_response`, and a page's search XHR often completes during
+    `goto`, before any action runs — a waiter registered afterwards would
+    miss it and time out.
     """
     t = action["type"]
     timeout = int(action.get("timeout_ms") or default_timeout_ms)
@@ -241,10 +323,15 @@ def _do_action(page, action: dict, default_timeout_ms: int) -> None:
         page.wait_for_timeout(int(action.get("ms", 1000)))
     elif t == "wait_for_response":
         pattern = re.compile(action["url_pattern"])
-        page.wait_for_response(
-            lambda resp: bool(pattern.search(resp.url)),
-            timeout=timeout,
-        )
+        seen = seen_urls if seen_urls is not None else []
+        waited = 0
+        while not any(pattern.search(u) for u in seen):
+            if waited >= timeout:
+                raise PWError(
+                    f"wait_for_response: no response matched within {timeout} ms"
+                )
+            page.wait_for_timeout(_RESPONSE_POLL_MS)
+            waited += _RESPONSE_POLL_MS
     elif t == "fill":
         page.fill(action["selector"], action.get("text", ""))
     elif t == "click":
@@ -279,6 +366,7 @@ def intercept(
     pairs is capped at MAX_INTERCEPT_CAPTURED.
     """
     captured: list[dict] = []
+    seen_urls: list[str] = []
     compiled = [re.compile(p) for p in capture_patterns]
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -298,6 +386,8 @@ def intercept(
             page = ctx.new_page()
 
             def on_response(response):
+                if len(seen_urls) < MAX_SEEN_RESPONSES:
+                    seen_urls.append(response.url)
                 if len(captured) >= MAX_INTERCEPT_CAPTURED:
                     return
                 if not any(p.search(response.url) for p in compiled):
@@ -338,7 +428,7 @@ def intercept(
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                 for action in actions:
-                    _do_action(page, action, timeout_ms)
+                    _do_action(page, action, timeout_ms, seen_urls)
                 return {
                     "status": "ok",
                     "requested_url": url,
@@ -381,9 +471,21 @@ def render(url: str, timeout_ms: int) -> dict:
             )
             page = ctx.new_page()
             try:
-                resp = page.goto(
-                    url, wait_until="networkidle", timeout=timeout_ms
-                )
+                # Navigate to `load`, then give client-side rendering a
+                # bounded chance to settle. Waiting for `networkidle` as
+                # the goto condition never finishes on pages that poll
+                # or stream (Amazon), so every such render timed out.
+                resp = page.goto(url, wait_until="load", timeout=timeout_ms)
+                # A page that never goes quiet is still rendered; report
+                # it so the caller knows late content may be missing.
+                network_settled = True
+                try:
+                    page.wait_for_load_state(
+                        "networkidle",
+                        timeout=min(SETTLE_TIMEOUT_MS, timeout_ms),
+                    )
+                except PWError:
+                    network_settled = False
                 html = page.content()
                 title = page.title()
                 final_url = page.url
@@ -395,6 +497,9 @@ def render(url: str, timeout_ms: int) -> dict:
                         "utf-8", errors="replace"
                     )
                     truncated = True
+                text, text_truncated = _truncate_text(
+                    page.evaluate(_VISIBLE_TEXT_JS) or "", MAX_TEXT_BYTES
+                )
                 return {
                     "status": "ok",
                     "requested_url": url,
@@ -403,6 +508,9 @@ def render(url: str, timeout_ms: int) -> dict:
                     "title": title,
                     "html": html,
                     "truncated": truncated,
+                    "text": text,
+                    "text_truncated": text_truncated,
+                    "network_settled": network_settled,
                 }
             finally:
                 ctx.close()
