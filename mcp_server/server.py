@@ -530,7 +530,7 @@ _SSH_WAIT_SECS = int(os.environ.get("RESEARCH_SSH_WAIT_SECS", "200"))
 # did NOT pass an explicit `model` (never override caller intent). Set
 # to empty string to disable the fallback entirely.
 _LIMIT_FALLBACK_MODEL = os.environ.get(
-    "RESEARCH_LIMIT_FALLBACK_MODEL", "claude-opus-4-7"
+    "RESEARCH_LIMIT_FALLBACK_MODEL", "claude-opus-5"
 )
 # Cross-provider fallback after Claude quota exhaustion.  `codex` is the only
 # supported value; an empty string disables it.  This remains operator config,
@@ -1738,7 +1738,7 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
     if model and not MODEL_ID_RE.fullmatch(model):
         return {
             "status": "error",
-            "error": "invalid model; expected a model id like 'claude-opus-5'",
+            "error": "invalid model; expected a model id like 'claude-opus-5-5'",
         }
     if model and depth == "fast":
         return {
