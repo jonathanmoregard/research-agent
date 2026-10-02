@@ -476,13 +476,16 @@ def render(url: str, timeout_ms: int) -> dict:
                 # the goto condition never finishes on pages that poll
                 # or stream (Amazon), so every such render timed out.
                 resp = page.goto(url, wait_until="load", timeout=timeout_ms)
+                # A page that never goes quiet is still rendered; report
+                # it so the caller knows late content may be missing.
+                network_settled = True
                 try:
                     page.wait_for_load_state(
                         "networkidle",
                         timeout=min(SETTLE_TIMEOUT_MS, timeout_ms),
                     )
                 except PWError:
-                    pass
+                    network_settled = False
                 html = page.content()
                 title = page.title()
                 final_url = page.url
@@ -507,6 +510,7 @@ def render(url: str, timeout_ms: int) -> dict:
                     "truncated": truncated,
                     "text": text,
                     "text_truncated": text_truncated,
+                    "network_settled": network_settled,
                 }
             finally:
                 ctx.close()

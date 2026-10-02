@@ -456,6 +456,8 @@ def _tool_render_page(args: dict) -> str:
     total = len(content.encode("utf-8", errors="replace"))
     chunk, nxt = _slice_utf8(content, offset, AGENT_OUTPUT_BYTES)
     truncated_marker = " [scraper-truncated]" if upstream_cut else ""
+    if out.get("network_settled") is False:
+        truncated_marker += " [still loading when captured]"
     tail = ""
     if nxt is not None:
         tail = (f"\n\n[shim-truncated: more follows — call render_page again "
