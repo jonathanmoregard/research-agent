@@ -1,0 +1,31 @@
+{
+  "_note": "Hand-built in the documented Browse API item_summary/search response shape (field names per eBay's reference); ids and tracking parameters are illustrative, not captured from a live call.",
+  "href": "https://api.ebay.com/buy/browse/v1/item_summary/search?q=leinenhemd&limit=1&offset=0",
+  "total": 1834,
+  "limit": 1,
+  "offset": 0,
+  "itemSummaries": [
+    {
+      "itemId": "v1|226512345678|0",
+      "title": "Herren Leinenhemd Langarm Blau Gr. L",
+      "leafCategoryIds": ["57990"],
+      "image": {"imageUrl": "https://i.ebayimg.com/images/g/abcAAOSw1234/s-l225.jpg"},
+      "price": {"value": "29.95", "currency": "EUR"},
+      "itemHref": "https://api.ebay.com/buy/browse/v1/item/v1%7C226512345678%7C0",
+      "seller": {"username": "leinen_shop", "feedbackPercentage": "99.6", "feedbackScore": 4521},
+      "condition": "Neu mit Etikett",
+      "conditionId": "1000",
+      "shippingOptions": [{"shippingCostType": "FIXED", "shippingCost": {"value": "12.00", "currency": "EUR"}}],
+      "buyingOptions": ["FIXED_PRICE", "BEST_OFFER"],
+      "itemWebUrl": "https://www.ebay.de/itm/226512345678?hash=item34bd5e2f4e:g:abcAAOSw1234&amdata=enc%3AAQAJAAAA4Bq7rPZ0x8nV3l%2BkTq9y3pQ%3D%3D",
+      "itemLocation": {"postalCode": "10115", "country": "DE"},
+      "adultOnly": false,
+      "legacyItemId": "226512345678",
+      "availableCoupons": false,
+      "itemCreationDate": "2026-09-21T08:14:02.000Z",
+      "topRatedBuyingExperience": true,
+      "priorityListing": false,
+      "listingMarketplaceId": "EBAY_DE"
+    }
+  ]
+}
