@@ -361,11 +361,11 @@ def _do_action(page, action: dict, default_timeout_ms: int,
             page.wait_for_timeout(_RESPONSE_POLL_MS)
             waited += _RESPONSE_POLL_MS
     elif t == "fill":
-        page.fill(action["selector"], action.get("text", ""))
+        page.fill(action["selector"], action.get("text", ""), timeout=timeout)
     elif t == "click":
-        page.click(action["selector"])
+        page.click(action["selector"], timeout=timeout)
     elif t == "press":
-        page.press(action["selector"], action["key"])
+        page.press(action["selector"], action["key"], timeout=timeout)
     else:  # pragma: no cover — _validate_intercept_inputs gates this
         raise ValueError(f"unknown action: {t}")
 
@@ -454,8 +454,10 @@ def intercept(
 
             page.on("response", on_response)
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                # One budget for navigation AND actions, so the whole call
+                # stays inside timeout_ms (plus browser launch/teardown).
                 deadline = time.monotonic() + timeout_ms / 1000
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                 for action in actions:
                     _do_action(page, action, timeout_ms, seen_urls, deadline)
                 return {

@@ -1640,40 +1640,47 @@ _HARNESS_TAGS = _WRAP_DELIVERY_TAGS + (
     "bash-input",
     "bash-stdout",
     "bash-stderr",
+    "local-command-caveat",
+    "ide-opened-file",
+    "ide-selection",
 )
-_HARNESS_TAG_KEYS = frozenset(t.replace("_", "-").lower() for t in _HARNESS_TAGS)
 # Invisible characters the unicode sanitizer keeps on purpose (LRM/RLM, soft
-# hyphen, variation selectors, ALM, CGJ, Mongolian FVS, other Cf). Between
-# `<`, `/` and a tag name they render as nothing, so the old `\s*`-only
-# lookahead let `<LRM/system-reminder>` through looking exactly like the tag.
-_TAG_LT_RX = re.compile(r"<")
-_TAG_SCAN_CHARS = 96
+# hyphen, variation selectors, ALM, CGJ, Mongolian FVS, other Cf/Mn/Me).
+# Between `<`, `/` and a tag name — or inside the name — they render as
+# nothing, so the old `\s*`-only lookahead let `<LRM/system-reminder>`
+# through looking exactly like the tag. The class is built from the Unicode
+# categories so it cannot drift from what "renders as nothing" means; runs of
+# any length are skipped (a fixed look-ahead window was outlasted by 97 LRMs).
+def _invisible_class() -> str:
+    ranges: list[tuple[int, int]] = []
+    for cp in list(range(0x0, 0x10000)) + list(range(0xE0000, 0xE1000)):
+        ch = chr(cp)
+        if unicodedata.category(ch) in ("Cf", "Mn", "Me") or ch.isspace():
+            if ranges and ranges[-1][1] == cp - 1:
+                ranges[-1] = (ranges[-1][0], cp)
+            else:
+                ranges.append((cp, cp))
+    return "[" + "".join(
+        re.escape(chr(a)) if a == b else f"{re.escape(chr(a))}-{re.escape(chr(b))}"
+        for a, b in ranges
+    ) + "]*+"  # possessive: a run is consumed once, never re-split
 
 
-def _is_invisible(ch: str) -> bool:
-    cat = unicodedata.category(ch)
-    return ch.isspace() or cat in ("Cf", "Mn", "Me") or "\ufe00" <= ch <= "\ufe0f"
+_INV = _invisible_class()
 
 
-def _harness_tag_after(body: str, i: int) -> bool:
-    """True if the text after the `<` at `i` spells (/)? + a harness tag name
-    once invisible characters are dropped."""
-    skeleton = []
-    for ch in body[i + 1 : i + 1 + _TAG_SCAN_CHARS]:
-        if ch.isspace():
-            if skeleton:
-                break  # whitespace ends the name; attributes follow
-            continue
-        if _is_invisible(ch):
-            continue
-        if ch in "/\u2215\u2044" and not skeleton:
-            continue
-        if ch.isalnum() or ch in "-_":
-            skeleton.append(ch)
-            continue
-        break
-    name = "".join(skeleton).replace("_", "-").lower()
-    return name in _HARNESS_TAG_KEYS
+def _tag_name_pattern(name: str) -> str:
+    # Invisible characters may sit between any two letters; `-` and `_` fold.
+    parts = ["[-_]" if c in "-_" else re.escape(c) for c in name]
+    return _INV.join(parts)
+
+
+_DANGEROUS_WRAP_RX = re.compile(
+    "<(?=" + _INV + "(?:[/\u2215\u2044]" + _INV + ")?"
+    + "(?:" + "|".join(_tag_name_pattern(t) for t in sorted(_HARNESS_TAGS, key=len, reverse=True)) + ")"
+    + "(?![A-Za-z0-9]))",
+    re.IGNORECASE,
+)
 
 
 def _encode_wrap_tags(body: str) -> str:
@@ -1685,17 +1692,10 @@ def _encode_wrap_tags(body: str) -> str:
     the name are ignored when matching. Other tag names (e.g. <html>,
     <code>) are untouched — they don't escape our wrap. Idempotent: a body
     that is already encoded passes through unchanged because `&lt;` no
-    longer matches `<`.
+    longer matches `<`. Linear: each look-ahead stops at the first visible
+    character that cannot continue a tag name.
     """
-    out = []
-    last = 0
-    for m in _TAG_LT_RX.finditer(body):
-        if _harness_tag_after(body, m.start()):
-            out.append(body[last : m.start()])
-            out.append("&lt;")
-            last = m.start() + 1
-    out.append(body[last:])
-    return "".join(out)
+    return _DANGEROUS_WRAP_RX.sub("&lt;", body)
 
 
 def _wrap_content(report_id: str, sanitized: str) -> str:
@@ -2347,24 +2347,30 @@ _MAX_CONTENT_RETRIES = _read_retry_budget(os.environ.get("RESEARCH_MAX_CONTENT_R
 _RETRY_STATE_SUFFIX = ".retry.json"
 
 
-# Honeypot "unavailable" signals that come from the judge model's OWN output
-# (a malformed or unreadable tool call, an unparseable response, a reply cut
-# off at max_tokens) are shaped by the report under scan, not by an outage.
-# They stay in the infra vocabulary for the operator, but they spend the
-# content retry budget: otherwise a report that reliably breaks the judge's
-# tool call would earn unlimited free resamples.
-_CONTENT_SHAPED_SKIP_MARKERS = (
-    "malformed-tool-call",
-    "malformed-tool-args",
-    "unreadable-tool-call",
-    "parse-error",
+# Honeypot "unavailable" signals mostly come from the judge model's OWN output
+# (a malformed or unreadable tool call, a missing required call, an
+# unparseable response, a reply cut off at max_tokens) — shaped by the report
+# under scan, not by an outage. They stay in the infra vocabulary for the
+# operator, but they spend the content retry budget: otherwise a report that
+# reliably breaks the judge's tool call would earn unlimited free resamples.
+# ALLOWLIST of real outages (provider exception, missing library or key,
+# key-config error, unhandled exception); any other or future honeypot
+# signal counts as content-shaped.
+_HONEYPOT_OUTAGE_MARKERS = (
+    "-api-error",
+    "-lib-missing",
+    "-api-key",
+    "key-config-error",
+    ":unhandled:",
 )
 
 
 def _retry_is_free(reason) -> bool:
-    return _is_infra_reason(reason) and not any(
-        m in reason for m in _CONTENT_SHAPED_SKIP_MARKERS
-    )
+    if not _is_infra_reason(reason):
+        return False
+    if "honeypot_unavailable" in reason:
+        return any(m in reason for m in _HONEYPOT_OUTAGE_MARKERS)
+    return True
 
 
 def _write_retry_state(quarantine: Path, report_id: str, infra: bool, content_retries: int) -> None:
@@ -2585,6 +2591,40 @@ def retry_research(report_id: str) -> dict:
     if not quarantine.is_dir() or not src.exists():
         return {"status": "error", "error": "report_id not found in quarantine"}
 
+    # Claim the quarantined copy under an exclusive lock, so two concurrent
+    # retries of one report cannot both read an unspent budget and each get
+    # an independent scanner draw: the loser finds the copy already gone.
+    try:
+        lock_fd = os.open(
+            quarantine / ".retry.lock",
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+    except OSError:
+        return {"status": "error", "error": "report_id not found in quarantine"}
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        claimed = _claim_quarantined(quarantine, src, report_id)
+    finally:
+        os.close(lock_fd)
+    if isinstance(claimed, dict):
+        return claimed
+    content, content_retries = claimed
+
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    t_scan_start = time.monotonic()
+    return _scan_and_deliver(
+        content, report_id, f"retry:{report_id}", 0, t_received, t_scan_start,
+        content_retries=content_retries,
+    )
+
+
+def _claim_quarantined(quarantine: Path, src: Path, report_id: str):
+    """Under the retry lock: snapshot, apply the retry budget, remove the
+    quarantined copy. Returns (content, content_retries) or an error dict."""
+    if not src.exists():
+        return {"status": "error", "error": "report_id not found in quarantine"}
+
     # Snapshot the quarantined content under O_NOFOLLOW so a concurrent
     # symlink swap at `src` (only possible for same-user processes — the
     # bwrap agent itself cannot reach this directory) can't redirect the
@@ -2619,13 +2659,7 @@ def retry_research(report_id: str) -> dict:
     # from the snapshot (atomic O_EXCL, so nothing can pre-squat it).
     src.unlink(missing_ok=True)
     (quarantine / f"{report_id}{_RETRY_STATE_SUFFIX}").unlink(missing_ok=True)
-
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    t_scan_start = time.monotonic()
-    return _scan_and_deliver(
-        content, report_id, f"retry:{report_id}", 0, t_received, t_scan_start,
-        content_retries=content_retries,
-    )
+    return content, content_retries
 
 
 _SCANNER_REPO = "https://github.com/jonathanmoregard/injection-scanner.git"

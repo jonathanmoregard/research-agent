@@ -211,6 +211,15 @@ class _FakePage:
     def wait_for_selector(self, selector, timeout):
         self.timeouts.append(timeout)
 
+    def click(self, selector, timeout=None):
+        self.timeouts.append(timeout)
+
+    def fill(self, selector, text, timeout=None):
+        self.timeouts.append(timeout)
+
+    def press(self, selector, key, timeout=None):
+        self.timeouts.append(timeout)
+
 
 def test_actions_share_one_deadline():
     import time as _t
@@ -237,6 +246,20 @@ def test_exhausted_deadline_stops_actions():
     _assert(not page.waits, "page waited after the deadline")
 
 
+def test_click_fill_press_get_the_deadline_too():
+    # Refuter (Codex) bypass: these took Playwright's own ~30 s default.
+    import time as _t
+    deadline = _t.monotonic() + 1.0
+    for action in ({"type": "click", "selector": "#never"},
+                   {"type": "fill", "selector": "#q", "text": "x"},
+                   {"type": "press", "selector": "#q", "key": "Enter"}):
+        page = _FakePage()
+        _do_action(page, action, 30000, [], deadline)
+        _assert(page.timeouts and page.timeouts[0] is not None
+                and page.timeouts[0] <= 1000,
+                f"{action['type']} not bounded: {page.timeouts}")
+
+
 def main() -> int:
     tests = [
         test_valid_minimal,
@@ -260,6 +283,7 @@ def main() -> int:
         test_in_range_action_times_accepted,
         test_actions_share_one_deadline,
         test_exhausted_deadline_stops_actions,
+        test_click_fill_press_get_the_deadline_too,
     ]
     for t in tests:
         t()

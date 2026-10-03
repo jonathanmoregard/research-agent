@@ -106,6 +106,8 @@ def test_budget_is_configurable(env, monkeypatch):
     "unavailable:malformed-tool-args",
     "unavailable:unreadable-tool-call",
     "unavailable:anthropic-parse-error:ValueError",
+    "unavailable:missing-required-tool-call",
+    "unavailable:some-future-model-output-signal",
 ])
 def test_content_shaped_honeypot_skip_spends_the_budget(env, monkeypatch, signal):
     reason = f"honeypot_unavailable:scenario_a:{signal}+skipped=1/6"
@@ -122,3 +124,29 @@ def test_provider_outage_skip_stays_free(env, monkeypatch):
     _first_reject(monkeypatch, reason)
     for _ in range(3):
         assert "retry limit" not in srv.retry_research(RID).get("error", "")
+
+
+def test_concurrent_retries_get_one_draw(env, monkeypatch):
+    """Refuter (Codex): two simultaneous retries both read content_retries=0
+    and each got an independent stochastic draw."""
+    import threading
+    import time
+    _first_reject(monkeypatch, DETECTION)
+    scans = []
+    orig_read = srv._read_retry_state
+
+    def slow_read(q, rid):
+        out = orig_read(q, rid)
+        time.sleep(0.2)  # widen the read -> remove window
+        return out
+
+    monkeypatch.setattr(srv, "_read_retry_state", slow_read)
+    monkeypatch.setattr(
+        srv, "_scan_text", lambda t: (scans.append(1), _verdict(False, DETECTION))[1]
+    )
+    ts = [threading.Thread(target=srv.retry_research, args=(RID,)) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert len(scans) == 1, f"{len(scans)} concurrent draws"

@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -32,7 +32,7 @@ jobs:
           persist-credentials: false
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - name: pytest
-        run: nix shell "$NIXPKGS#uv" -c uv run --locked --with pytest pytest -q --ignore=tests/bench_depths.py
+        run: nix shell "$NIXPKGS#uv" -c uv run --locked pytest -q --ignore=tests/bench_depths.py
 
   security:
     runs-on: ubuntu-latest
