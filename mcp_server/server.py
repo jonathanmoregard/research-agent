@@ -530,7 +530,7 @@ _SSH_WAIT_SECS = int(os.environ.get("RESEARCH_SSH_WAIT_SECS", "200"))
 # did NOT pass an explicit `model` (never override caller intent). Set
 # to empty string to disable the fallback entirely.
 _LIMIT_FALLBACK_MODEL = os.environ.get(
-    "RESEARCH_LIMIT_FALLBACK_MODEL", "claude-opus-4-7"
+    "RESEARCH_LIMIT_FALLBACK_MODEL", "claude-opus-5"
 )
 # Cross-provider fallback after Claude quota exhaustion.  `codex` is the only
 # supported value; an empty string disables it.  This remains operator config,
@@ -1690,7 +1690,7 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             ~1.5-3min, deep ~10-15min.
         model: Optional Claude model id override for the in-jail agent
             (e.g. 'claude-fable-5', 'claude-sonnet-5'). Empty string uses
-            the default pinned in run-agent.sh (currently claude-opus-5).
+            the default pinned in run-agent.sh (currently claude-opus-5-5).
             Supplying a model is a hard Claude pin and disables automatic
             Claude-model and Codex-provider fallback. Omit it unless strict
             model identity matters.
@@ -1738,7 +1738,7 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
     if model and not MODEL_ID_RE.fullmatch(model):
         return {
             "status": "error",
-            "error": "invalid model; expected a model id like 'claude-opus-5'",
+            "error": "invalid model; expected a model id like 'claude-opus-5-5'",
         }
     if model and depth == "fast":
         return {

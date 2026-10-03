@@ -85,17 +85,19 @@ SHOPPING_TOOLS="mcp__shopping__ebay_search,mcp__shopping__tradera_search"
 # constant rather than a literal repeated per depth so the two pins can
 # never silently drift apart.
 #
-# Opus 5 as of 2026-08-08 (was claude-fable-5). Bare `claude-opus-5`, no
+# Opus 5.5 as of 2026-10-02 (was claude-opus-5; before that claude-fable-5).
+# Needs the system claude-code >= 2.1.280 — older CLIs reject the id with
+# "does not support this model". Bare `claude-opus-5-5`, no
 # `[1m]` suffix: the id is charset-gated by MODEL_ID_RE in server.py and
 # again below, and neither pattern admits brackets. The CLI recognises the
-# bare id (`claude --model claude-opus-5` exits 0; an unrecognised id exits
+# bare id (`claude --model claude-opus-5-5` exits 0; an unrecognised id exits
 # 1 with "is not a model this version of Claude Code recognizes"), so it
 # already applies the model's real context window without the suffix.
 #
 # Overridable per depth via RESEARCH_MODEL_NORMAL / RESEARCH_MODEL_DEEP,
 # and per call via RESEARCH_MODEL (the MCP tool's `model` param) — see
 # below; this constant is only the floor when nothing else is set.
-DEFAULT_MODEL="claude-opus-5"
+DEFAULT_MODEL="claude-opus-5-5"
 
 case "${DEPTH}" in
   normal)
