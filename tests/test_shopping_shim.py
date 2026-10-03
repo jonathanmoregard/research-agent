@@ -490,3 +490,81 @@ def test_every_listed_tool_is_implemented_and_is_a_search():
     names = {t["name"] for t in shim.TOOLS}
     assert names == set(shim.TOOL_IMPL)
     assert all(n.endswith("_search") for n in names)
+
+
+# ----- eBay listing links are short canonical /itm/<id> URLs ---------------
+
+import json  # noqa: E402
+import pathlib  # noqa: E402
+
+_EBAY_FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "ebay_item_summary_de.json"
+_TRACKED = ("https://www.ebay.co.uk/itm/315512345678?hash=item4975b2c1de:g:xyz"
+            "&amdata=enc%3AAQAJAAAA4Bq7%3D%3D&var=0")
+
+
+def _ebay_link(item: dict, marketplace: str = "EBAY_DE") -> str:
+    out = shim.format_ebay_items({"total": 1, "itemSummaries": [item]}, marketplace)
+    (block,) = _listing_blocks(out)
+    return block.splitlines()[1].strip()
+
+
+def _assert_canonical(link: str, host: str, item_id: str) -> None:
+    parts = urllib.parse.urlsplit(link)
+    assert parts.scheme == "https"
+    assert parts.netloc == host
+    assert parts.path == f"/itm/{item_id}"
+    assert not parts.query and not parts.fragment
+
+
+def test_recorded_item_summary_yields_short_canonical_link(monkeypatch, ebay):
+    page = json.loads(_EBAY_FIXTURE.read_text())
+    _record(monkeypatch, [EBAY_TOKEN, page])
+    out = shim._tool_ebay_search({"query": "leinenhemd"})
+    (block,) = _listing_blocks(out)
+    _assert_canonical(block.splitlines()[1].strip(), "www.ebay.de", "226512345678")
+    assert "amdata" not in out and "hash=" not in out
+
+
+@pytest.mark.parametrize("item,marketplace,host,item_id", [
+    # legacyItemId is the id; the returned host is kept.
+    ({"legacyItemId": "315512345678", "itemWebUrl": _TRACKED},
+     "EBAY_DE", "www.ebay.co.uk", "315512345678"),
+    # legacyItemId as an int.
+    ({"legacyItemId": 315512345678, "itemWebUrl": _TRACKED},
+     "EBAY_GB", "www.ebay.co.uk", "315512345678"),
+    # No legacyItemId: id parsed from the /itm/ path.
+    ({"itemWebUrl": _TRACKED}, "EBAY_GB", "www.ebay.co.uk", "315512345678"),
+    # Slugged path variant.
+    ({"itemWebUrl": "https://www.ebay.fr/itm/chemise-lin/115512345678?_trkparms=x"},
+     "EBAY_FR", "www.ebay.fr", "115512345678"),
+    # Only the RESTful itemId; no web URL: host from the marketplace.
+    ({"itemId": "v1|405512345678|0"}, "EBAY_IT", "www.ebay.it", "405512345678"),
+    # Garbage legacyItemId falls through to the URL.
+    ({"legacyItemId": "12; DROP", "itemWebUrl": _TRACKED},
+     "EBAY_GB", "www.ebay.co.uk", "315512345678"),
+    # Foreign-host itemWebUrl is not trusted as the host.
+    ({"legacyItemId": "226512345678", "itemWebUrl": "https://www.ebay.de.evil.example/itm/1"},
+     "EBAY_NL", "www.ebay.nl", "226512345678"),
+], ids=["legacy-str", "legacy-int", "from-url", "slugged-url", "rest-id-only",
+        "garbage-legacy", "lookalike-host"])
+def test_ebay_link_is_canonical_itm_url(item, marketplace, host, item_id):
+    item = {"title": "t", **item}
+    _assert_canonical(_ebay_link(item, marketplace), host, item_id)
+
+
+def test_every_marketplace_maps_to_an_ebay_host():
+    for mp in shim.EBAY_MARKETPLACES:
+        _assert_canonical(_ebay_link({"title": "t", "legacyItemId": "123456789"}, mp),
+                          shim.EBAY_MARKETPLACE_HOSTS[mp], "123456789")
+
+
+@pytest.mark.parametrize("item,expected", [
+    # No id anywhere: the returned link is kept as eBay gave it.
+    ({"itemWebUrl": "https://www.ebay.de/b/Leinenhemden/57990"},
+     "https://www.ebay.de/b/Leinenhemden/57990"),
+    ({}, "(no usable URL)"),
+    ({"itemWebUrl": "javascript:alert(1)", "legacyItemId": None}, "(no usable URL)"),
+    ({"itemWebUrl": 42, "legacyItemId": ["1"], "itemId": {"x": 1}}, "(no usable URL)"),
+], ids=["no-id-keeps-original", "absent", "javascript", "wrong-types"])
+def test_ebay_link_without_any_id_is_not_invented(item, expected):
+    assert _ebay_link({"title": "t", **item}) == expected

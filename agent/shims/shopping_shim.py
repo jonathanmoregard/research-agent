@@ -261,10 +261,20 @@ EBAY_SCOPE = "https://api.ebay.com/oauth/api_scope"
 #
 # eBay has no Swedish site (no Buy marketplace for Sweden). A buyer in
 # Sweden searches an EU marketplace and asks for delivery to Sweden.
-EBAY_MARKETPLACES = {
-    "EBAY_DE", "EBAY_GB", "EBAY_FR", "EBAY_IT", "EBAY_ES", "EBAY_NL",
-    "EBAY_AT", "EBAY_BE", "EBAY_IE", "EBAY_PL", "EBAY_CH", "EBAY_US",
+# Marketplace id -> the site's web host, used for canonical listing links.
+EBAY_MARKETPLACE_HOSTS = {
+    "EBAY_DE": "www.ebay.de", "EBAY_GB": "www.ebay.co.uk",
+    "EBAY_FR": "www.ebay.fr", "EBAY_IT": "www.ebay.it",
+    "EBAY_ES": "www.ebay.es", "EBAY_NL": "www.ebay.nl",
+    "EBAY_AT": "www.ebay.at", "EBAY_BE": "www.ebay.be",
+    "EBAY_IE": "www.ebay.ie", "EBAY_PL": "www.ebay.pl",
+    "EBAY_CH": "www.ebay.ch", "EBAY_US": "www.ebay.com",
 }
+EBAY_MARKETPLACES = set(EBAY_MARKETPLACE_HOSTS)
+# Registrable eBay domains ("ebay.de", "ebay.co.uk", ...) a returned link may sit on.
+_EBAY_DOMAINS = {h.removeprefix("www.") for h in EBAY_MARKETPLACE_HOSTS.values()}
+_EBAY_ID_RX = re.compile(r"^[0-9]{6,20}$")
+_EBAY_ITM_PATH_RX = re.compile(r"^/itm/(?:[^/]+/)?([0-9]{6,20})/?$")
 EBAY_DEFAULT_MARKETPLACE = "EBAY_DE"
 EBAY_SORTS = {
     "best_match": "",
@@ -369,7 +379,63 @@ def _money(obj) -> str:
     return f"{obj.get('value')} {obj.get('currency') or ''}".strip()
 
 
-def format_ebay_items(body) -> str:
+def _ebay_host(value) -> str:
+    """The lowercased host of an https/http link on an eBay site, or ""."""
+    if not isinstance(value, str):
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(value.strip())
+    except ValueError:
+        return ""
+    host = (parts.hostname or "").lower()
+    if (parts.scheme.lower() not in ("http", "https")
+            or parts.netloc.lower() != host
+            or not any(host == d or host.endswith("." + d) for d in _EBAY_DOMAINS)):
+        return ""
+    return host
+
+
+def _ebay_item_id(it: dict) -> str:
+    """The numeric listing id: legacyItemId, else from itemWebUrl, else itemId."""
+    legacy = it.get("legacyItemId")
+    if isinstance(legacy, int) and not isinstance(legacy, bool):
+        legacy = str(legacy)
+    if isinstance(legacy, str) and _EBAY_ID_RX.match(legacy.strip()):
+        return legacy.strip()
+    web = it.get("itemWebUrl")
+    if _ebay_host(web):
+        m = _EBAY_ITM_PATH_RX.match(urllib.parse.urlsplit(web.strip()).path)
+        if m:
+            return m.group(1)
+    rest = it.get("itemId")  # RESTful id, "v1|<legacy id>|<variation id>"
+    if isinstance(rest, str):
+        bits = rest.split("|")
+        if len(bits) == 3 and bits[0] == "v1" and _EBAY_ID_RX.match(bits[1]):
+            return bits[1]
+    return ""
+
+
+def ebay_listing_url(it, marketplace: str = EBAY_DEFAULT_MARKETPLACE) -> str:
+    """A short canonical listing link, https://<ebay host>/itm/<id>, or nothing.
+
+    itemWebUrl carries tracking parameters (hash, amdata, ...) that bloat the
+    report and add nothing. The listing id alone addresses the same item. The
+    host is the one eBay returned when that is an eBay site, else the
+    searched marketplace's site. With no usable id the returned link is kept
+    as-is (subject to `_url`).
+    """
+    if not isinstance(it, dict):
+        return ""
+    item_id = _ebay_item_id(it)
+    if not item_id:
+        return _url(it.get("itemWebUrl"))
+    host = (_ebay_host(it.get("itemWebUrl"))
+            or EBAY_MARKETPLACE_HOSTS.get(str(marketplace).upper())
+            or EBAY_MARKETPLACE_HOSTS[EBAY_DEFAULT_MARKETPLACE])
+    return f"https://{host}/itm/{item_id}"
+
+
+def format_ebay_items(body, marketplace: str = EBAY_DEFAULT_MARKETPLACE) -> str:
     if not isinstance(body, dict):
         return "(unexpected response shape)"
     items = body.get("itemSummaries")
@@ -407,7 +473,7 @@ def format_ebay_items(body) -> str:
                 f"({_clip(seller.get('feedbackScore'), 10)})"
             )
         lines.append("- " + " | ".join(parts)
-                     + f"\n    {_url(it.get('itemWebUrl')) or '(no usable URL)'}")
+                     + f"\n    {ebay_listing_url(it, marketplace) or '(no usable URL)'}")
     return "\n".join(lines)
 
 
@@ -450,7 +516,7 @@ def _tool_ebay_search(args: dict) -> str:
     return _wrap_untrusted(
         "ebay-browse-api",
         f"eBay search — marketplace={headers['X-EBAY-C-MARKETPLACE-ID']} "
-        f"query={args.get('query')!r}\n\n" + format_ebay_items(body),
+        f"query={args.get('query')!r}\n\n" + format_ebay_items(body, headers["X-EBAY-C-MARKETPLACE-ID"]),
     )
 
 
