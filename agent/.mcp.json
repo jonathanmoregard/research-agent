@@ -2,53 +2,45 @@
   "mcpServers": {
     "exa": {
       "command": "python3",
-      "args": ["/workspace/agent/shims/exa_shim.py"],
-      "env": {
-        "EXA_API_KEY": "${EXA_API_KEY}"
-      }
+      "args": [
+        "/workspace/agent/shims/exa_shim.py"
+      ]
     },
     "tavily-remote-mcp": {
       "command": "python3",
-      "args": ["/workspace/agent/shims/tavily_shim.py"],
-      "env": {
-        "TAVILY_API_KEY": "${TAVILY_API_KEY}"
-      }
+      "args": [
+        "/workspace/agent/shims/tavily_shim.py"
+      ]
     },
     "render": {
       "command": "python3",
-      "args": ["/workspace/agent/shims/render_shim.py"],
-      "env": {
-        "RESEARCH_RUN_ID": "${RESEARCH_RUN_ID}"
-      }
+      "args": [
+        "/workspace/agent/shims/render_shim.py"
+      ]
     },
     "trademark": {
       "command": "python3",
-      "args": ["/workspace/agent/shims/trademark_shim.py"],
-      "env": {
-        "EUIPO_CLIENT_ID": "${EUIPO_CLIENT_ID}",
-        "EUIPO_CLIENT_SECRET": "${EUIPO_CLIENT_SECRET}"
-      }
+      "args": [
+        "/workspace/agent/shims/trademark_shim.py"
+      ]
     },
     "shopping": {
       "command": "python3",
-      "args": ["/workspace/agent/shims/shopping_shim.py"],
-      "env": {
-        "EBAY_CLIENT_ID": "${EBAY_CLIENT_ID}",
-        "EBAY_CLIENT_SECRET": "${EBAY_CLIENT_SECRET}",
-        "TRADERA_APP_ID": "${TRADERA_APP_ID}",
-        "TRADERA_APP_KEY": "${TRADERA_APP_KEY}"
-      }
+      "args": [
+        "/workspace/agent/shims/shopping_shim.py"
+      ]
     },
     "bolagsverket": {
       "command": "python3",
-      "args": ["/workspace/agent/shims/bolagsverket_shim.py"]
+      "args": [
+        "/workspace/agent/shims/bolagsverket_shim.py"
+      ]
     },
     "prv": {
       "command": "python3",
-      "args": ["/workspace/agent/shims/prv_shim.py"],
-      "env": {
-        "PRV_CACHE_DIR": "${PRV_CACHE_DIR}"
-      }
+      "args": [
+        "/workspace/agent/shims/prv_shim.py"
+      ]
     }
   }
 }

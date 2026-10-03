@@ -20,6 +20,8 @@ import threading
 import time
 import uuid
 
+from netguard import blocked_hop, install_request_guard
+
 MAX_SESSIONS = 2
 SESSION_IDLE_TTL_S = 300.0
 MAX_ACTIONS_PER_CALL = 20
@@ -176,6 +178,16 @@ class _Session:
         self.snapshot_refs_ok = True
 
 
+def _refuse_blocked(page, resp) -> None:
+    """Never observe (screenshot/snapshot) a page on a blocked host."""
+    if blocked_hop(resp, page.url) is not None:
+        try:
+            page.goto("about:blank")
+        except Exception:
+            pass
+        raise RuntimeError("host not allowed (navigation reached a blocked host)")
+
+
 class BrowserWorker(threading.Thread):
     """Single thread owning all Playwright state. submit() is thread-safe."""
 
@@ -302,8 +314,11 @@ class BrowserWorker(threading.Thread):
         sid = uuid.uuid4().hex[:16]
         self._sessions[sid] = s
         try:
-            page.goto(cmd["url"], wait_until="domcontentloaded",
-                      timeout=int(cmd.get("timeout_ms") or 30000))
+            # Inside the try so a failure here still closes the browser.
+            install_request_guard(context)
+            resp = page.goto(cmd["url"], wait_until="domcontentloaded",
+                             timeout=int(cmd.get("timeout_ms") or 30000))
+            _refuse_blocked(page, resp)
             out = self._observe(s)
         except Exception:
             self._close(sid)
@@ -328,6 +343,9 @@ class BrowserWorker(threading.Thread):
             if a["type"] == "wait_ms":
                 a = dict(a, ms=min(int(a["ms"]), remaining_ms))
             self._do(s, a, min(req_timeout, remaining_ms))
+        # goto / click / submit may have navigated, and redirect hops are
+        # not seen by the request guard.
+        _refuse_blocked(s.page, None)
         return self._observe(s)
 
     def _locator(self, s: _Session, target: dict):
