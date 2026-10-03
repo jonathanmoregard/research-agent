@@ -277,3 +277,12 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_script_cases(monkeypatch):
+    """Run the scenario cases under pytest too (they were script-only, so a
+    plain `pytest` collected nothing from this file). The scanner health gate
+    starts DEGRADED until a live boot smoke passes; the cases stub the scan
+    itself, so they open the gate explicitly."""
+    monkeypatch.setattr(srv, "_scanner_health_gate", lambda: (True, "ok"))
+    assert main() == 0

@@ -48,6 +48,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from enum import Enum
 from pathlib import Path
@@ -1625,22 +1626,76 @@ def _write_artifact_audit(
 # tag in the body breaks our wrap) and the fix is structural too: encode
 # the `<` of any matching tag in the body before interpolation.
 _WRAP_DELIVERY_TAGS = ("untrusted_external_content", "system-reminder")
-_DANGEROUS_WRAP_RX = re.compile(
-    r"<(?=\s*/?\s*(?:" + "|".join(re.escape(t) for t in _WRAP_DELIVERY_TAGS) + r")\b)",
-    re.IGNORECASE,
+# Tag names the parent Claude Code session reads as harness text, beyond our
+# own two wrap tags (security review 2026-10-03, C-3). Compared with `_` and
+# `-` folded together, so `system_reminder` is covered too.
+_HARNESS_TAGS = _WRAP_DELIVERY_TAGS + (
+    "user-prompt-submit-hook",
+    "task-notification",
+    "command-message",
+    "command-name",
+    "command-args",
+    "local-command-stdout",
+    "local-command-stderr",
+    "bash-input",
+    "bash-stdout",
+    "bash-stderr",
 )
+_HARNESS_TAG_KEYS = frozenset(t.replace("_", "-").lower() for t in _HARNESS_TAGS)
+# Invisible characters the unicode sanitizer keeps on purpose (LRM/RLM, soft
+# hyphen, variation selectors, ALM, CGJ, Mongolian FVS, other Cf). Between
+# `<`, `/` and a tag name they render as nothing, so the old `\s*`-only
+# lookahead let `<LRM/system-reminder>` through looking exactly like the tag.
+_TAG_LT_RX = re.compile(r"<")
+_TAG_SCAN_CHARS = 96
+
+
+def _is_invisible(ch: str) -> bool:
+    cat = unicodedata.category(ch)
+    return ch.isspace() or cat in ("Cf", "Mn", "Me") or "\ufe00" <= ch <= "\ufe0f"
+
+
+def _harness_tag_after(body: str, i: int) -> bool:
+    """True if the text after the `<` at `i` spells (/)? + a harness tag name
+    once invisible characters are dropped."""
+    skeleton = []
+    for ch in body[i + 1 : i + 1 + _TAG_SCAN_CHARS]:
+        if ch.isspace():
+            if skeleton:
+                break  # whitespace ends the name; attributes follow
+            continue
+        if _is_invisible(ch):
+            continue
+        if ch in "/\u2215\u2044" and not skeleton:
+            continue
+        if ch.isalnum() or ch in "-_":
+            skeleton.append(ch)
+            continue
+        break
+    name = "".join(skeleton).replace("_", "-").lower()
+    return name in _HARNESS_TAG_KEYS
 
 
 def _encode_wrap_tags(body: str) -> str:
-    """Replace the `<` of any literal wrap-tag occurrence in `body` with
-    `&lt;`. Stops a research report from closing our own
-    `<untrusted_external_content>` + `<system-reminder>` wrap and
-    escaping into trusted context. Other tag names (e.g. <html>,
-    <code>) are untouched — they don't escape our wrap. Idempotent: a
-    body that is already encoded passes through unchanged because
-    `&lt;` no longer matches `<`.
+    """Replace the `<` of any harness-tag occurrence in `body` with `&lt;`.
+    Stops a research report from closing our own
+    `<untrusted_external_content>` + `<system-reminder>` wrap, or forging
+    another tag the parent treats as harness text, and so escaping into
+    trusted context. Invisible format characters around `<`, `/` and inside
+    the name are ignored when matching. Other tag names (e.g. <html>,
+    <code>) are untouched — they don't escape our wrap. Idempotent: a body
+    that is already encoded passes through unchanged because `&lt;` no
+    longer matches `<`.
     """
-    return _DANGEROUS_WRAP_RX.sub("&lt;", body)
+    out = []
+    last = 0
+    for m in _TAG_LT_RX.finditer(body):
+        if _harness_tag_after(body, m.start()):
+            out.append(body[last : m.start()])
+            out.append("&lt;")
+            last = m.start() + 1
+    out.append(body[last:])
+    return "".join(out)
 
 
 def _wrap_content(report_id: str, sanitized: str) -> str:
@@ -2274,6 +2329,68 @@ def _scan_error_verdict(exc: BaseException):
     )
 
 
+# Retry budget for CONTENT-derived rejects (security review 2026-10-03, C-1).
+# The honeypot layer samples at provider-default temperature, so re-scanning
+# the same bytes until one sample misses turns a detection into a lottery.
+# A detection may be re-scanned this many times (default 1: one
+# false-positive resample survives); an infra reject was never judged and
+# stays retryable. State lives next to the quarantined copy.
+def _read_retry_budget(raw: str | None) -> int:
+    try:
+        v = int(raw) if raw not in (None, "") else 1
+    except ValueError:
+        v = 1
+    return max(0, min(v, 10))
+
+
+_MAX_CONTENT_RETRIES = _read_retry_budget(os.environ.get("RESEARCH_MAX_CONTENT_RETRIES"))
+_RETRY_STATE_SUFFIX = ".retry.json"
+
+
+# Honeypot "unavailable" signals that come from the judge model's OWN output
+# (a malformed or unreadable tool call, an unparseable response, a reply cut
+# off at max_tokens) are shaped by the report under scan, not by an outage.
+# They stay in the infra vocabulary for the operator, but they spend the
+# content retry budget: otherwise a report that reliably breaks the judge's
+# tool call would earn unlimited free resamples.
+_CONTENT_SHAPED_SKIP_MARKERS = (
+    "malformed-tool-call",
+    "malformed-tool-args",
+    "unreadable-tool-call",
+    "parse-error",
+)
+
+
+def _retry_is_free(reason) -> bool:
+    return _is_infra_reason(reason) and not any(
+        m in reason for m in _CONTENT_SHAPED_SKIP_MARKERS
+    )
+
+
+def _write_retry_state(quarantine: Path, report_id: str, infra: bool, content_retries: int) -> None:
+    path = quarantine / f"{report_id}{_RETRY_STATE_SUFFIX}"
+    try:
+        path.unlink(missing_ok=True)
+        _atomic_write_excl(
+            path, json.dumps({"infra": bool(infra), "content_retries": int(content_retries)})
+        )
+    except OSError as e:
+        print(f"research-agent: retry-state write failed for {report_id}: {e}", file=sys.stderr)
+
+
+def _read_retry_state(quarantine: Path, report_id: str) -> tuple[bool, int]:
+    """(infra, content_retries). Missing/unreadable state = an unclassified
+    reject that has never been retried: treated as content-derived, which is
+    the conservative reading."""
+    try:
+        obj = json.loads(_safe_read(quarantine / f"{report_id}{_RETRY_STATE_SUFFIX}"))
+        infra = obj.get("infra") is True
+        n = obj.get("content_retries")
+        return infra, n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else 0
+    except (OSError, ValueError, AttributeError):
+        return False, 0
+
+
 def _scan_and_deliver(
     content: str,
     report_id: str,
@@ -2281,6 +2398,7 @@ def _scan_and_deliver(
     agent_ms: int,
     t_received: float,
     t_scan_start: float,
+    content_retries: int = 0,
 ) -> dict:
     """Scan in-memory `content` and either deliver or quarantine.
 
@@ -2355,6 +2473,10 @@ def _scan_and_deliver(
         else:
             audit_content = f"<oversized:{content_len} bytes, not stored>"
         _write_quarantine_audit(report_id, prompt, verdict, audit_content)
+        if not oversized:
+            _write_retry_state(
+                quarantine, report_id, _retry_is_free(verdict.reason), content_retries
+            )
         from mcp_server.artifact_gate import discard_artifacts
         discard_artifacts(report_id)
         return _reject_response(
@@ -2474,15 +2596,35 @@ def retry_research(report_id: str) -> dict:
     except OSError:
         return {"status": "error", "error": "report_id not found in quarantine"}
 
+    # Retry budget (C-1): a detection may only be re-sampled a bounded
+    # number of times; an infra reject was never judged and stays open.
+    was_infra, content_retries = _read_retry_state(quarantine, report_id)
+    if not was_infra:
+        if content_retries >= _MAX_CONTENT_RETRIES:
+            _LOG.warning(
+                "retry refused id=%s content_retries=%d budget=%d",
+                report_id, content_retries, _MAX_CONTENT_RETRIES,
+            )
+            return {
+                "status": "error",
+                "error": "retry limit reached for this report — the scanner "
+                "detected something in it and it was already re-scanned; it "
+                "stays quarantined",
+                "report_id": report_id,
+            }
+        content_retries += 1
+
     # Remove the quarantined source now that we own a snapshot. If the
     # scan rejects, _scan_and_deliver writes a fresh quarantine file
     # from the snapshot (atomic O_EXCL, so nothing can pre-squat it).
     src.unlink(missing_ok=True)
+    (quarantine / f"{report_id}{_RETRY_STATE_SUFFIX}").unlink(missing_ok=True)
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     t_scan_start = time.monotonic()
     return _scan_and_deliver(
-        content, report_id, f"retry:{report_id}", 0, t_received, t_scan_start
+        content, report_id, f"retry:{report_id}", 0, t_received, t_scan_start,
+        content_retries=content_retries,
     )
 
 
