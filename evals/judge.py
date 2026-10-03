@@ -48,8 +48,19 @@ def parse_judge_output(raw: str) -> dict:
 
 def judge_report(question: str, expectation: str, report: str, timeout: int = 300) -> dict:
     prompt = build_judge_prompt(question, expectation, report)
+    # The report is untrusted web-derived text. The judge only has to emit
+    # JSON, so it runs with no tools, no MCP servers and none of the
+    # operator's settings: a plain `claude -p` inherits ~200 tools here
+    # (Bash, Edit, every user MCP incl. research-agent). `--tools ""` alone
+    # still leaves the MCP servers; all three flags are needed (measured
+    # from the stream-json init event, security review 2026-10-03).
     result = subprocess.run(
-        ["claude", "-p", "--model", JUDGE_MODEL],
+        [
+            "claude", "-p", "--model", JUDGE_MODEL,
+            "--tools", "",
+            "--strict-mcp-config",
+            "--setting-sources", "",
+        ],
         input=prompt,
         capture_output=True,
         text=True,
