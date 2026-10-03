@@ -1,0 +1,9 @@
+# Reviewed false positives (security review 2026-10-03): detect-secrets
+# baseline hashes and a test fixture string, not live credentials.
+797351eb61ea0104e80928ebaad7d59aae35ad24:.secrets.baseline:generic-api-key:115
+797351eb61ea0104e80928ebaad7d59aae35ad24:.secrets.baseline:generic-api-key:124
+797351eb61ea0104e80928ebaad7d59aae35ad24:.secrets.baseline:generic-api-key:133
+622ecac5f8011a76388b7b974bc8b4894079710c:scanner/test_intercept.py:generic-api-key:74
+622ecac5f8011a76388b7b974bc8b4894079710c:.secrets.baseline:generic-api-key:115
+622ecac5f8011a76388b7b974bc8b4894079710c:.secrets.baseline:generic-api-key:126
+622ecac5f8011a76388b7b974bc8b4894079710c:.secrets.baseline:generic-api-key:135
