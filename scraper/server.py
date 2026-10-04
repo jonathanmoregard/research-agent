@@ -21,11 +21,9 @@ authorization and basic input shape.
 from __future__ import annotations
 
 import hmac
-import ipaddress
 import json
 import os
 import re
-import socket
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -33,6 +31,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import sync_playwright
 
+from netguard import blocked_hop, install_request_guard, is_blocked_host
 from sessions import (
     ACT_BUDGET_MS,
     get_artifact_store,
@@ -151,75 +150,23 @@ def _load_token() -> str:
 _load_token()
 
 
-# SSRF blocklist. Reject URLs whose hostname resolves into one of these
-# ranges. Defense-in-depth — the prod host has no cloud metadata service
-# and the scraper VM's SLIRP NAT already isolates it from the host LAN,
-# but if the VM is ever migrated to a cloud or someone wires bridged
-# networking, IMDS / link-local exfil becomes possible. Cheap to block
-# at the URL gate.
-_BLOCKED_NETS = [
-    ipaddress.ip_network(n)
-    for n in (
-        "127.0.0.0/8",       # loopback (including 127.0.0.1 — self-recursion)
-        "169.254.0.0/16",    # link-local (AWS/GCP/Azure IMDS, IPv4)
-        "::1/128",           # loopback v6
-        "fe80::/10",         # link-local v6
-        "fc00::/7",          # unique-local v6 (includes IMDSv6)
-    )
-]
+# SSRF gate: every destination must be a public unicast address. The
+# scraper VM sits behind QEMU SLIRP, where 10.0.2.2 IS the host's loopback,
+# so a private-range miss here means reading host-local services. See
+# netguard.py for the layers (URL gate, per-request route guard, redirect
+# chain check) and nixos-config scraper-microvm.nix for the guest firewall
+# that backs them.
+_is_blocked_host = is_blocked_host
 
 
-def _is_blocked_host(host: str) -> bool:
-    """True if host (literal or after DNS) resolves into a blocked range.
+class BlockedDestination(Exception):
+    """A navigation (redirect hop or final URL) reached a blocked host."""
 
-    Handles literal IP inputs in all the historic forms inet_aton accepts
-    (dot-quad, integer, hex, octal, mixed) before falling back to DNS, so
-    `http://2130706433/` (= 127.0.0.1) and `http://0x7f000001/` cannot
-    bypass the gate via a form that glibc's getaddrinfo refuses to
-    resolve (EAI_NONAME). Chromium's own URL parser accepts all of these,
-    so we MUST normalize before checking.
 
-    For genuine hostnames: resolves every A/AAAA so DNS rebinding can't
-    slip a legitimate-looking hostname through that later swaps to
-    169.254.x. Chromium does its own second lookup — we cannot bind it
-    to our pre-resolved IP — so this remains best-effort. For airtight
-    enforcement, run chromium behind an outbound HTTP proxy enforcing
-    the same blocklist (follow-up).
-    """
-    # Literal IPv4 in any historic form. inet_aton accepts:
-    #   "127.0.0.1", "127.1", "0x7f000001", "017700000001", "2130706433"
-    try:
-        ipv4 = ipaddress.IPv4Address(socket.inet_aton(host))
-    except OSError:
-        ipv4 = None
-    if ipv4 is not None:
-        return any(ipv4 in net for net in _BLOCKED_NETS if net.version == 4)
-
-    # Literal IPv6. Strip zone-id (`fe80::1%eth0`) before inet_pton.
-    try:
-        ipv6 = ipaddress.IPv6Address(
-            socket.inet_pton(socket.AF_INET6, host.split("%", 1)[0])
-        )
-    except OSError:
-        ipv6 = None
-    if ipv6 is not None:
-        return any(ipv6 in net for net in _BLOCKED_NETS if net.version == 6)
-
-    # Hostname — resolve and check every answer.
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror:
-        # Unresolvable. Let chromium fail with NXDOMAIN downstream.
-        return False
-    for info in infos:
-        addr = info[4][0]
-        try:
-            ip = ipaddress.ip_address(addr.split("%", 1)[0])
-        except ValueError:
-            continue
-        if any(ip in net for net in _BLOCKED_NETS):
-            return True
-    return False
+def _refuse_blocked_hop(resp, final_url: str) -> None:
+    hop = blocked_hop(resp, final_url)
+    if hop is not None:
+        raise BlockedDestination(hop)
 
 
 # --- intercept / form-driving config -----------------------------------------
@@ -383,6 +330,7 @@ def intercept(
                 viewport={"width": 1280, "height": 800},
                 accept_downloads=False,
             )
+            install_request_guard(ctx)
             page = ctx.new_page()
 
             def on_response(response):
@@ -426,9 +374,12 @@ def intercept(
 
             page.on("response", on_response)
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                _refuse_blocked_hop(resp, page.url)
                 for action in actions:
                     _do_action(page, action, timeout_ms, seen_urls)
+                # A click/submit may have navigated (and redirected) too.
+                _refuse_blocked_hop(None, page.url)
                 return {
                     "status": "ok",
                     "requested_url": url,
@@ -469,6 +420,7 @@ def render(url: str, timeout_ms: int) -> dict:
                 # context is torn down at the end anyway, but explicit.
                 accept_downloads=False,
             )
+            install_request_guard(ctx)
             page = ctx.new_page()
             try:
                 # Navigate to `load`, then give client-side rendering a
@@ -476,6 +428,9 @@ def render(url: str, timeout_ms: int) -> dict:
                 # the goto condition never finishes on pages that poll
                 # or stream (Amazon), so every such render timed out.
                 resp = page.goto(url, wait_until="load", timeout=timeout_ms)
+                # Redirect hops bypass the route guard; never return a
+                # page that any hop of the chain placed on a blocked host.
+                _refuse_blocked_hop(resp, page.url)
                 # A page that never goes quiet is still rendered; report
                 # it so the caller knows late content may be missing.
                 network_settled = True
@@ -486,6 +441,8 @@ def render(url: str, timeout_ms: int) -> dict:
                     )
                 except PWError:
                     network_settled = False
+                # A client-side redirect may have moved the page since goto.
+                _refuse_blocked_hop(None, page.url)
                 html = page.content()
                 title = page.title()
                 final_url = page.url
@@ -726,6 +683,10 @@ class Handler(BaseHTTPRequestHandler):
             timeout_ms = DEFAULT_TIMEOUT_MS
         try:
             out = render(url, timeout_ms)
+        except BlockedDestination:
+            self._json(400, {"status": "error",
+                             "error": "host not allowed (redirected)"})
+            return
         except PWError as e:
             self._json(
                 502,
@@ -769,6 +730,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             out = intercept(url, actions, capture_patterns, timeout_ms)
+        except BlockedDestination:
+            self._json(400, {"status": "error",
+                             "error": "host not allowed (redirected)"})
+            return
         except PWError as e:
             self._json(
                 502,

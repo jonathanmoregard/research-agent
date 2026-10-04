@@ -69,6 +69,7 @@ class _FakeLocator:
 
 class _FakeContext:
     def new_page(self): return _FakePage()
+    def route(self, pattern, handler): self.routed = (pattern, handler)
     def close(self): pass
 
 
@@ -219,6 +220,7 @@ class _FailingPage(_FakePage):
 
 class _FailingContext:
     def new_page(self): return _FailingPage()
+    def route(self, pattern, handler): pass
     def close(self): pass
 
 

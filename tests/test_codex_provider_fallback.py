@@ -201,7 +201,8 @@ class CodexProviderFallbackTests(unittest.TestCase):
             runner,
         )
         self.assertNotIn('--ro-bind-data "${CODEX_AUTH_FD}"', runner)
-        self.assertIn("printf '{}\\n' > \"${RENDERED_MCP}\"", runner)
+        # No provider gets a rendered (credential-bearing) MCP config.
+        self.assertNotIn("expandvars", runner)
         self.assertNotIn('"${CODEX_AUTH_JSON}" > "${CODEX_STATE_DIR}/auth.json"', runner)
 
     def test_codex_config_exposes_only_the_research_mcp_allowlist(self):
