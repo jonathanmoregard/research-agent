@@ -133,8 +133,26 @@ def _browser_internal(url: str) -> bool:
     return url.startswith(("data:", "blob:", "about:"))
 
 
-def install_request_guard(context) -> None:
-    """Abort every request from `context` whose destination is blocked."""
+def _main_frame_navigation(request) -> bool:
+    try:
+        if not request.is_navigation_request():
+            return False
+        return request.frame.parent_frame is None
+    except Exception:
+        # Service-worker and other frameless requests are not navigations.
+        return False
+
+
+def install_request_guard(context, nav_allowed=None) -> None:
+    """Abort every request from `context` whose destination is blocked.
+
+    With `nav_allowed` (a URL -> bool predicate, the run's provenance gate),
+    every top-level navigation is checked too — goto, link clicks, JS
+    `location` changes, form submits — and only GET navigations pass: a
+    form POST would carry whatever the agent typed to the page's server.
+    Subresources and iframes stay ungated: the page author chose them, so
+    they carry nothing the author did not already have.
+    """
     verdicts: dict[str, bool] = {}
 
     def handler(route):
@@ -142,6 +160,10 @@ def install_request_guard(context) -> None:
         if _browser_internal(url):
             route.continue_()
             return
+        if nav_allowed is not None and _main_frame_navigation(route.request):
+            if route.request.method != "GET" or not nav_allowed(url):
+                route.abort("blockedbyclient")
+                return
         try:
             host = (urlparse(url).hostname or "").lower()
             scheme_ok = urlparse(url).scheme in ("http", "https", "ws", "wss")

@@ -235,6 +235,58 @@ def test_request_guard(guard, url, outcome):
     assert r.outcome == outcome
 
 
+class _NavRequest:
+    def __init__(self, url, *, nav=True, main=True, method="GET", frameless=False):
+        self.url = url
+        self.method = method
+        self._nav = nav
+        self._frameless = frameless
+        self._parent = None if main else object()
+
+    def is_navigation_request(self):
+        return self._nav
+
+    @property
+    def frame(self):
+        if self._frameless:
+            raise RuntimeError("service worker request has no frame")
+        return types.SimpleNamespace(parent_frame=self._parent)
+
+
+def _nav_guard(allowed):
+    holder = {}
+    ctx = types.SimpleNamespace(route=lambda pattern, h: holder.update(h=h))
+    netguard.install_request_guard(ctx, nav_allowed=lambda u: u in allowed)
+    return holder["h"]
+
+
+SEEN = f"https://{PUBLIC}/seen"
+
+
+@pytest.mark.parametrize("request_,outcome", [
+    (_NavRequest(SEEN), "continue"),
+    (_NavRequest(f"https://{PUBLIC}/?k=leak"), "abort"),          # click/JS nav to unseen URL
+    (_NavRequest(SEEN, method="POST"), "abort"),                  # form POST carries typed data
+    (_NavRequest(f"https://{PUBLIC}/?k=leak", main=False), "continue"),  # iframe: author's choice
+    (_NavRequest(f"https://{PUBLIC}/x.js", nav=False), "continue"),      # subresource
+    (_NavRequest(f"https://{PUBLIC}/sw", frameless=True), "continue"),
+    (_NavRequest("http://10.0.2.2:8762/"), "abort"),              # SSRF guard still applies
+])
+def test_navigation_gate(request_, outcome):
+    allowed = {SEEN, "http://10.0.2.2:8762/"}
+    r = _Route(request_.url)
+    r.request = request_
+    _nav_guard(allowed)(r)
+    assert r.outcome == outcome
+
+
+def test_no_predicate_keeps_navigation_ungated(guard):
+    r = _Route(f"https://{PUBLIC}/?k=anything")
+    r.request = _NavRequest(r.request.url)
+    guard(r)
+    assert r.outcome == "continue"
+
+
 def test_every_blocked_net_is_actually_rejected():
     # Guard against a typo'd or dead entry: the first address of every
     # listed net is refused.
