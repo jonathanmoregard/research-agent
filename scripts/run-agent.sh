@@ -6,12 +6,18 @@
 #
 # The jail:
 #   - Fresh tmpfs at $HOME — no session files, history, or cache leak.
-#   - Fresh tmpfs at /scratch — the agent writes its report here.
-#   - Read-only bind of /workspace/agent — CLAUDE.md + .mcp.json.
+#   - /scratch is a fresh per-call directory (on guest /tmp) — the agent
+#     writes its report here; publish_report copies it to /out afterwards.
+#   - Read-only bind of /workspace/agent — CLAUDE.md + .mcp.json. Neither
+#     holds a secret: keys reach the MCP shims only through the jail env.
+#   - Built-in tools: Write only (--tools), scoped to /scratch. No Read,
+#     Glob, Grep or Bash, so the agent cannot read its env, its config or
+#     anything else in the jail; see AGENT_ARGV below.
 #   - Read-only bind of /usr, /etc, /lib* — system libraries.
-#   - Writable bind of /out/<uuid>.md only — final report destination.
+#   - /out is not bound at all — the report is published after the jail exits.
 #   - Writable bind of /tool-cache (when present) — persistent PRV +
-#     Bolagsverket SQLite indexes; see CACHE_ARGS below.
+#     Bolagsverket SQLite indexes for the shims; see CACHE_ARGS below.
+#     The agent's own Write is NOT allowed there (Edit(//scratch/**)).
 #   - Network: inherited (exa + tavily MCPs need outbound).
 #   - Memory: bounded by a per-call cgroup cap; see MEMGUARD below and
 #     lib/memguard.sh.
@@ -79,6 +85,12 @@ PRV_TOOLS="mcp__prv__prv_search"
 # Tradera REST v4). Same inert-without-creds behaviour as TRADEMARK_TOOLS.
 # Search only — neither shim can bid, buy or message.
 SHOPPING_TOOLS="mcp__shopping__ebay_search,mcp__shopping__tradera_search"
+# The one built-in the agent keeps (see --tools below), and only under
+# /scratch. Claude Code matches file writes against Edit(path) rules (a
+# Write(path) rule is ignored with a warning); `//` anchors the path at the
+# filesystem root. A bare `Write` here used to reach the RW /tool-cache
+# share, i.e. host-persistent state shared by every later call.
+SCRATCH_WRITE="Edit(//scratch/**)"
 
 # Default model for BOTH agent depths (fast runs no agent at all — it is
 # a direct server-side Exa call, so no model applies there). Single
@@ -101,11 +113,11 @@ DEFAULT_MODEL="claude-opus-5-5"
 
 case "${DEPTH}" in
   normal)
-    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},${BROWSE_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},${PRV_TOOLS},${SHOPPING_TOOLS},Write"
+    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},${BROWSE_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},${PRV_TOOLS},${SHOPPING_TOOLS},${SCRATCH_WRITE}"
     MODEL="${DEFAULT_MODEL}"
     ;;
   deep)
-    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},${BROWSE_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},${PRV_TOOLS},${SHOPPING_TOOLS},Write"
+    ALLOWED_TOOLS="${EXA_TOOLS},${TAVILY_SEARCH},${RENDER_TOOLS},${BROWSE_TOOLS},${TRADEMARK_TOOLS},${BOLAGSVERKET_TOOLS},${PRV_TOOLS},${SHOPPING_TOOLS},${SCRATCH_WRITE}"
     MODEL="${DEFAULT_MODEL}"
     ;;
   *)
@@ -157,41 +169,31 @@ OUT_DIR="${RESEARCH_REPORTS_DIR:-/out}"
 SCRATCH_FILE="/scratch/${REPORT_UUID}.md"
 FINAL_FILE="${OUT_DIR}/${REPORT_UUID}.md"
 
-# Pre-create the final file so bwrap can bind it writable. bwrap's
-# --unshare-user maps the outer uid to 'nobody' (65534) inside the jail;
-# the bound file must be writable by that uid, so we chmod 666 up front.
-# The file is ephemeral — only valid for this one call.
+# Pre-create the final file: the host's report slot for this call. The
+# jail never sees it. The agent writes a NEW file under /scratch (Claude
+# Code's Write refuses to overwrite a file it has not Read, and the agent
+# has no Read) and publish_report copies it here after the jail exits.
 touch "${FINAL_FILE}"
-chmod 666 "${FINAL_FILE}"
 
 # Prompt passed via a file to avoid shell-quoting issues with arbitrary content.
 PROMPT_CONTENT="$(cat "${PROMPT_FILE}")"
 
-# Claude Code does NOT expand ${VAR} in `.mcp.json` `url` / `headers` fields.
-# Render a resolved copy with env substitution and bind-mount it over the
-# read-only original inside the jail. Ephemeral per call; cleaned up on exit.
-RENDERED_MCP=$(mktemp --suffix=.mcp.json)
-# Invariant: the rendered file holds substituted EXA_API_KEY +
-# TAVILY_API_KEY values. It MUST live on /tmp (in-VM disk), never on
-# /out (virtiofs share, visible to the host). Without this guard, a
-# future operator who exports TMPDIR=/out would silently leak keys to
-# the host's reports/ dir.
-case "${RENDERED_MCP}" in
+# No credential is ever written to a file the jail can see. agent/.mcp.json
+# is used as shipped: it carries no secrets and no `env` blocks, because
+# Claude Code starts stdio MCP servers with its own environment, which
+# already holds the keys from the --setenv list below. (This used to render
+# the keys into a copy of .mcp.json bind-mounted into the agent's cwd,
+# where the agent's Read tool could open it.) Codex likewise passes the
+# names listed in codex-config.toml `env_vars` from its environment.
+#
+# Per-call scratch directory, bound at /scratch inside the jail. Guest /tmp
+# (in-VM disk), never a host-visible share.
+SCRATCH_DIR=$(mktemp -d --suffix=.scratch)
+case "${SCRATCH_DIR}" in
   /tmp/*) ;;
-  *) echo "run-agent: refusing to render .mcp.json outside /tmp (got ${RENDERED_MCP})" >&2; exit 3 ;;
+  *) echo "run-agent: refusing scratch dir outside /tmp (got ${SCRATCH_DIR})" >&2; exit 3 ;;
 esac
-chmod 600 "${RENDERED_MCP}"
-# RESEARCH_RUN_ID follows the same dual path as EXA_API_KEY for Claude: baked
-# into the rendered .mcp.json and passed via --setenv below. Codex reads the
-# tool environment from codex-config.toml, so its placeholder deliberately
-# contains no copied credentials.
-export RESEARCH_RUN_ID="${REPORT_UUID}"
-if [[ "${PROVIDER}" == "claude" ]]; then
-  python3 -c 'import os,sys; sys.stdout.write(os.path.expandvars(sys.stdin.read()))' \
-    < "${AGENT_DIR}/.mcp.json" > "${RENDERED_MCP}"
-else
-  printf '{}\n' > "${RENDERED_MCP}"
-fi
+chmod 700 "${SCRATCH_DIR}"
 
 # Codex auth and state live in a fresh directory on the guest's /tmp.  The
 # directory is bind-mounted into the already-ephemeral bwrap home, then removed
@@ -234,8 +236,9 @@ if [[ "${PROVIDER}" == "codex" ]]; then
 else
   unset CODEX_AUTH_JSON
 fi
+# shellcheck disable=SC2329  # invoked by the EXIT trap below
 cleanup() {
-  rm -f "${RENDERED_MCP}"
+  rm -rf -- "${SCRATCH_DIR}"
   if [[ -n "${CODEX_STATE_DIR}" ]]; then
     rm -rf -- "${CODEX_STATE_DIR}"
   fi
@@ -329,10 +332,29 @@ else
     claude -p "${PROMPT_CONTENT}"
     --add-dir /scratch
     "${MODEL_FLAGS[@]}"
+    # The built-in tool SET, not only pre-approval: with --allowed-tools
+    # alone Read/Glob/Grep stay live (headless mode auto-allows them in
+    # the cwd). MCP tools are not affected by --tools.
+    --tools Write
+    # Anything not pre-approved below is denied, never prompted for.
+    --permission-mode dontAsk
     --allowed-tools "${ALLOWED_TOOLS}"
+    # Belt to --tools: deny the readers and executors by name as well.
+    --disallowed-tools "Read,Glob,Grep,Bash,NotebookEdit,WebFetch,WebSearch,Task,Agent"
   )
 fi
 
+# Copy the agent's report from the scratch dir to the host-visible report
+# slot. Only a regular file is taken, never a symlink. No report leaves the
+# pre-created empty file, which the host already treats as "wrote nothing".
+publish_report() {
+  local src="${SCRATCH_DIR}/${REPORT_UUID}.md"
+  if [[ -f "${src}" && ! -L "${src}" ]]; then
+    cat -- "${src}" > "${FINAL_FILE}"
+  fi
+}
+
+agent_rc=0
 "${MEMGUARD_ARGV[@]}" \
 bwrap \
   --ro-bind /nix/store /nix/store \
@@ -347,9 +369,8 @@ bwrap \
   --tmpfs /tmp \
   --tmpfs "${HOME_DIR}" \
   --ro-bind "${AGENT_DIR}" "${AGENT_DIR}" \
-  --ro-bind "${RENDERED_MCP}" "${AGENT_DIR}/.mcp.json" \
   "${CODEX_BIND_ARGS[@]}" \
-  --bind "${FINAL_FILE}" "${SCRATCH_FILE}" \
+  --bind "${SCRATCH_DIR}" /scratch \
   --unshare-user \
   --unshare-pid \
   --unshare-uts \
@@ -373,4 +394,7 @@ bwrap \
   "${CACHE_ARGS[@]}" \
   --setenv CLAUDE_STREAM_IDLE_TIMEOUT_MS "1800000" \
   -- \
-  "${AGENT_ARGV[@]}"
+  "${AGENT_ARGV[@]}" || agent_rc=$?
+
+publish_report
+exit "${agent_rc}"
