@@ -150,7 +150,8 @@ def install_request_guard(context, nav_allowed=None, on_blocked_nav=None) -> Non
     every top-level navigation is checked too — goto, link clicks, JS
     `location` changes, form submits — and only GET navigations pass: a
     form POST would carry whatever the agent typed to the page's server.
-    `on_blocked_nav(url)` is told about each refused navigation.
+    `on_blocked_nav(url)` is told about each refused navigation. A
+    refused navigation is answered locally with 204, so the page stays put.
 
     Subresources and iframes stay ungated. That is NOT because they are
     harmless: once the agent has typed into a page, that page's script can
@@ -175,7 +176,11 @@ def install_request_guard(context, nav_allowed=None, on_blocked_nav=None) -> Non
                         on_blocked_nav(url)
                     except Exception:
                         pass
-                route.abort("blockedbyclient")
+                # Answered locally with 204 No Content: nothing leaves the
+                # browser, and chromium keeps the current page (an abort
+                # would leave it on chrome-error://). Verified in real
+                # chromium for link clicks, JS location changes and forms.
+                route.fulfill(status=204, body="")
                 return
         try:
             host = (urlparse(url).hostname or "").lower()

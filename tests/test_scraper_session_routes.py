@@ -49,6 +49,7 @@ import server   # noqa: E402
 import sessions  # noqa: E402
 
 BEARER = "Bearer stub-token-for-tests"
+RUN = "a" * 32
 
 
 class _FakeWorker:
@@ -133,20 +134,20 @@ def _assert(cond: bool, msg: str) -> None:
 # ---- tests ----
 
 def test_open_requires_auth():
-    code, body = _post("/session/open", {"url": "https://example.com/"}, auth=None)
+    code, body = _post("/session/open", {"url": "https://example.com/", "run_id": RUN}, auth=None)
     _assert(code == 401, f"expected 401, got {code}: {body}")
     _assert(body["status"] == "error", "no error status")
 
 
 def test_open_blocked_host():
-    code, body = _post("/session/open", {"url": "http://127.0.0.1/"})
+    code, body = _post("/session/open", {"url": "http://127.0.0.1/", "run_id": RUN})
     _assert(code == 400, f"expected 400, got {code}: {body}")
     _assert("host not allowed" in body.get("error", ""), f"unexpected error: {body}")
 
 
 def test_open_ok():
     _fake.cmds.clear()
-    code, body = _post("/session/open", {"url": "https://example.com/"})
+    code, body = _post("/session/open", {"url": "https://example.com/", "run_id": RUN})
     _assert(code == 200, f"expected 200, got {code}: {body}")
     _assert(body.get("status") == "ok", f"bad status: {body}")
     _assert("session_id" in body, f"no session_id: {body}")
@@ -154,21 +155,57 @@ def test_open_ok():
     _assert(_fake.cmds[0]["op"] == "open", f"wrong op: {_fake.cmds[0]}")
 
 
-def test_open_bad_viewport():
-    code, body = _post("/session/open", {"url": "https://example.com/", "viewport": {"width": 100, "height": 100}})
-    _assert(code == 400, f"expected 400 for bad viewport, got {code}: {body}")
-    _assert("viewport" in body.get("error", ""), f"unexpected error: {body}")
-
-
-def test_open_good_viewport():
+def test_open_odd_viewport_is_snapped_to_default():
     _fake.cmds.clear()
-    code, body = _post("/session/open", {"url": "https://example.com/", "viewport": {"width": 1280, "height": 720}})
+    code, body = _post("/session/open", {"url": "https://example.com/", "run_id": RUN,
+                                         "viewport": {"width": 100, "height": 100}})
+    _assert(code == 200, f"expected 200, got {code}: {body}")
+    _assert(_fake.cmds[-1]["viewport"] == {"width": 1280, "height": 800}, f"{_fake.cmds[-1]}")
+
+
+def test_open_preset_viewport_kept():
+    _fake.cmds.clear()
+    code, body = _post("/session/open", {"url": "https://example.com/", "run_id": RUN,
+                                         "viewport": {"width": 390, "height": 844}})
     _assert(code == 200, f"expected 200 with valid viewport, got {code}: {body}")
+    _assert(_fake.cmds[-1]["viewport"] == {"width": 390, "height": 844}, f"{_fake.cmds[-1]}")
+
+
+def test_open_requires_run_id_and_forwards_policy():
+    code, body = _post("/session/open", {"url": "https://example.com/"})
+    _assert(code == 400 and "run_id" in body.get("error", ""), f"{code}: {body}")
+    _fake.cmds.clear()
+    policy = {"urls": ["https://seen.test/"], "templates": True}
+    code, body = _post("/session/open", {"url": "https://example.com/", "run_id": RUN,
+                                         "nav_policy": policy})
+    _assert(code == 200, f"{code}: {body}")
+    _assert(_fake.cmds[-1]["nav_policy"] == policy and _fake.cmds[-1]["run_id"] == RUN,
+            f"{_fake.cmds[-1]}")
+
+
+def test_session_ops_forward_run_id_and_map_forbidden_to_403():
+    sid = "ab12" * 4
+    for op, body in (("act", {"actions": []}), ("screenshot", {}), ("close", {}),
+                     ("save_artifact", {"name": "shot"})):
+        code, out = _post(f"/session/{sid}/{op}", body)
+        _assert(code == 400 and "run_id" in out.get("error", ""), f"{op}: {code} {out}")
+        _fake.cmds.clear()
+        code, out = _post(f"/session/{sid}/{op}", dict(body, run_id=RUN))
+        _assert(code == 200 and _fake.cmds[-1]["run_id"] == RUN, f"{op}: {code} {out}")
+    orig = _fake.submit
+    def _forbid(cmd, timeout_s=120.0):
+        raise RuntimeError("SessionForbidden: session belongs to another run")
+    _fake.submit = _forbid
+    try:
+        code, out = _post(f"/session/{sid}/act", {"actions": [], "run_id": RUN})
+    finally:
+        _fake.submit = orig
+    _assert(code == 403 and "another run" in out["error"], f"{code}: {out}")
 
 
 def test_act_validates_actions():
     sid = "ab12" * 4
-    code, body = _post(f"/session/{sid}/act", {"actions": [{"type": "explode"}]})
+    code, body = _post(f"/session/{sid}/act", {"actions": [{"type": "explode"}], "run_id": RUN})
     _assert(code == 400, f"expected 400, got {code}: {body}")
     _assert("unknown type" in body.get("error", ""), f"unexpected error: {body}")
 
@@ -176,7 +213,7 @@ def test_act_validates_actions():
 def test_act_goto_blocked_host():
     sid = "ab12" * 4
     actions = [{"type": "goto", "url": "http://127.0.0.1/"}]
-    code, body = _post(f"/session/{sid}/act", {"actions": actions})
+    code, body = _post(f"/session/{sid}/act", {"actions": actions, "run_id": RUN})
     _assert(code == 400, f"expected 400, got {code}: {body}")
     _assert("host not allowed" in body.get("error", ""), f"unexpected error: {body}")
 
@@ -191,7 +228,7 @@ def test_act_ok():
     _fake.cmds.clear()
     sid = "ab12" * 4
     actions = [{"type": "click", "target": {"selector": "#btn"}}]
-    code, body = _post(f"/session/{sid}/act", {"actions": actions})
+    code, body = _post(f"/session/{sid}/act", {"actions": actions, "run_id": RUN})
     _assert(code == 200, f"expected 200, got {code}: {body}")
     _assert(_fake.cmds[-1]["op"] == "act", f"wrong op: {_fake.cmds[-1]}")
 
@@ -240,7 +277,7 @@ def test_artifacts_delete():
 def test_worker_error_is_502():
     _fake._raise = True
     try:
-        code, body = _post("/session/open", {"url": "https://example.com/"})
+        code, body = _post("/session/open", {"url": "https://example.com/", "run_id": RUN})
         _assert(code == 502, f"expected 502, got {code}: {body}")
         _assert(body["status"] == "error", f"bad status: {body}")
         _assert("worker exploded" in body.get("error", ""), f"wrong error: {body}")
@@ -251,52 +288,57 @@ def test_worker_error_is_502():
 def test_open_bool_timeout_uses_default():
     """timeout_ms: true must not reach the worker as True/1 — clamp to default."""
     _fake.cmds.clear()
-    code, body = _post("/session/open", {"url": "https://example.com/", "timeout_ms": True})
+    code, body = _post("/session/open", {"url": "https://example.com/", "run_id": RUN, "timeout_ms": True})
     _assert(code == 200, f"expected 200, got {code}: {body}")
     _assert(len(_fake.cmds) == 1, f"no cmd recorded: {_fake.cmds}")
     got = _fake.cmds[0]["timeout_ms"]
     _assert(got == server.DEFAULT_TIMEOUT_MS, f"timeout_ms should be default ({server.DEFAULT_TIMEOUT_MS}), got {got!r}")
 
 
-def test_open_bool_viewport_is_400():
-    """viewport with bool width must be rejected with 400."""
-    code, body = _post("/session/open", {"url": "https://example.com/", "viewport": {"width": True, "height": 700}})
-    _assert(code == 400, f"expected 400 for bool viewport width, got {code}: {body}")
+def test_open_malformed_viewport_is_400():
+    """A viewport that is not an object is malformed (400); odd numbers snap."""
+    code, body = _post("/session/open", {"url": "https://example.com/", "run_id": RUN, "viewport": "1280x800"})
+    _assert(code == 400, f"expected 400 for malformed viewport, got {code}: {body}")
     _assert("viewport" in body.get("error", ""), f"unexpected error: {body}")
+    _fake.cmds.clear()
+    code, body = _post("/session/open", {"url": "https://example.com/", "run_id": RUN, "viewport": {"width": True, "height": 700}})
+    _assert(code == 200 and _fake.cmds[-1]["viewport"] == {"width": 1280, "height": 800}, f"{code}: {body}")
 
 
 def test_act_oversized_body_is_400():
-    """A body larger than MAX_REQUEST_BYTES on act must return 400, not 200."""
+    """A body larger than the policy cap on act must return 400, not 200."""
     sid = "ab12" * 4
     url = f"http://127.0.0.1:{_srv_port}/session/{sid}/act"
-    # 70 KiB body — above the 64 KiB cap
-    big_body = b'{"actions":[]}' + b" " * (70 * 1024)
-    req = urllib.request.Request(url, data=big_body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Content-Length", str(len(big_body)))
-    req.add_header("Authorization", BEARER)
-    try:
-        with urllib.request.urlopen(req) as r:
-            code, body = r.status, json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        code, body = e.code, json.loads(e.read())
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", _srv_port, timeout=10)
+    conn.putrequest("POST", f"/session/{sid}/act")
+    conn.putheader("Content-Type", "application/json")
+    # Declared length over the cap: refused before the body is read.
+    conn.putheader("Content-Length", str(server.MAX_POLICY_REQUEST_BYTES + 1))
+    conn.putheader("Authorization", BEARER)
+    conn.endheaders()
+    conn.send(b'{"actions":[]}')
+    r = conn.getresponse()
+    code, body = r.status, json.loads(r.read())
+    conn.close()
     _assert(code == 400, f"expected 400 for oversized act body, got {code}: {body}")
 
 
-def test_screenshot_empty_body_still_200():
-    """screenshot with an empty/no body must still return 200."""
+def test_screenshot_oversized_body_is_400():
+    """Only act/open/intercept get the large policy cap."""
     sid = "ab12" * 4
     url = f"http://127.0.0.1:{_srv_port}/session/{sid}/screenshot"
-    req = urllib.request.Request(url, data=b"", method="POST")
+    big = b'{"run_id":"' + RUN.encode() + b'"}' + b" " * (70 * 1024)
+    req = urllib.request.Request(url, data=big, method="POST")
     req.add_header("Content-Type", "application/json")
-    req.add_header("Content-Length", "0")
+    req.add_header("Content-Length", str(len(big)))
     req.add_header("Authorization", BEARER)
     try:
         with urllib.request.urlopen(req) as r:
             code, body = r.status, json.loads(r.read())
     except urllib.error.HTTPError as e:
         code, body = e.code, json.loads(e.read())
-    _assert(code == 200, f"expected 200 for screenshot with empty body, got {code}: {body}")
+    _assert(code == 400, f"expected 400 for oversized screenshot body, got {code}: {body}")
 
 
 def test_act_goto_url_too_long_is_400():
@@ -304,7 +346,7 @@ def test_act_goto_url_too_long_is_400():
     sid = "ab12" * 4
     long_url = "https://example.com/" + "a" * (server.MAX_URL_LEN + 1)
     actions = [{"type": "goto", "url": long_url}]
-    code, body = _post(f"/session/{sid}/act", {"actions": actions})
+    code, body = _post(f"/session/{sid}/act", {"actions": actions, "run_id": RUN})
     _assert(code == 400, f"expected 400 for overlong goto url, got {code}: {body}")
     _assert("url too long" in body.get("error", ""), f"unexpected error: {body}")
 

@@ -20,10 +20,14 @@ import threading
 import time
 import uuid
 
+import urlpolicy
 from netguard import blocked_hop, install_request_guard
-from urlpolicy import MAX_KEY_LEN, typed_text_error
+from urlpolicy import press_key_error, typed_text_error
 
-MAX_SESSIONS = 2
+# Per research run, and for the whole scraper (two runs can overlap: two
+# agent slots in the research VM). Per-run so one run cannot starve another.
+MAX_SESSIONS_PER_RUN = 2
+MAX_SESSIONS = 4
 SESSION_IDLE_TTL_S = 300.0
 MAX_ACTIONS_PER_CALL = 20
 # Worker-side ceiling for one act call. Timeout hierarchy — each layer must
@@ -40,7 +44,31 @@ MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 MAX_ARTIFACTS_PER_RUN = 10
 MAX_ARTIFACT_TOTAL_BYTES = 64 * 1024 * 1024
 ARTIFACT_TTL_S = 30 * 60.0
-DEFAULT_VIEWPORT = {"width": 1280, "height": 720}
+DEFAULT_VIEWPORT = dict(urlpolicy.DEFAULT_VIEWPORT)
+# Cap on harvested outlinks per observation; the broker feeds them to the
+# run's URL ledger and does not show them to the model.
+MAX_LINKS = urlpolicy.MAX_URLS_PER_TEXT
+# Exact DOM-resolved hrefs of navigable links (docs/egress-broker.md §3.4).
+LINKS_JS = r"""
+(max) => {
+  const out = [];
+  const seen = new Set();
+  const sel = 'a[href], area[href], link[rel~="canonical"][href], ' +
+    'link[rel~="alternate"][href], link[rel~="next"][href], link[rel~="prev"][href]';
+  for (const el of document.querySelectorAll(sel)) {
+    let h = el.href;
+    if (h && typeof h === "object" && typeof h.baseVal === "string") {
+      // SVG <a>: href is an SVGAnimatedString.
+      try { h = new URL(h.baseVal, document.baseURI).href; } catch (e) { continue; }
+    }
+    if (typeof h !== "string" || !/^https?:/i.test(h) || seen.has(h)) continue;
+    seen.add(h);
+    out.push(h);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+"""
 _UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -94,8 +122,8 @@ def validate_actions(actions) -> str | None:
         if t == "press" and (not _valid_target(a.get("target"))
                              or not isinstance(a.get("key"), str)):
             return f"action {i}: press needs target + key"
-        if t == "press" and len(a["key"]) > MAX_KEY_LEN:
-            return f"action {i}: press key name too long"
+        if t == "press" and press_key_error(a["key"]):
+            return f"action {i}: {press_key_error(a['key'])}"
         if t == "scroll" and not isinstance(a.get("dy"), (int, float)):
             return f"action {i}: scroll needs dy"
         if t == "drag":
@@ -109,7 +137,62 @@ def validate_actions(actions) -> str | None:
             return f"action {i}: wait_for_selector needs selector"
         if t == "wait_ms" and not (isinstance(a.get("ms"), int) and 0 < a["ms"] <= 30000):
             return f"action {i}: wait_ms needs ms 1..30000"
+    try:
+        # Malformed numbers (NaN, inf, strings) are refused here; the
+        # worker snaps the valid ones against the session viewport.
+        urlpolicy.normalize_session_actions(actions, DEFAULT_VIEWPORT)
+    except ValueError as e:
+        return f"bad action number: {e}"
     return typed_text_error([a["text"] for a in actions if a["type"] == "fill"])
+
+
+def nav_ledger(policy) -> urlpolicy.Ledger:
+    """The run's allowed-URL snapshot the broker sends as `nav_policy`.
+
+    Missing or malformed means empty (fail closed: only the entry URL, the
+    current site and the shop templates stay reachable).
+    """
+    ledger = urlpolicy.Ledger()
+    urls = policy.get("urls") if isinstance(policy, dict) else None
+    if isinstance(urls, list):
+        ledger.add_urls(u for u in urls[:NAV_POLICY_MAX_URLS] if isinstance(u, str))
+    return ledger
+
+
+NAV_POLICY_MAX_URLS = 20_000
+
+
+def nav_predicate(entry_url: str, ledger_ref, current_url):
+    """URL -> bool for main-frame navigations (docs/egress-broker.md §4.1).
+
+    Allowed: the session's own entry URL; the same site as the page being
+    navigated away from (a site search via fill + Enter lands on
+    /search?q=<typed> on that host, whose script already had the text); or
+    whatever the provenance check allows against the run's snapshot.
+    `ledger_ref()` and `current_url()` are read at navigation time.
+    """
+    entry = urlpolicy.normalize(entry_url)
+
+    def allowed(url: str) -> bool:
+        if entry is not None and urlpolicy.normalize(url) == entry:
+            return True
+        try:
+            cur = current_url() or ""
+        except Exception:
+            cur = ""
+        if urlpolicy.same_site(url, cur):
+            return True
+        return urlpolicy.check(url, ledger_ref()).allowed
+
+    return allowed
+
+
+def page_links(page) -> list[str]:
+    try:
+        links = page.evaluate(LINKS_JS, MAX_LINKS)
+    except Exception:
+        return []
+    return [u for u in links if isinstance(u, str)][:MAX_LINKS] if isinstance(links, list) else []
 
 
 class ArtifactStore:
@@ -172,13 +255,23 @@ def get_artifact_store() -> ArtifactStore:
     return _artifact_store
 
 
-class _Session:
-    __slots__ = ("browser", "context", "page", "last_used", "snapshot_refs_ok")
+class SessionForbidden(RuntimeError):
+    """A session op named a run other than the one that opened the session."""
 
-    def __init__(self, browser, context, page):
+
+class _Session:
+    __slots__ = ("browser", "context", "page", "last_used", "snapshot_refs_ok",
+                 "run_id", "viewport", "nav_ledger", "blocked_navs")
+
+    def __init__(self, browser, context, page, run_id: str = "",
+                 viewport: dict | None = None):
         self.browser, self.context, self.page = browser, context, page
         self.last_used = time.monotonic()
         self.snapshot_refs_ok = True
+        self.run_id = run_id
+        self.viewport = viewport or dict(DEFAULT_VIEWPORT)
+        self.nav_ledger = urlpolicy.Ledger()
+        self.blocked_navs: list[str] = []
 
 
 def _refuse_blocked(page, resp) -> None:
@@ -285,6 +378,8 @@ class BrowserWorker(threading.Thread):
                 raise RuntimeError(
                     "unknown or expired session — call browse_open again"
                 )
+            if cmd.get("run_id") != s.run_id:
+                raise SessionForbidden("session belongs to another run")
             s.last_used = time.monotonic()
             if op == "act":
                 return self._act(s, cmd)
@@ -293,7 +388,8 @@ class BrowserWorker(threading.Thread):
             if op == "save_artifact":
                 data, mime = self._shoot(s.page, full_page=False,
                                          cap=MAX_ARTIFACT_BYTES, artifact=True)
-                fname = self.artifacts.add(cmd["run_id"], cmd["name"], data, mime)
+                # The session's own run, whatever the request named.
+                fname = self.artifacts.add(s.run_id, cmd["name"], data, mime)
                 return {"stored": True, "name": fname}
             if op == "close":
                 self._close(sid)
@@ -302,23 +398,40 @@ class BrowserWorker(threading.Thread):
 
     def _open(self, cmd: dict) -> dict:
         self._sweep()
+        run_id = cmd.get("run_id") or ""
+        mine = sum(1 for v in self._sessions.values() if v.run_id == run_id)
+        if mine >= MAX_SESSIONS_PER_RUN:
+            raise RuntimeError(
+                f"session limit ({MAX_SESSIONS_PER_RUN} per run) reached — "
+                "browse_close one first"
+            )
         if len(self._sessions) >= MAX_SESSIONS:
             raise RuntimeError(
-                f"session limit ({MAX_SESSIONS}) reached — browse_close one first"
+                f"scraper session limit ({MAX_SESSIONS}) reached — retry shortly"
             )
+        viewport = urlpolicy.snap_viewport(cmd.get("viewport"))
         browser = self._factory()
         context = browser.new_context(
             user_agent=_UA,
-            viewport=cmd.get("viewport") or DEFAULT_VIEWPORT,
+            viewport=viewport,
             accept_downloads=False,
+            # context.route does not see requests a service worker serves,
+            # navigations in its scope included (G6).
+            service_workers="block",
         )
         page = context.new_page()
-        s = _Session(browser, context, page)
+        s = _Session(browser, context, page, run_id=run_id, viewport=viewport)
+        s.nav_ledger = nav_ledger(cmd.get("nav_policy"))
         sid = uuid.uuid4().hex[:16]
         self._sessions[sid] = s
         try:
             # Inside the try so a failure here still closes the browser.
-            install_request_guard(context)
+            install_request_guard(
+                context,
+                nav_allowed=nav_predicate(cmd["url"], lambda: s.nav_ledger,
+                                          lambda: s.page.url),
+                on_blocked_nav=s.blocked_navs.append,
+            )
             resp = page.goto(cmd["url"], wait_until="domcontentloaded",
                              timeout=int(cmd.get("timeout_ms") or 30000))
             _refuse_blocked(page, resp)
@@ -337,7 +450,14 @@ class BrowserWorker(threading.Thread):
         # gave up, serializing later commands behind the orphan.
         deadline = time.monotonic() + self._act_budget_ms / 1000.0
         req_timeout = int(cmd.get("timeout_ms") or 30000)
-        for a in cmd.get("actions") or []:
+        # The broker's latest snapshot: links seen on the previous
+        # observation become clickable now.
+        if "nav_policy" in cmd:
+            s.nav_ledger = nav_ledger(cmd.get("nav_policy"))
+        s.blocked_navs.clear()
+        # Defence in depth: the broker already snapped every number.
+        actions = urlpolicy.normalize_session_actions(cmd.get("actions") or [], s.viewport)
+        for a in actions:
             remaining_ms = int((deadline - time.monotonic()) * 1000)
             if remaining_ms <= 0:
                 raise RuntimeError(
@@ -349,7 +469,10 @@ class BrowserWorker(threading.Thread):
         # goto / click / submit may have navigated, and redirect hops are
         # not seen by the request guard.
         _refuse_blocked(s.page, None)
-        return self._observe(s)
+        out = self._observe(s)
+        if s.blocked_navs:
+            out["blocked_navigation"] = s.blocked_navs[0][:300]
+        return out
 
     def _locator(self, s: _Session, target: dict):
         if target.get("selector"):
@@ -443,6 +566,7 @@ class BrowserWorker(threading.Thread):
             "snapshot": snapshot,
             "final_url": s.page.url,
             "title": s.page.title(),
+            "links": page_links(s.page),
         }
 
     def _sweep(self) -> None:

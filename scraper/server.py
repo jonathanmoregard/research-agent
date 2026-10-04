@@ -37,11 +37,15 @@ from netguard import (
     install_request_guard,
     is_blocked_host,
 )
-from urlpolicy import MAX_KEY_LEN, typed_text_error
+import urlpolicy
+from urlpolicy import press_key_error, typed_text_error
 from sessions import (
     ACT_BUDGET_MS,
     get_artifact_store,
     get_worker,
+    nav_ledger,
+    nav_predicate,
+    page_links,
     validate_actions,
     validate_artifact_name,
     validate_run_id,
@@ -52,6 +56,9 @@ TOKEN_FILE = os.environ.get("SCRAPER_TOKEN_FILE", "/etc/scraper/token")
 
 MAX_URL_LEN = 4096
 MAX_REQUEST_BYTES = 64 * 1024
+# /intercept, /session/open and act carry the run's URL snapshot
+# (`nav_policy`, up to 20 000 URLs), so they get a larger body cap.
+MAX_POLICY_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_TIMEOUT_MS = 60_000
 DEFAULT_TIMEOUT_MS = 30_000
 # Cap on returned HTML so a malicious target site can't balloon caller
@@ -250,9 +257,8 @@ def _validate_intercept_inputs(
                 return f"action {i} url_pattern is not a valid regex"
         if t == "fill" and not isinstance(action.get("text", ""), str):
             return f"action {i} fill text must be a string"
-        if t == "press" and not (isinstance(action.get("key"), str)
-                                 and len(action["key"]) <= MAX_KEY_LEN):
-            return f"action {i} press needs a key name"
+        if t == "press" and press_key_error(action.get("key")):
+            return f"action {i}: {press_key_error(action.get('key'))}"
     typed = typed_text_error(
         [a.get("text", "") for a in actions if a.get("type") == "fill"]
     )
@@ -344,6 +350,7 @@ def intercept(
     actions: list,
     capture_patterns: list,
     timeout_ms: int,
+    nav_policy: dict | None = None,
 ) -> dict:
     """Drive a SPA form and capture matching XHR responses.
 
@@ -357,7 +364,11 @@ def intercept(
     """
     captured: list[dict] = []
     seen_urls: list[str] = []
+    blocked_navs: list[str] = []
     compiled = [re.compile(p) for p in capture_patterns]
+    # Defence in depth: the broker already snapped every number.
+    actions = urlpolicy.normalize_intercept_actions(actions)
+    ledger = nav_ledger(nav_policy)
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=True,
@@ -370,11 +381,18 @@ def intercept(
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/120.0.0.0 Safari/537.36"
                 ),
-                viewport={"width": 1280, "height": 800},
+                viewport=dict(urlpolicy.DEFAULT_VIEWPORT),
                 accept_downloads=False,
+                service_workers="block",
             )
-            install_request_guard(ctx)
             page = ctx.new_page()
+            # Top-level navigations (clicks, submits, JS) are gated against
+            # the run's snapshot; see sessions.nav_predicate.
+            install_request_guard(
+                ctx,
+                nav_allowed=nav_predicate(url, lambda: ledger, lambda: page.url),
+                on_blocked_nav=blocked_navs.append,
+            )
 
             def on_response(response):
                 if len(seen_urls) < MAX_SEEN_RESPONSES:
@@ -426,12 +444,16 @@ def intercept(
                     _do_action(page, action, timeout_ms, seen_urls, deadline)
                 # A click/submit may have navigated (and redirected) too.
                 _refuse_blocked_hop(None, page.url)
-                return {
+                out = {
                     "status": "ok",
                     "requested_url": url,
                     "final_url": page.url,
                     "captured": captured,
+                    "links": page_links(page),
                 }
+                if blocked_navs:
+                    out["blocked_navigation"] = blocked_navs[0][:300]
+                return out
             finally:
                 ctx.close()
         finally:
@@ -461,11 +483,15 @@ def render(url: str, timeout_ms: int) -> dict:
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/120.0.0.0 Safari/537.36"
                 ),
-                viewport={"width": 1280, "height": 800},
+                viewport=dict(urlpolicy.DEFAULT_VIEWPORT),
                 # Don't accept any cookies / persist any state — the
                 # context is torn down at the end anyway, but explicit.
                 accept_downloads=False,
+                service_workers="block",
             )
+            # No navigation gate here: the only model input is the URL the
+            # broker already gated, and client-side redirects (consent
+            # walls, locale) must keep working (docs/egress-broker.md §0.1).
             install_request_guard(ctx)
             page = ctx.new_page()
             try:
@@ -514,6 +540,7 @@ def render(url: str, timeout_ms: int) -> dict:
                     "text": text,
                     "text_truncated": text_truncated,
                     "network_settled": network_settled,
+                    "links": page_links(page),
                 }
             finally:
                 ctx.close()
@@ -546,7 +573,8 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _read_body(self) -> tuple[int, dict | None, str | None]:
+    def _read_body(self, max_bytes: int = MAX_REQUEST_BYTES
+                   ) -> tuple[int, dict | None, str | None]:
         """Returns (length, parsed_dict, error_string). Either parsed is set,
         or error is set. Empties everything else.
         """
@@ -554,7 +582,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             return 0, None, "bad length"
-        if length <= 0 or length > MAX_REQUEST_BYTES:
+        if length <= 0 or length > max_bytes:
             return length, None, "bad length"
         raw = self.rfile.read(length)
         try:
@@ -604,7 +632,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             out = get_worker().submit(cmd, timeout_s=timeout_s)
         except RuntimeError as e:
-            self._json(502, {"status": "error", "error": str(e)[:300]})
+            msg = str(e)
+            if msg.startswith("SessionForbidden"):
+                self._json(403, {"status": "error",
+                                 "error": "session belongs to another run"})
+                return
+            self._json(502, {"status": "error", "error": msg[:300]})
             return
         out["status"] = "ok"
         self._json(200, out)
@@ -612,7 +645,7 @@ class Handler(BaseHTTPRequestHandler):
     def _do_session_open(self) -> None:
         if not self._check_auth():
             return
-        _length, req, err = self._read_body()
+        _length, req, err = self._read_body(MAX_POLICY_REQUEST_BYTES)
         if err is not None or req is None:
             self._json(400, {"status": "error", "error": err or "bad json"})
             return
@@ -624,36 +657,38 @@ class Handler(BaseHTTPRequestHandler):
         if host_err is not None:
             self._json(400, {"status": "error", "error": host_err})
             return
-        viewport = req.get("viewport")
-        if viewport is not None and not (
-            isinstance(viewport, dict)
-            and isinstance(viewport.get("width"), int)
-            and not isinstance(viewport.get("width"), bool)
-            and isinstance(viewport.get("height"), int)
-            and not isinstance(viewport.get("height"), bool)
-            and 320 <= viewport["width"] <= 1920
-            and 240 <= viewport["height"] <= 1080
-        ):
+        run_id = req.get("run_id")
+        if not validate_run_id(run_id):
+            self._json(400, {"status": "error", "error": "bad run_id"})
+            return
+        try:
+            # Snapped to a preset; only a non-object is malformed.
+            viewport = urlpolicy.snap_viewport(req.get("viewport"))
+        except ValueError:
             self._json(400, {"status": "error", "error": "bad viewport"})
             return
         timeout_ms = _clamp_timeout(req.get("timeout_ms"))
         # Browser launch + goto + observe: wait the goto timeout plus 60 s
         # launch/observe slack so we outlast the worker, never abandon it.
         self._submit({"op": "open", "url": url, "viewport": viewport,
-                      "timeout_ms": timeout_ms},
+                      "timeout_ms": timeout_ms, "run_id": run_id,
+                      "nav_policy": req.get("nav_policy")},
                      timeout_s=timeout_ms / 1000 + 60)
 
     def _do_session_op(self, sid: str, op: str) -> None:
         if not self._check_auth():
             return
-        _length, req, err = self._read_body()
+        _length, req, err = self._read_body(
+            MAX_POLICY_REQUEST_BYTES if op == "act" else MAX_REQUEST_BYTES)
         if err is not None or req is None:
-            # close/screenshot may come with an empty body; tolerate it.
-            # act/save_artifact require a valid body — return 400 on error.
-            if op in ("act", "save_artifact"):
-                self._json(400, {"status": "error", "error": err or "bad json"})
-                return
-            req = {}
+            self._json(400, {"status": "error", "error": err or "bad json"})
+            return
+        # Every session op names the run that opened the session; the
+        # worker refuses any other run with 403.
+        run_id = req.get("run_id")
+        if not validate_run_id(run_id):
+            self._json(400, {"status": "error", "error": "bad run_id"})
+            return
         if op == "act":
             actions = req.get("actions") or []
             verr = validate_actions(actions)
@@ -674,28 +709,28 @@ class Handler(BaseHTTPRequestHandler):
                         return
             # Worker bounds one act call to ACT_BUDGET_MS; wait that plus
             # 30 s queue/observe slack so we outlast it (see sessions.py).
-            self._submit({"op": "act", "session_id": sid, "actions": actions,
-                          "timeout_ms": _clamp_timeout(req.get("timeout_ms"))},
-                         timeout_s=ACT_BUDGET_MS / 1000 + 30)
+            cmd = {"op": "act", "session_id": sid, "actions": actions,
+                   "timeout_ms": _clamp_timeout(req.get("timeout_ms")),
+                   "run_id": run_id}
+            if "nav_policy" in req:
+                cmd["nav_policy"] = req.get("nav_policy")
+            self._submit(cmd, timeout_s=ACT_BUDGET_MS / 1000 + 30)
             return
         if op == "screenshot":
             self._submit({"op": "screenshot", "session_id": sid,
-                          "full_page": bool(req.get("full_page"))})
+                          "full_page": bool(req.get("full_page")),
+                          "run_id": run_id})
             return
         if op == "save_artifact":
             name = req.get("name")
-            run_id = req.get("run_id")
             if not validate_artifact_name(name):
                 self._json(400, {"status": "error", "error": "bad artifact name"})
-                return
-            if not validate_run_id(run_id):
-                self._json(400, {"status": "error", "error": "bad run_id"})
                 return
             self._submit({"op": "save_artifact", "session_id": sid,
                           "name": name, "run_id": run_id})
             return
         if op == "close":
-            self._submit({"op": "close", "session_id": sid})
+            self._submit({"op": "close", "session_id": sid, "run_id": run_id})
             return
         self._json(404, {"status": "error", "error": "not found"})
 
@@ -750,7 +785,7 @@ class Handler(BaseHTTPRequestHandler):
     def _do_intercept(self) -> None:
         if not self._check_auth():
             return
-        _length, req, err = self._read_body()
+        _length, req, err = self._read_body(MAX_POLICY_REQUEST_BYTES)
         if err is not None or req is None:
             self._json(400, {"status": "error", "error": err or "bad json"})
             return
@@ -775,7 +810,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"status": "error", "error": host_err})
             return
         try:
-            out = intercept(url, actions, capture_patterns, timeout_ms)
+            out = intercept(url, actions, capture_patterns, timeout_ms,
+                            req.get("nav_policy"))
         except BlockedDestination:
             self._json(400, {"status": "error",
                              "error": "host not allowed (redirected)"})

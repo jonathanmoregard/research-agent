@@ -21,10 +21,15 @@ from sessions import (  # noqa: E402
     BrowserWorker,
     MAX_ARTIFACTS_PER_RUN,
     MAX_SESSIONS,
+    MAX_SESSIONS_PER_RUN,
     validate_actions,
     validate_artifact_name,
     validate_run_id,
 )
+
+
+RUN = "a" * 32
+OTHER_RUN = "b" * 32
 
 
 def _assert(cond: bool, msg: str) -> None:
@@ -53,6 +58,7 @@ class _FakePage:
         def up(self): self.page.calls.append(("mouse.up",))
         def move(self, x, y, steps=1): self.page.calls.append(("mouse.move", x, y, steps))
         def wheel(self, dx, dy): self.page.calls.append(("wheel", dx, dy))
+        def click(self, x, y): self.page.calls.append(("mouse.click", x, y))
     @property
     def mouse(self): return _FakePage._Mouse(self)
 
@@ -130,21 +136,21 @@ def test_validate_names():
 def test_open_act_screenshot_close():
     w = _worker()
     try:
-        out = w.submit({"op": "open", "url": "https://x.test/"})
+        out = w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN})
         _assert(out["session_id"], "no session_id")
         _assert(out["screenshot_b64"], "no screenshot")
         _assert("ref=e2" in out["snapshot"], "no snapshot")
         sid = out["session_id"]
-        out2 = w.submit({"op": "act", "session_id": sid, "actions": [
+        out2 = w.submit({"op": "act", "session_id": sid, "run_id": RUN, "actions": [
             {"type": "click", "target": {"selector": "#b"}},
             {"type": "drag", "from": {"x": 1, "y": 1}, "to": {"x": 5, "y": 5}},
         ]})
         _assert(out2["screenshot_b64"], "act returned no screenshot")
-        out3 = w.submit({"op": "screenshot", "session_id": sid})
+        out3 = w.submit({"op": "screenshot", "session_id": sid, "run_id": RUN})
         _assert(out3["screenshot_b64"], "screenshot op failed")
-        w.submit({"op": "close", "session_id": sid})
+        w.submit({"op": "close", "session_id": sid, "run_id": RUN})
         try:
-            w.submit({"op": "act", "session_id": sid, "actions": []})
+            w.submit({"op": "act", "session_id": sid, "run_id": RUN, "actions": []})
             _assert(False, "closed session still usable")
         except RuntimeError as e:
             _assert("unknown or expired session" in str(e), f"wrong error: {e}")
@@ -154,15 +160,28 @@ def test_open_act_screenshot_close():
 def test_session_cap():
     w = _worker()
     try:
-        sids = [w.submit({"op": "open", "url": "https://x.test/"})["session_id"]
-                for _ in range(MAX_SESSIONS)]
+        sids = [w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN})["session_id"]
+                for _ in range(MAX_SESSIONS_PER_RUN)]
         try:
-            w.submit({"op": "open", "url": "https://x.test/"})
-            _assert(False, "cap not enforced")
+            w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN})
+            _assert(False, "per-run cap not enforced")
+        except RuntimeError as e:
+            _assert("per run" in str(e), f"wrong error: {e}")
+        # Another run still gets its own slots, up to the global cap.
+        others = []
+        for i in range(MAX_SESSIONS - MAX_SESSIONS_PER_RUN):
+            run = f"{i:x}" * 32
+            others.append((run, w.submit({"op": "open", "url": "https://x.test/",
+                                          "run_id": run[:32]})["session_id"]))
+        try:
+            w.submit({"op": "open", "url": "https://x.test/", "run_id": "f" * 32})
+            _assert(False, "global cap not enforced")
         except RuntimeError as e:
             _assert("session limit" in str(e), f"wrong error: {e}")
         for s in sids:
-            w.submit({"op": "close", "session_id": s})
+            w.submit({"op": "close", "session_id": s, "run_id": RUN})
+        for run, s in others:
+            w.submit({"op": "close", "session_id": s, "run_id": run[:32]})
     finally:
         w.shutdown()
 
@@ -170,11 +189,11 @@ def test_idle_ttl_sweep():
     w = BrowserWorker(browser_factory=_fake_factory, idle_ttl_s=0.05)
     w.start()
     try:
-        sid = w.submit({"op": "open", "url": "https://x.test/"})["session_id"]
+        sid = w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN})["session_id"]
         time.sleep(0.15)
         w.submit({"op": "sweep"})
         try:
-            w.submit({"op": "act", "session_id": sid, "actions": []})
+            w.submit({"op": "act", "session_id": sid, "run_id": RUN, "actions": []})
             _assert(False, "expired session survived sweep")
         except RuntimeError:
             pass
@@ -247,7 +266,7 @@ def test_browser_leak_on_failed_open():
         # First open must raise
         raised = False
         try:
-            w.submit({"op": "open", "url": "https://x.test/"})
+            w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN})
         except RuntimeError as e:
             raised = True
             _assert("simulated goto failure" in str(e), f"unexpected error: {e}")
@@ -257,14 +276,14 @@ def test_browser_leak_on_failed_open():
         _assert(len(_failing_made) == 1, "failing browser not created")
         _assert(_failing_made[0].closed, "failing browser not closed after error")
 
-        # Both session slots must be free: open MAX_SESSIONS more successfully
+        # Both session slots must be free: open the per-run maximum again
         sids = []
-        for _ in range(MAX_SESSIONS):
-            out = w.submit({"op": "open", "url": "https://x.test/"})
+        for _ in range(MAX_SESSIONS_PER_RUN):
+            out = w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN})
             sids.append(out["session_id"])
-        _assert(len(sids) == MAX_SESSIONS, "could not open sessions after failed open")
+        _assert(len(sids) == MAX_SESSIONS_PER_RUN, "could not open sessions after failed open")
         for sid in sids:
-            w.submit({"op": "close", "session_id": sid})
+            w.submit({"op": "close", "session_id": sid, "run_id": RUN})
     finally:
         w.shutdown()
 
@@ -277,9 +296,9 @@ def test_act_budget_exceeded():
                       act_budget_ms=0)
     w.start()
     try:
-        sid = w.submit({"op": "open", "url": "https://x.test/"})["session_id"]
+        sid = w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN})["session_id"]
         try:
-            w.submit({"op": "act", "session_id": sid, "actions": [
+            w.submit({"op": "act", "session_id": sid, "run_id": RUN, "actions": [
                 {"type": "click", "target": {"selector": "#b"}},
             ]})
             _assert(False, "act with exhausted budget did not raise")
@@ -303,8 +322,8 @@ def test_act_timeout_clamped_to_remaining_budget():
     w._do = _spy_do
     w.start()
     try:
-        sid = w.submit({"op": "open", "url": "https://x.test/"})["session_id"]
-        out = w.submit({"op": "act", "session_id": sid, "actions": [
+        sid = w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN})["session_id"]
+        out = w.submit({"op": "act", "session_id": sid, "run_id": RUN, "actions": [
             {"type": "click", "target": {"selector": "#b"}},
             {"type": "wait_ms", "ms": 30000},
         ], "timeout_ms": 30000})
@@ -321,6 +340,126 @@ def test_act_timeout_clamped_to_remaining_budget():
         w.shutdown()
 
 
+# ----- run binding, nav gate, snapping (docs/egress-broker.md §4) -----
+
+def test_session_ops_refuse_another_run():
+    w = _worker()
+    try:
+        sid = w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN})["session_id"]
+        for op in ("act", "screenshot", "save_artifact", "close"):
+            cmd = {"op": op, "session_id": sid, "run_id": OTHER_RUN,
+                   "actions": [], "name": "n"}
+            try:
+                w.submit(cmd)
+                _assert(False, f"{op} accepted another run")
+            except RuntimeError as e:
+                _assert(str(e).startswith("SessionForbidden"), f"{op}: wrong error {e}")
+        w.submit({"op": "close", "session_id": sid, "run_id": RUN})
+    finally:
+        w.shutdown()
+
+
+def test_save_artifact_keys_by_session_run():
+    store = ArtifactStore()
+    w = BrowserWorker(browser_factory=_fake_factory, idle_ttl_s=9999, artifacts=store)
+    w.start()
+    try:
+        sid = w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN})["session_id"]
+        w.submit({"op": "save_artifact", "session_id": sid, "run_id": RUN, "name": "shot"})
+        _assert(len(store.take(RUN)) == 1, "artifact not stored under the session's run")
+        _assert(store.take(OTHER_RUN) == [], "artifact leaked to another run")
+    finally:
+        w.shutdown()
+
+
+class _RecordingContext(_FakeContext):
+    def __init__(self, kw): self.kw = kw
+
+
+class _RecordingBrowser(_FakeBrowser):
+    contexts = []
+    def new_context(self, **kw):
+        c = _RecordingContext(kw); _RecordingBrowser.contexts.append(c); return c
+
+
+def test_open_blocks_service_workers_and_installs_nav_gate():
+    _RecordingBrowser.contexts.clear()
+    w = BrowserWorker(browser_factory=_RecordingBrowser, idle_ttl_s=9999)
+    w.start()
+    try:
+        out = w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN,
+                        "viewport": {"width": 333, "height": 333},
+                        "nav_policy": {"urls": ["https://seen.test/a"]}})
+        ctx = _RecordingBrowser.contexts[-1]
+        _assert(ctx.kw.get("service_workers") == "block", f"kwargs {ctx.kw}")
+        _assert(ctx.kw.get("viewport") == {"width": 1280, "height": 800},
+                f"viewport not snapped: {ctx.kw}")
+        _assert(ctx.routed[0] == "**/*", "request guard not installed")
+        _assert("links" in out, "open observation lacks links[]")
+    finally:
+        w.shutdown()
+
+
+def test_act_snaps_numbers_before_running():
+    w = _worker()
+    calls = []
+    orig_do = w._do
+    def _spy(s, a, timeout):
+        calls.append(a)
+        orig_do(s, a, timeout)
+    w._do = _spy
+    try:
+        sid = w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN})["session_id"]
+        w.submit({"op": "act", "session_id": sid, "run_id": RUN, "actions": [
+            {"type": "scroll", "dy": 50},
+            {"type": "click", "target": {"x": 101.37, "y": 55.5}},
+            {"type": "drag", "from": {"x": 1, "y": 1}, "to": {"x": 5, "y": 5},
+             "steps": 33, "hold_ms": 7},
+        ]})
+        _assert(calls[0]["dy"] == 100, f"dy not snapped: {calls[0]}")
+        _assert(calls[1]["target"] == {"x": 104, "y": 56}, f"xy not snapped: {calls[1]}")
+        _assert(calls[2]["steps"] == 20 and calls[2]["hold_ms"] == 0, f"drag: {calls[2]}")
+    finally:
+        w.shutdown()
+
+
+def test_nav_predicate_composition():
+    import urlpolicy
+    from sessions import nav_ledger, nav_predicate
+    ledger = nav_ledger({"urls": ["https://seen.test/a?id=1"]})
+    current = {"url": "https://www.shop.test/start"}
+    pred = nav_predicate("https://entry.test/x", lambda: ledger, lambda: current["url"])
+    _assert(pred("https://entry.test/x"), "entry URL refused")
+    _assert(pred("https://seen.test/a?id=1"), "ledgered URL refused")
+    _assert(pred("https://shop.test/search?q=typed+words"), "same-site nav refused")
+    _assert(pred("https://www.ikea.com/se/sv/search/?q=soffa"), "template refused")
+    _assert(not pred("https://evil.test/?k=leak"), "unseen URL allowed")
+    _assert(not pred("https://seen.test/a?id=2"), "modified URL allowed")
+    _assert(not pred("https://www.ikea.com/se/sv/search/?q=https://evil"), "G1 echo allowed")
+    _assert(nav_ledger(None).urls == set(), "missing policy must be empty (fail closed)")
+    _assert(nav_ledger({"urls": "nope"}).urls == set(), "malformed policy must be empty")
+    _assert(urlpolicy.same_site("https://shop.test/", "https://www.shop.test/"), "www")
+
+
+def test_act_reports_blocked_navigation():
+    w = _worker()
+    try:
+        sid = w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN})["session_id"]
+        s = w._sessions[sid]
+        orig = w._do
+        def _nav_refused(sess, a, timeout):
+            sess.blocked_navs.append("https://evil.test/?k=1")
+            orig(sess, a, timeout)
+        w._do = _nav_refused
+        out = w.submit({"op": "act", "session_id": sid, "run_id": RUN,
+                        "nav_policy": {"urls": ["https://new.test/"]},
+                        "actions": [{"type": "click", "target": {"ref": "e2"}}]})
+        _assert(out.get("blocked_navigation") == "https://evil.test/?k=1", f"{out.keys()}")
+        _assert("https://new.test/" in s.nav_ledger.urls, "act did not replace the snapshot")
+    finally:
+        w.shutdown()
+
+
 # ----- regression: submit-after-shutdown hangs -----
 
 def test_submit_after_shutdown_raises_fast():
@@ -332,7 +471,7 @@ def test_submit_after_shutdown_raises_fast():
     t0 = time.monotonic()
     raised = False
     try:
-        w.submit({"op": "open", "url": "https://x.test/"}, timeout_s=120.0)
+        w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN}, timeout_s=120.0)
     except RuntimeError as e:
         raised = True
         _assert("not running" in str(e), f"unexpected error: {e}")

@@ -209,6 +209,10 @@ class _Route:
         self.outcome = "abort"
     def continue_(self):
         self.outcome = "continue"
+    def fulfill(self, status=200, body=""):
+        # A refused navigation answers 204 locally: chromium keeps the
+        # current page instead of showing its error page.
+        self.outcome = "refused" if status == 204 else "fulfill"
 
 
 @pytest.fixture
@@ -265,8 +269,8 @@ SEEN = f"https://{PUBLIC}/seen"
 
 @pytest.mark.parametrize("request_,outcome", [
     (_NavRequest(SEEN), "continue"),
-    (_NavRequest(f"https://{PUBLIC}/?k=leak"), "abort"),          # click/JS nav to unseen URL
-    (_NavRequest(SEEN, method="POST"), "abort"),                  # form POST carries typed data
+    (_NavRequest(f"https://{PUBLIC}/?k=leak"), "refused"),        # click/JS nav to unseen URL
+    (_NavRequest(SEEN, method="POST"), "refused"),                # form POST carries typed data
     (_NavRequest(f"https://{PUBLIC}/?k=leak", main=False), "continue"),  # iframe: author's choice
     (_NavRequest(f"https://{PUBLIC}/x.js", nav=False), "continue"),      # subresource
     (_NavRequest(f"https://{PUBLIC}/sw", frameless=True), "continue"),
@@ -320,7 +324,7 @@ def test_session_actions_refuse_key_shaped_fill():
     fill["text"] = "solkräm"
     assert sessions.validate_actions([fill]) is None
     press = {"type": "press", "target": {"ref": "e1"}, "key": "x" * 40}
-    assert "too long" in sessions.validate_actions([press])
+    assert "key name" in sessions.validate_actions([press])
 
 
 def test_intercept_actions_refuse_key_shaped_fill():
@@ -337,3 +341,25 @@ def test_intercept_actions_refuse_key_shaped_fill():
         [], 30000,
     )
     assert ok is None
+
+
+def test_every_browser_context_blocks_service_workers():
+    # G6: context.route does not see requests a service worker serves.
+    # Real-chromium check (allow vs block) lives in the local probe; this
+    # pins that no new_context call forgets the flag.
+    for name in ("server.py", "sessions.py"):
+        src = (REPO_ROOT / "scraper" / name).read_text()
+        chunks = src.split("new_context(")[1:]
+        assert chunks, name
+        for body in chunks:
+            call = body[:body.index("new_page()")]
+            assert 'service_workers="block"' in call, (name, call[:200])
+
+
+def test_render_has_no_nav_gate_but_intercept_and_sessions_do():
+    src = (REPO_ROOT / "scraper" / "server.py").read_text()
+    render_src = src[src.index("def render("):src.index("class Handler")]
+    intercept_src = src[src.index("def intercept("):src.index("def render(")]
+    assert "install_request_guard(ctx)" in render_src
+    assert "nav_allowed=" in intercept_src
+    assert "nav_allowed=" in (REPO_ROOT / "scraper" / "sessions.py").read_text()
