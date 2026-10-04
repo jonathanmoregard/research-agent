@@ -339,7 +339,7 @@ wheels = [
 [[package]]
 name = "injection-scanner"
 version = "0.1.0"
-source = { git = "https://github.com/jonathanmoregard/injection-scanner?rev=8e7afd542478850dc1a646b6dec2fc6b218a8a33#8e7afd542478850dc1a646b6dec2fc6b218a8a33" }
+source = { git = "https://github.com/jonathanmoregard/injection-scanner?rev=ffd272a57d073ff6628bb440ee10d623df43d3ce#ffd272a57d073ff6628bb440ee10d623df43d3ce" }
 dependencies = [
     { name = "anthropic" },
     { name = "openai" },
@@ -814,7 +814,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", specifier = ">=0.96.0" },
     { name = "curl-cffi", specifier = ">=0.7" },
-    { name = "injection-scanner", git = "https://github.com/jonathanmoregard/injection-scanner?rev=8e7afd542478850dc1a646b6dec2fc6b218a8a33" },
+    { name = "injection-scanner", git = "https://github.com/jonathanmoregard/injection-scanner?rev=ffd272a57d073ff6628bb440ee10d623df43d3ce" },
     { name = "mcp", specifier = ">=1.28.1" },
     { name = "openai", specifier = ">=2.32.0" },
 ]
