@@ -63,8 +63,8 @@ def test_default_cap_matches_sizing_invariant():
     """The shipped default, and the arithmetic behind it.
 
     memguard.sh sizes the cap so `slots * cap + guest_base <= guest_mem`:
-    3 slots (_VM_SLOTS_DEFAULT), ~1100 MiB measured guest base, 6144 MiB
-    guest => cap <= ~1680 MiB. If someone retunes either knob without the
+    2 slots (_VM_SLOTS_DEFAULT), ~1100 MiB measured guest base, 4224 MiB
+    guest (nixos-config research-agent-microvm.nix) => cap <= ~1562 MiB. If someone retunes either knob without the
     other, this fails and points at the comment that explains why.
     """
     r = _sh("memguard_cap")
@@ -73,7 +73,7 @@ def test_default_cap_matches_sizing_invariant():
 
     from mcp_server.server import _VM_SLOTS_DEFAULT
 
-    guest_mem_mib, guest_base_mib = 6144, 1100
+    guest_mem_mib, guest_base_mib = 4224, 1100
     assert _VM_SLOTS_DEFAULT * 1536 + guest_base_mib <= guest_mem_mib, (
         f"{_VM_SLOTS_DEFAULT} slots x 1536 MiB no longer fits in the guest — "
         "re-derive MEMGUARD_DEFAULT_CAP against the invariant in memguard.sh"

@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -194,6 +195,14 @@ _VALID_ACTION_TYPES = {
 }
 
 
+def _is_bounded_ms(v, lo: int) -> bool:
+    return (
+        isinstance(v, int)
+        and not isinstance(v, bool)
+        and lo <= v <= MAX_TIMEOUT_MS
+    )
+
+
 def _validate_intercept_inputs(
     url: str,
     actions: list,
@@ -217,6 +226,15 @@ def _validate_intercept_inputs(
         t = action.get("type")
         if t not in _VALID_ACTION_TYPES:
             return f"action {i} has unknown type {t!r}"
+        # Per-action times go straight to Playwright, so they get the same
+        # ceiling as the top-level timeout. Without it one call could pin a
+        # chromium + handler thread for days after the shim gave up.
+        if "timeout_ms" in action and not _is_bounded_ms(action["timeout_ms"], lo=1):
+            return f"action {i} bad timeout_ms (1..{MAX_TIMEOUT_MS})"
+        if t == "wait_for_timeout_ms" and "ms" in action and not _is_bounded_ms(
+            action["ms"], lo=0
+        ):
+            return f"action {i} bad ms (0..{MAX_TIMEOUT_MS})"
         if t == "wait_for_response":
             p = action.get("url_pattern")
             if not isinstance(p, str) or not p:
@@ -249,7 +267,8 @@ _RESPONSE_POLL_MS = 100
 
 
 def _do_action(page, action: dict, default_timeout_ms: int,
-               seen_urls: list[str] | None = None) -> None:
+               seen_urls: list[str] | None = None,
+               deadline: float | None = None) -> None:
     """Apply one action. Raises Playwright errors on failure — the caller
     catches them and returns a structured error to the API client.
 
@@ -259,15 +278,24 @@ def _do_action(page, action: dict, default_timeout_ms: int,
     `page.wait_for_response`, and a page's search XHR often completes during
     `goto`, before any action runs — a waiter registered afterwards would
     miss it and time out.
+
+    `deadline` (time.monotonic() seconds) is the whole action sequence's
+    budget: every wait is clamped to what is left of it, and an action that
+    starts after it is refused, so N actions cannot add up to N x timeout.
     """
     t = action["type"]
     timeout = int(action.get("timeout_ms") or default_timeout_ms)
+    if deadline is not None:
+        remaining = int((deadline - time.monotonic()) * 1000)
+        if remaining <= 0:
+            raise PWError("intercept action budget exhausted")
+        timeout = min(timeout, remaining)
     if t == "wait_for_selector":
         page.wait_for_selector(action["selector"], timeout=timeout)
     elif t == "wait_for_load_state":
         page.wait_for_load_state(action.get("state", "domcontentloaded"), timeout=timeout)
     elif t == "wait_for_timeout_ms":
-        page.wait_for_timeout(int(action.get("ms", 1000)))
+        page.wait_for_timeout(min(int(action.get("ms", 1000)), timeout))
     elif t == "wait_for_response":
         pattern = re.compile(action["url_pattern"])
         seen = seen_urls if seen_urls is not None else []
@@ -280,11 +308,11 @@ def _do_action(page, action: dict, default_timeout_ms: int,
             page.wait_for_timeout(_RESPONSE_POLL_MS)
             waited += _RESPONSE_POLL_MS
     elif t == "fill":
-        page.fill(action["selector"], action.get("text", ""))
+        page.fill(action["selector"], action.get("text", ""), timeout=timeout)
     elif t == "click":
-        page.click(action["selector"])
+        page.click(action["selector"], timeout=timeout)
     elif t == "press":
-        page.press(action["selector"], action["key"])
+        page.press(action["selector"], action["key"], timeout=timeout)
     else:  # pragma: no cover — _validate_intercept_inputs gates this
         raise ValueError(f"unknown action: {t}")
 
@@ -374,10 +402,13 @@ def intercept(
 
             page.on("response", on_response)
             try:
+                # One budget for navigation AND actions, so the whole call
+                # stays inside timeout_ms (plus browser launch/teardown).
+                deadline = time.monotonic() + timeout_ms / 1000
                 resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                 _refuse_blocked_hop(resp, page.url)
                 for action in actions:
-                    _do_action(page, action, timeout_ms, seen_urls)
+                    _do_action(page, action, timeout_ms, seen_urls, deadline)
                 # A click/submit may have navigated (and redirected) too.
                 _refuse_blocked_hop(None, page.url)
                 return {

@@ -40,12 +40,13 @@ def _token() -> str:
 
 def fetch_artifacts(run_id: str) -> list[dict]:
     """GET (take-and-clear) the run's artifacts. [] on any failure —
-    a broken pull must never block report delivery."""
-    req = urllib.request.Request(
-        f"{SCRAPER_HOST_API}/artifacts/{run_id}",
-        headers={"Authorization": f"Bearer {_token()}"},
-    )
+    a broken pull must never block report delivery. The token read sits
+    inside the try: a missing token file is a failed pull, not a crash."""
     try:
+        req = urllib.request.Request(
+            f"{SCRAPER_HOST_API}/artifacts/{run_id}",
+            headers={"Authorization": f"Bearer {_token()}"},
+        )
         with urllib.request.urlopen(req, timeout=30) as resp:
             body = resp.read(_FETCH_CAP)
         out = json.loads(body)
@@ -58,13 +59,14 @@ def fetch_artifacts(run_id: str) -> list[dict]:
 
 
 def discard_artifacts(run_id: str) -> None:
-    """Best-effort clear (report-isolated path)."""
-    req = urllib.request.Request(
-        f"{SCRAPER_HOST_API}/artifacts/{run_id}",
-        headers={"Authorization": f"Bearer {_token()}"},
-        method="DELETE",
-    )
+    """Best-effort clear (report-isolated path). Never raises: it runs on
+    the scanner's reject path, which must always end in the generic reject."""
     try:
+        req = urllib.request.Request(
+            f"{SCRAPER_HOST_API}/artifacts/{run_id}",
+            headers={"Authorization": f"Bearer {_token()}"},
+            method="DELETE",
+        )
         urllib.request.urlopen(req, timeout=15).read(1024)
     except Exception:
         pass

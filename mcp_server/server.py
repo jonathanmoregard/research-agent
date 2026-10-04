@@ -48,6 +48,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from enum import Enum
 from pathlib import Path
@@ -697,7 +698,13 @@ _VM_LOCK_PATH = Path(
 _VM_LOCK_WAIT_SECS = int(os.environ.get("RESEARCH_LOCK_WAIT_SECS", "1800"))
 
 
-_VM_SLOTS_DEFAULT = 6
+# 2026-10-04: 2 slots. The memguard sizing invariant
+# (slots * cap + guest_base <= guest_mem, scripts/lib/memguard.sh) was
+# broken at 6 slots x 1536 MiB against a 4096 MiB guest, so the per-call
+# cap could no longer stop VM-wide reclaim (security review 2026-10-03, D3).
+# Option (a), chosen by default: 2 slots + a 4224 MiB guest (companion
+# nixos-config PR). Alternative (b): keep 6 slots with a ~480 MiB cap.
+_VM_SLOTS_DEFAULT = 2
 
 
 def _read_slots(raw: str | None) -> int:
@@ -1625,20 +1632,74 @@ def _write_artifact_audit(
 # tag in the body breaks our wrap) and the fix is structural too: encode
 # the `<` of any matching tag in the body before interpolation.
 _WRAP_DELIVERY_TAGS = ("untrusted_external_content", "system-reminder")
+# Tag names the parent Claude Code session reads as harness text, beyond our
+# own two wrap tags (security review 2026-10-03, C-3). Compared with `_` and
+# `-` folded together, so `system_reminder` is covered too.
+_HARNESS_TAGS = _WRAP_DELIVERY_TAGS + (
+    "user-prompt-submit-hook",
+    "task-notification",
+    "command-message",
+    "command-name",
+    "command-args",
+    "local-command-stdout",
+    "local-command-stderr",
+    "bash-input",
+    "bash-stdout",
+    "bash-stderr",
+    "local-command-caveat",
+    "ide-opened-file",
+    "ide-selection",
+)
+# Invisible characters the unicode sanitizer keeps on purpose (LRM/RLM, soft
+# hyphen, variation selectors, ALM, CGJ, Mongolian FVS, other Cf/Mn/Me).
+# Between `<`, `/` and a tag name — or inside the name — they render as
+# nothing, so the old `\s*`-only lookahead let `<LRM/system-reminder>`
+# through looking exactly like the tag. The class is built from the Unicode
+# categories so it cannot drift from what "renders as nothing" means; runs of
+# any length are skipped (a fixed look-ahead window was outlasted by 97 LRMs).
+def _invisible_class() -> str:
+    ranges: list[tuple[int, int]] = []
+    for cp in list(range(0x0, 0x10000)) + list(range(0xE0000, 0xE1000)):
+        ch = chr(cp)
+        if unicodedata.category(ch) in ("Cf", "Mn", "Me") or ch.isspace():
+            if ranges and ranges[-1][1] == cp - 1:
+                ranges[-1] = (ranges[-1][0], cp)
+            else:
+                ranges.append((cp, cp))
+    return "[" + "".join(
+        re.escape(chr(a)) if a == b else f"{re.escape(chr(a))}-{re.escape(chr(b))}"
+        for a, b in ranges
+    ) + "]*+"  # possessive: a run is consumed once, never re-split
+
+
+_INV = _invisible_class()
+
+
+def _tag_name_pattern(name: str) -> str:
+    # Invisible characters may sit between any two letters; `-` and `_` fold.
+    parts = ["[-_]" if c in "-_" else re.escape(c) for c in name]
+    return _INV.join(parts)
+
+
 _DANGEROUS_WRAP_RX = re.compile(
-    r"<(?=\s*/?\s*(?:" + "|".join(re.escape(t) for t in _WRAP_DELIVERY_TAGS) + r")\b)",
+    "<(?=" + _INV + "(?:[/\u2215\u2044]" + _INV + ")?"
+    + "(?:" + "|".join(_tag_name_pattern(t) for t in sorted(_HARNESS_TAGS, key=len, reverse=True)) + ")"
+    + "(?![A-Za-z0-9]))",
     re.IGNORECASE,
 )
 
 
 def _encode_wrap_tags(body: str) -> str:
-    """Replace the `<` of any literal wrap-tag occurrence in `body` with
-    `&lt;`. Stops a research report from closing our own
-    `<untrusted_external_content>` + `<system-reminder>` wrap and
-    escaping into trusted context. Other tag names (e.g. <html>,
-    <code>) are untouched — they don't escape our wrap. Idempotent: a
-    body that is already encoded passes through unchanged because
-    `&lt;` no longer matches `<`.
+    """Replace the `<` of any harness-tag occurrence in `body` with `&lt;`.
+    Stops a research report from closing our own
+    `<untrusted_external_content>` + `<system-reminder>` wrap, or forging
+    another tag the parent treats as harness text, and so escaping into
+    trusted context. Invisible format characters around `<`, `/` and inside
+    the name are ignored when matching. Other tag names (e.g. <html>,
+    <code>) are untouched — they don't escape our wrap. Idempotent: a body
+    that is already encoded passes through unchanged because `&lt;` no
+    longer matches `<`. Linear: each look-ahead stops at the first visible
+    character that cannot continue a tag name.
     """
     return _DANGEROUS_WRAP_RX.sub("&lt;", body)
 
@@ -2274,6 +2335,74 @@ def _scan_error_verdict(exc: BaseException):
     )
 
 
+# Retry budget for CONTENT-derived rejects (security review 2026-10-03, C-1).
+# The honeypot layer samples at provider-default temperature, so re-scanning
+# the same bytes until one sample misses turns a detection into a lottery.
+# A detection may be re-scanned this many times (default 1: one
+# false-positive resample survives); an infra reject was never judged and
+# stays retryable. State lives next to the quarantined copy.
+def _read_retry_budget(raw: str | None) -> int:
+    try:
+        v = int(raw) if raw not in (None, "") else 1
+    except ValueError:
+        v = 1
+    return max(0, min(v, 10))
+
+
+_MAX_CONTENT_RETRIES = _read_retry_budget(os.environ.get("RESEARCH_MAX_CONTENT_RETRIES"))
+_RETRY_STATE_SUFFIX = ".retry.json"
+
+
+# Honeypot "unavailable" signals mostly come from the judge model's OWN output
+# (a malformed or unreadable tool call, a missing required call, an
+# unparseable response, a reply cut off at max_tokens) — shaped by the report
+# under scan, not by an outage. They stay in the infra vocabulary for the
+# operator, but they spend the content retry budget: otherwise a report that
+# reliably breaks the judge's tool call would earn unlimited free resamples.
+# ALLOWLIST of real outages (provider exception, missing library or key,
+# key-config error, unhandled exception); any other or future honeypot
+# signal counts as content-shaped.
+_HONEYPOT_OUTAGE_MARKERS = (
+    "-api-error",
+    "-lib-missing",
+    "-api-key",
+    "key-config-error",
+    ":unhandled:",
+)
+
+
+def _retry_is_free(reason) -> bool:
+    if not _is_infra_reason(reason):
+        return False
+    if "honeypot_unavailable" in reason:
+        return any(m in reason for m in _HONEYPOT_OUTAGE_MARKERS)
+    return True
+
+
+def _write_retry_state(quarantine: Path, report_id: str, infra: bool, content_retries: int) -> None:
+    path = quarantine / f"{report_id}{_RETRY_STATE_SUFFIX}"
+    try:
+        path.unlink(missing_ok=True)
+        _atomic_write_excl(
+            path, json.dumps({"infra": bool(infra), "content_retries": int(content_retries)})
+        )
+    except OSError as e:
+        print(f"research-agent: retry-state write failed for {report_id}: {e}", file=sys.stderr)
+
+
+def _read_retry_state(quarantine: Path, report_id: str) -> tuple[bool, int]:
+    """(infra, content_retries). Missing/unreadable state = an unclassified
+    reject that has never been retried: treated as content-derived, which is
+    the conservative reading."""
+    try:
+        obj = json.loads(_safe_read(quarantine / f"{report_id}{_RETRY_STATE_SUFFIX}"))
+        infra = obj.get("infra") is True
+        n = obj.get("content_retries")
+        return infra, n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else 0
+    except (OSError, ValueError, AttributeError):
+        return False, 0
+
+
 def _scan_and_deliver(
     content: str,
     report_id: str,
@@ -2281,6 +2410,7 @@ def _scan_and_deliver(
     agent_ms: int,
     t_received: float,
     t_scan_start: float,
+    content_retries: int = 0,
 ) -> dict:
     """Scan in-memory `content` and either deliver or quarantine.
 
@@ -2355,6 +2485,10 @@ def _scan_and_deliver(
         else:
             audit_content = f"<oversized:{content_len} bytes, not stored>"
         _write_quarantine_audit(report_id, prompt, verdict, audit_content)
+        if not oversized:
+            _write_retry_state(
+                quarantine, report_id, _retry_is_free(verdict.reason), content_retries
+            )
         from mcp_server.artifact_gate import discard_artifacts
         discard_artifacts(report_id)
         return _reject_response(
@@ -2463,6 +2597,40 @@ def retry_research(report_id: str) -> dict:
     if not quarantine.is_dir() or not src.exists():
         return {"status": "error", "error": "report_id not found in quarantine"}
 
+    # Claim the quarantined copy under an exclusive lock, so two concurrent
+    # retries of one report cannot both read an unspent budget and each get
+    # an independent scanner draw: the loser finds the copy already gone.
+    try:
+        lock_fd = os.open(
+            quarantine / ".retry.lock",
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+    except OSError:
+        return {"status": "error", "error": "report_id not found in quarantine"}
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        claimed = _claim_quarantined(quarantine, src, report_id)
+    finally:
+        os.close(lock_fd)
+    if isinstance(claimed, dict):
+        return claimed
+    content, content_retries = claimed
+
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    t_scan_start = time.monotonic()
+    return _scan_and_deliver(
+        content, report_id, f"retry:{report_id}", 0, t_received, t_scan_start,
+        content_retries=content_retries,
+    )
+
+
+def _claim_quarantined(quarantine: Path, src: Path, report_id: str):
+    """Under the retry lock: snapshot, apply the retry budget, remove the
+    quarantined copy. Returns (content, content_retries) or an error dict."""
+    if not src.exists():
+        return {"status": "error", "error": "report_id not found in quarantine"}
+
     # Snapshot the quarantined content under O_NOFOLLOW so a concurrent
     # symlink swap at `src` (only possible for same-user processes — the
     # bwrap agent itself cannot reach this directory) can't redirect the
@@ -2474,16 +2642,30 @@ def retry_research(report_id: str) -> dict:
     except OSError:
         return {"status": "error", "error": "report_id not found in quarantine"}
 
+    # Retry budget (C-1): a detection may only be re-sampled a bounded
+    # number of times; an infra reject was never judged and stays open.
+    was_infra, content_retries = _read_retry_state(quarantine, report_id)
+    if not was_infra:
+        if content_retries >= _MAX_CONTENT_RETRIES:
+            _LOG.warning(
+                "retry refused id=%s content_retries=%d budget=%d",
+                report_id, content_retries, _MAX_CONTENT_RETRIES,
+            )
+            return {
+                "status": "error",
+                "error": "retry limit reached for this report — the scanner "
+                "detected something in it and it was already re-scanned; it "
+                "stays quarantined",
+                "report_id": report_id,
+            }
+        content_retries += 1
+
     # Remove the quarantined source now that we own a snapshot. If the
     # scan rejects, _scan_and_deliver writes a fresh quarantine file
     # from the snapshot (atomic O_EXCL, so nothing can pre-squat it).
     src.unlink(missing_ok=True)
-
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    t_scan_start = time.monotonic()
-    return _scan_and_deliver(
-        content, report_id, f"retry:{report_id}", 0, t_received, t_scan_start
-    )
+    (quarantine / f"{report_id}{_RETRY_STATE_SUFFIX}").unlink(missing_ok=True)
+    return content, content_retries
 
 
 _SCANNER_REPO = "https://github.com/jonathanmoregard/injection-scanner.git"

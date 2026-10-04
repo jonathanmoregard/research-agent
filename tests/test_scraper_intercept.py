@@ -40,6 +40,8 @@ import os
 os.environ["SCRAPER_TOKEN_FILE"] = str(_TOKEN_FILE)
 
 from server import (  # noqa: E402
+    _do_action,
+    MAX_TIMEOUT_MS,
     _validate_intercept_inputs,
     _truncate_text,
     MAX_INTERCEPT_ACTIONS,
@@ -167,6 +169,97 @@ def test_truncate_multibyte_safe():
     out.encode("utf-8")
 
 
+# --- per-action time bounds (security review 2026-10-03, D5) ---------------
+# The top-level timeout_ms was capped, but an action's own `timeout_ms` and a
+# `wait_for_timeout_ms` action's `ms` went straight to Playwright, so one call
+# could pin a chromium + handler thread for ~24 days after the shim gave up.
+
+
+def test_action_timeout_over_cap_rejected():
+    for bad in (MAX_TIMEOUT_MS + 1, 2_147_483_647, 0, -5, "30000", True, 1.5):
+        err = _validate_intercept_inputs(
+            "https://x.com", [{"type": "wait_for_selector", "selector": "#q",
+                               "timeout_ms": bad}], [], 30000)
+        _assert(err is not None and "timeout_ms" in err,
+                f"action timeout_ms={bad!r} not rejected: {err!r}")
+
+
+def test_wait_ms_over_cap_rejected():
+    for bad in (MAX_TIMEOUT_MS + 1, 86_400_000, -1, "1000", None, True):
+        err = _validate_intercept_inputs(
+            "https://x.com", [{"type": "wait_for_timeout_ms", "ms": bad}], [], 30000)
+        _assert(err is not None and "ms" in err,
+                f"wait ms={bad!r} not rejected: {err!r}")
+
+
+def test_in_range_action_times_accepted():
+    actions = [{"type": "wait_for_timeout_ms", "ms": 1000},
+               {"type": "click", "selector": "b", "timeout_ms": 5000},
+               {"type": "wait_for_timeout_ms"}]
+    _assert(_validate_intercept_inputs("https://x.com", actions, [], 30000) is None,
+            "in-range action times rejected")
+
+
+class _FakePage:
+    def __init__(self):
+        self.waits = []
+        self.timeouts = []
+
+    def wait_for_timeout(self, ms):
+        self.waits.append(ms)
+
+    def wait_for_selector(self, selector, timeout):
+        self.timeouts.append(timeout)
+
+    def click(self, selector, timeout=None):
+        self.timeouts.append(timeout)
+
+    def fill(self, selector, text, timeout=None):
+        self.timeouts.append(timeout)
+
+    def press(self, selector, key, timeout=None):
+        self.timeouts.append(timeout)
+
+
+def test_actions_share_one_deadline():
+    import time as _t
+    page = _FakePage()
+    deadline = _t.monotonic() + 2.0  # 2 s of budget left
+    _do_action(page, {"type": "wait_for_timeout_ms", "ms": 60000}, 30000, [], deadline)
+    _do_action(page, {"type": "wait_for_selector", "selector": "#q",
+                      "timeout_ms": 60000}, 30000, [], deadline)
+    _assert(page.waits and page.waits[0] <= 2000, f"wait not clamped: {page.waits}")
+    _assert(page.timeouts and page.timeouts[0] <= 2000,
+            f"selector timeout not clamped: {page.timeouts}")
+
+
+def test_exhausted_deadline_stops_actions():
+    import time as _t
+    page = _FakePage()
+    try:
+        _do_action(page, {"type": "wait_for_timeout_ms", "ms": 1000}, 30000, [],
+                   _t.monotonic() - 1)
+    except Exception as e:  # PWError stub
+        _assert("budget" in str(e), f"unexpected error: {e}")
+    else:
+        _assert(False, "action ran after the deadline")
+    _assert(not page.waits, "page waited after the deadline")
+
+
+def test_click_fill_press_get_the_deadline_too():
+    # Refuter (Codex) bypass: these took Playwright's own ~30 s default.
+    import time as _t
+    deadline = _t.monotonic() + 1.0
+    for action in ({"type": "click", "selector": "#never"},
+                   {"type": "fill", "selector": "#q", "text": "x"},
+                   {"type": "press", "selector": "#q", "key": "Enter"}):
+        page = _FakePage()
+        _do_action(page, action, 30000, [], deadline)
+        _assert(page.timeouts and page.timeouts[0] is not None
+                and page.timeouts[0] <= 1000,
+                f"{action['type']} not bounded: {page.timeouts}")
+
+
 def main() -> int:
     tests = [
         test_valid_minimal,
@@ -185,6 +278,12 @@ def main() -> int:
         test_truncate_short_unchanged,
         test_truncate_long_caps,
         test_truncate_multibyte_safe,
+        test_action_timeout_over_cap_rejected,
+        test_wait_ms_over_cap_rejected,
+        test_in_range_action_times_accepted,
+        test_actions_share_one_deadline,
+        test_exhausted_deadline_stops_actions,
+        test_click_fill_press_get_the_deadline_too,
     ]
     for t in tests:
         t()

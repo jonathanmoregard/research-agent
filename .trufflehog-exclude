@@ -1,0 +1,3 @@
+# Reviewed false positives (security review 2026-10-03): honeypot canary
+# fixtures in a historical path, not live credentials.
+^scanner/honeypot_scenarios\.py$

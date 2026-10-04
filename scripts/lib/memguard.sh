@@ -77,18 +77,19 @@
 #
 #     slots * cap  +  guest_base  <=  guest_mem
 #
-#   guest_mem  = 6144 MiB   (microvm.mem, nixos-config
+#   guest_mem  = 4224 MiB   (microvm.mem, nixos-config
 #                            modules/nixos/research-agent-microvm.nix)
 #   guest_base ~ 1100 MiB   (measured idle: 636 MiB used + 474 MiB
 #                            buff/cache — kernel, systemd, sshd, and the
 #                            page cache the virtiofs shares live in)
-#   slots      = 3          (_VM_SLOTS_DEFAULT in mcp_server/server.py)
+#   slots      = 2          (_VM_SLOTS_DEFAULT in mcp_server/server.py)
 #
-#   => cap <= (6144 - 1100) / 3 ~= 1680 MiB.  1536 MiB (1.5 GiB) sits just
-#      under that with room to spare.
+#   => cap <= (4224 - 1100) / 2 ~= 1562 MiB.  1536 MiB (1.5 GiB) sits just
+#      under that. (2026-10-04: was 3 slots / 6144 MiB; slots had drifted to
+#      6 and the guest to 4096 MiB, breaking the invariant.)
 #
-# Why that invariant and not just "bound one hog": with three admission
-# slots, three simultaneous runaway calls are reachable. If slots * cap
+# Why that invariant and not just "bound one hog": with N admission
+# slots, N simultaneous runaway calls are reachable. If slots * cap
 # exceeds what the guest actually has, the cgroups are individually
 # bounded but collectively still able to drive the VM into global reclaim
 # — which stalls sshd, trips the host watchdog, and restarts the VM. That
