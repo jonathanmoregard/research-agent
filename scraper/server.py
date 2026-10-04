@@ -32,7 +32,13 @@ from urllib.parse import urlparse
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import sync_playwright
 
-from netguard import blocked_hop, install_request_guard, is_blocked_host
+from netguard import (
+    MAX_KEY_LEN,
+    blocked_hop,
+    install_request_guard,
+    is_blocked_host,
+    typed_text_error,
+)
 from sessions import (
     ACT_BUDGET_MS,
     get_artifact_store,
@@ -243,6 +249,16 @@ def _validate_intercept_inputs(
                 re.compile(p)
             except re.error:
                 return f"action {i} url_pattern is not a valid regex"
+        if t == "fill" and not isinstance(action.get("text", ""), str):
+            return f"action {i} fill text must be a string"
+        if t == "press" and not (isinstance(action.get("key"), str)
+                                 and len(action["key"]) <= MAX_KEY_LEN):
+            return f"action {i} press needs a key name"
+    typed = typed_text_error(
+        [a.get("text", "") for a in actions if a.get("type") == "fill"]
+    )
+    if typed:
+        return typed
     if not isinstance(capture_patterns, list):
         return "capture_patterns must be a list"
     if len(capture_patterns) > MAX_INTERCEPT_PATTERNS:

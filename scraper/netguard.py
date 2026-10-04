@@ -193,3 +193,29 @@ def blocked_hop(response, final_url: str) -> str | None:
         if u and not _browser_internal(u) and is_blocked_url(u):
             return u
     return None
+
+
+# --- text the agent types into pages ----------------------------------------
+# Script on an attacker's page can read any field the agent fills and send it
+# anywhere (fetch/beacon are subresources, deliberately ungated). So typed
+# text is held to the same shape as a shop search query: short, human words,
+# no long opaque runs. Mirrors egress_gate/provenance.py query_is_bounded —
+# the scraper VM mounts only scraper/, so it cannot import that module.
+MAX_TYPED_CHARS = 100  # per call, all fill actions together
+MAX_TYPED_TOKEN = 32
+OPAQUE_TOKEN_LEN = 16
+MAX_KEY_LEN = 32  # press: a key name or chord ("Enter", "Control+A")
+
+
+def typed_text_error(texts: list[str]) -> str | None:
+    """None if the call's typed text is search-query shaped, else why not."""
+    if sum(len(t) for t in texts) > MAX_TYPED_CHARS:
+        return f"typed text too long (max {MAX_TYPED_CHARS} chars per call)"
+    for text in texts:
+        for token in text.split():
+            if len(token) > MAX_TYPED_TOKEN:
+                return f"typed word longer than {MAX_TYPED_TOKEN} chars"
+            if (len(token) >= OPAQUE_TOKEN_LEN and any(c.isdigit() for c in token)
+                    and any(c.isalpha() for c in token)):
+                return "typed text looks like an opaque token, not a search query"
+    return None

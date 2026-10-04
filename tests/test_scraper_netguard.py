@@ -293,3 +293,46 @@ def test_every_blocked_net_is_actually_rejected():
     for net in netguard.BLOCKED_NETS:
         assert netguard.is_blocked_ip(net.network_address), net
     assert not netguard.is_blocked_ip(ipaddress.ip_address(PUBLIC))
+
+
+# --- typed text bound -------------------------------------------------------
+
+CANARY = "canary" + "0a1b2c3d" * 4
+
+
+@pytest.mark.parametrize("texts,ok", [
+    (["usb-c kabel"], True),
+    (["Pippi Långstrump", "Stockholm"], True),
+    ([CANARY], False),
+    (["x" * 33], False),
+    (["word " * 21], False),                 # >100 chars in one fill
+    (["a" * 60, "b" * 30 + " " + "c" * 20], False),  # split across fills
+])
+def test_typed_text_bound(texts, ok):
+    assert (netguard.typed_text_error(texts) is None) is ok
+
+
+def test_session_actions_refuse_key_shaped_fill():
+    import sessions
+    fill = {"type": "fill", "target": {"ref": "e1"}, "text": CANARY}
+    assert sessions.validate_actions([fill]) is not None
+    fill["text"] = "solkräm"
+    assert sessions.validate_actions([fill]) is None
+    press = {"type": "press", "target": {"ref": "e1"}, "key": "x" * 40}
+    assert "too long" in sessions.validate_actions([press])
+
+
+def test_intercept_actions_refuse_key_shaped_fill():
+    err = server._validate_intercept_inputs(
+        "https://x.example/",
+        [{"type": "fill", "selector": "#q", "text": CANARY}],
+        [], 30000,
+    )
+    assert err is not None and "typed" in err
+    ok = server._validate_intercept_inputs(
+        "https://x.example/",
+        [{"type": "fill", "selector": "#q", "text": "acme"},
+         {"type": "press", "selector": "#q", "key": "Enter"}],
+        [], 30000,
+    )
+    assert ok is None

@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 
-from netguard import blocked_hop, install_request_guard
+from netguard import MAX_KEY_LEN, blocked_hop, install_request_guard, typed_text_error
 
 MAX_SESSIONS = 2
 SESSION_IDLE_TTL_S = 300.0
@@ -93,6 +93,8 @@ def validate_actions(actions) -> str | None:
         if t == "press" and (not _valid_target(a.get("target"))
                              or not isinstance(a.get("key"), str)):
             return f"action {i}: press needs target + key"
+        if t == "press" and len(a["key"]) > MAX_KEY_LEN:
+            return f"action {i}: press key name too long"
         if t == "scroll" and not isinstance(a.get("dy"), (int, float)):
             return f"action {i}: scroll needs dy"
         if t == "drag":
@@ -106,7 +108,7 @@ def validate_actions(actions) -> str | None:
             return f"action {i}: wait_for_selector needs selector"
         if t == "wait_ms" and not (isinstance(a.get("ms"), int) and 0 < a["ms"] <= 30000):
             return f"action {i}: wait_ms needs ms 1..30000"
-    return None
+    return typed_text_error([a["text"] for a in actions if a["type"] == "fill"])
 
 
 class ArtifactStore:
