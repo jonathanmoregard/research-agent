@@ -32,4 +32,4 @@ dev = [
 pythonpath = ["."]
 
 [tool.hatch.build.targets.wheel]
-packages = ["mcp_server", "evals"]
+packages = ["mcp_server", "evals", "egress_gate"]
