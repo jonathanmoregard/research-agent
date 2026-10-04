@@ -698,7 +698,13 @@ _VM_LOCK_PATH = Path(
 _VM_LOCK_WAIT_SECS = int(os.environ.get("RESEARCH_LOCK_WAIT_SECS", "1800"))
 
 
-_VM_SLOTS_DEFAULT = 6
+# 2026-10-04: 2 slots. The memguard sizing invariant
+# (slots * cap + guest_base <= guest_mem, scripts/lib/memguard.sh) was
+# broken at 6 slots x 1536 MiB against a 4096 MiB guest, so the per-call
+# cap could no longer stop VM-wide reclaim (security review 2026-10-03, D3).
+# Option (a), chosen by default: 2 slots + a 4224 MiB guest (companion
+# nixos-config PR). Alternative (b): keep 6 slots with a ~480 MiB cap.
+_VM_SLOTS_DEFAULT = 2
 
 
 def _read_slots(raw: str | None) -> int:
