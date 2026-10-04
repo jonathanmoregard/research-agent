@@ -309,7 +309,8 @@ CANARY = "canary" + "0a1b2c3d" * 4
     (["a" * 60, "b" * 30 + " " + "c" * 20], False),  # split across fills
 ])
 def test_typed_text_bound(texts, ok):
-    assert (netguard.typed_text_error(texts) is None) is ok
+    import urlpolicy
+    assert (urlpolicy.typed_text_error(texts) is None) is ok
 
 
 def test_session_actions_refuse_key_shaped_fill():

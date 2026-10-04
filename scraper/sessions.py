@@ -20,7 +20,8 @@ import threading
 import time
 import uuid
 
-from netguard import MAX_KEY_LEN, blocked_hop, install_request_guard, typed_text_error
+from netguard import blocked_hop, install_request_guard
+from urlpolicy import MAX_KEY_LEN, typed_text_error
 
 MAX_SESSIONS = 2
 SESSION_IDLE_TTL_S = 300.0

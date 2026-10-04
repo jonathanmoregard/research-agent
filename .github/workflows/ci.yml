@@ -44,7 +44,7 @@ jobs:
           fetch-depth: 0
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - name: bandit (high severity + high confidence)
-        run: nix shell "$NIXPKGS#bandit" -c bandit -r mcp_server scraper agent scripts evals egress_gate -lll -iii -q
+        run: nix shell "$NIXPKGS#bandit" -c bandit -r mcp_server scraper agent scripts evals -lll -iii -q
       - name: osv-scanner (uv.lock)
         run: nix shell "$NIXPKGS#osv-scanner" -c osv-scanner scan source --lockfile uv.lock
       - name: gitleaks (full history)

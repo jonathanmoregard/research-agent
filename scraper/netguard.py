@@ -143,15 +143,23 @@ def _main_frame_navigation(request) -> bool:
         return False
 
 
-def install_request_guard(context, nav_allowed=None) -> None:
+def install_request_guard(context, nav_allowed=None, on_blocked_nav=None) -> None:
     """Abort every request from `context` whose destination is blocked.
 
     With `nav_allowed` (a URL -> bool predicate, the run's provenance gate),
     every top-level navigation is checked too — goto, link clicks, JS
     `location` changes, form submits — and only GET navigations pass: a
     form POST would carry whatever the agent typed to the page's server.
-    Subresources and iframes stay ungated: the page author chose them, so
-    they carry nothing the author did not already have.
+    `on_blocked_nav(url)` is told about each refused navigation.
+
+    Subresources and iframes stay ungated. That is NOT because they are
+    harmless: once the agent has typed into a page, that page's script can
+    send the typed text anywhere in a fetch/beacon. Gating subresources
+    would not stop that (the script can encode it in any request it is
+    allowed to make), so the controls are upstream instead: the broker
+    bounds typed text per call and per run, and snaps every number the
+    model chooses (docs/egress-broker.md §0.1, §3.5, §3.6). This gate's job
+    is catching a navigation the broker did not vet.
     """
     verdicts: dict[str, bool] = {}
 
@@ -162,6 +170,11 @@ def install_request_guard(context, nav_allowed=None) -> None:
             return
         if nav_allowed is not None and _main_frame_navigation(route.request):
             if route.request.method != "GET" or not nav_allowed(url):
+                if on_blocked_nav is not None:
+                    try:
+                        on_blocked_nav(url)
+                    except Exception:
+                        pass
                 route.abort("blockedbyclient")
                 return
         try:
@@ -192,30 +205,4 @@ def blocked_hop(response, final_url: str) -> str | None:
     for u in urls:
         if u and not _browser_internal(u) and is_blocked_url(u):
             return u
-    return None
-
-
-# --- text the agent types into pages ----------------------------------------
-# Script on an attacker's page can read any field the agent fills and send it
-# anywhere (fetch/beacon are subresources, deliberately ungated). So typed
-# text is held to the same shape as a shop search query: short, human words,
-# no long opaque runs. Mirrors egress_gate/provenance.py query_is_bounded —
-# the scraper VM mounts only scraper/, so it cannot import that module.
-MAX_TYPED_CHARS = 100  # per call, all fill actions together
-MAX_TYPED_TOKEN = 32
-OPAQUE_TOKEN_LEN = 16
-MAX_KEY_LEN = 32  # press: a key name or chord ("Enter", "Control+A")
-
-
-def typed_text_error(texts: list[str]) -> str | None:
-    """None if the call's typed text is search-query shaped, else why not."""
-    if sum(len(t) for t in texts) > MAX_TYPED_CHARS:
-        return f"typed text too long (max {MAX_TYPED_CHARS} chars per call)"
-    for text in texts:
-        for token in text.split():
-            if len(token) > MAX_TYPED_TOKEN:
-                return f"typed word longer than {MAX_TYPED_TOKEN} chars"
-            if (len(token) >= OPAQUE_TOKEN_LEN and any(c.isdigit() for c in token)
-                    and any(c.isalpha() for c in token)):
-                return "typed text looks like an opaque token, not a search query"
     return None

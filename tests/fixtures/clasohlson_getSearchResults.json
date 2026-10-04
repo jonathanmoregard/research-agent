@@ -1,0 +1,7 @@
+{"_note": "Shape reconstructed 2026-10-04 from Clas Ohlson item URLs in past research reports (https://www.clasohlson.com/se + relative url); not a live capture.",
+ "products": [
+  {"code": "44-4973", "name": "Vattenkokare i plast, 1,7 liter", "currentPrice": {"value": 199.0, "formattedValue": "199,00 kr"}, "url": "/Vattenkokare-i-plast,-1,7-liter/p/44-4973"},
+  {"code": "44-4978", "name": "Vattenkokare rostfritt stål, 1,7 liter", "currentPrice": {"value": 299.0, "formattedValue": "299,00 kr"}, "url": "/Vattenkokare-rostfritt-stal,-1,7-liter/p/44-4978"},
+  {"code": "44-6050", "name": "Emerio vattenkokare i glas 1,7 l, WK-130126", "currentPrice": {"value": 349.0, "formattedValue": "349,00 kr"}, "url": "/Emerio-vattenkokare-i-glas-1,7-l,-WK-130126/p/44-6050"}
+ ],
+ "pagination": {"currentPage": 0, "totalResults": 3}}

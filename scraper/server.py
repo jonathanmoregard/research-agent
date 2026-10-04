@@ -33,12 +33,11 @@ from playwright.sync_api import Error as PWError
 from playwright.sync_api import sync_playwright
 
 from netguard import (
-    MAX_KEY_LEN,
     blocked_hop,
     install_request_guard,
     is_blocked_host,
-    typed_text_error,
 )
+from urlpolicy import MAX_KEY_LEN, typed_text_error
 from sessions import (
     ACT_BUDGET_MS,
     get_artifact_store,
