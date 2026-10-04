@@ -37,13 +37,13 @@ workspace_dependencies = false
 command = "python3"
 args = ["/workspace/agent/shims/exa_shim.py"]
 env_vars = ["EXA_API_KEY"]
-enabled_tools = ["web_search_exa", "web_fetch_exa"]
+enabled_tools = ["web_search_exa"]
 
 [mcp_servers.tavily-remote-mcp]
 command = "python3"
 args = ["/workspace/agent/shims/tavily_shim.py"]
 env_vars = ["TAVILY_API_KEY"]
-enabled_tools = ["tavily_search", "tavily_extract"]
+enabled_tools = ["tavily_search"]
 
 [mcp_servers.render]
 command = "python3"

@@ -58,13 +58,14 @@ esac
 
 # Per-depth tool allowlist. The prompt tells the agent *how* to use these;
 # we restrict *which* are callable at all.
-EXA_TOOLS="mcp__exa__web_search_exa,mcp__exa__web_fetch_exa"
-# tavily_shim.py implements tavily_search + tavily_extract and nothing else,
-# so there is no deep-only Tavily tier to allowlist.
-TAVILY_SEARCH="mcp__tavily-remote-mcp__tavily_search,mcp__tavily-remote-mcp__tavily_extract"
+EXA_TOOLS="mcp__exa__web_search_exa"
+# tavily_shim.py implements tavily_search and nothing else. URL-fetch tools
+# (Exa /contents, Tavily /extract) are gone: their crawlers fetch any URL the
+# model writes, an exfil channel. Search can return full page text instead.
+TAVILY_SEARCH="mcp__tavily-remote-mcp__tavily_search"
 # JS-render fallback. Crosses VMs (research-agent -> scraper microvm via
-# HTTP on 10.0.2.2:8123) and is an order of magnitude slower than an
-# extract API; the agent's CLAUDE.md gates calls to the thin-extract case.
+# HTTP on 10.0.2.2:8123) and is an order of magnitude slower than a search
+# with full text; the agent's CLAUDE.md says when to use it.
 RENDER_TOOLS="mcp__render__render_page,mcp__render__intercept_page"
 # Interactive browser sessions (screenshot -> act loop) on the scraper VM.
 BROWSE_TOOLS="mcp__render__browse_open,mcp__render__browse_act,mcp__render__browse_screenshot,mcp__render__browse_save_screenshot,mcp__render__browse_close"

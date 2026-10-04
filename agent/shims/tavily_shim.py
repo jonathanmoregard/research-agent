@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stdio MCP server exposing Tavily search/extract via tavily-python SDK.
+"""Stdio MCP server exposing Tavily search via tavily-python SDK.
 
 Bypasses the hosted `mcp.tavily.com` (OAuth-gated in remote MCP mode) and
 Smithery-wrapped `tavily-mcp` (breaks under Claude Code spawn path in
@@ -59,25 +59,16 @@ TOOLS = [
                 "query": {"type": "string", "description": "Search query"},
                 "max_results": {"type": "integer", "description": "Max results (1-20)", "default": 5},
                 "search_depth": {"type": "string", "enum": ["basic", "advanced"], "default": "basic"},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "tavily_extract",
-        "description": "Extract content from one or more URLs via Tavily.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "urls": {
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}},
-                    ],
-                    "description": "Single URL or list of URLs",
+                "include_raw_content": {
+                    "type": "boolean",
+                    "description": (
+                        "Return each result's page text (up to ~4000 chars) instead "
+                        "of the short snippet. There is no separate URL-extract tool."
+                    ),
+                    "default": False,
                 },
             },
-            "required": ["urls"],
+            "required": ["query"],
         },
     },
 ]
@@ -86,6 +77,7 @@ def _tool_tavily_search(args: dict) -> str:
     query = args.get("query") or ""
     max_results = int(args.get("max_results") or 5)
     depth = args.get("search_depth") or "basic"
+    raw = args.get("include_raw_content") is True
     resp = _post(
         "/search",
         {
@@ -93,6 +85,7 @@ def _tool_tavily_search(args: dict) -> str:
             "max_results": max(1, min(max_results, 20)),
             "search_depth": depth,
             "include_answer": True,
+            "include_raw_content": raw,
         },
     )
     lines: list[str] = []
@@ -101,33 +94,17 @@ def _tool_tavily_search(args: dict) -> str:
     for r in resp.get("results", []) or []:
         title = r.get("title") or "(untitled)"
         url = r.get("url") or ""
-        snippet = (r.get("content") or "")[:1000]
+        if raw and r.get("raw_content"):
+            snippet = r["raw_content"][:4000]
+        else:
+            snippet = (r.get("content") or "")[:1000]
         lines.append(f"Title: {title}\nURL: {url}\n\n{snippet}\n\n---")
-    text = "\n".join(lines) if lines else "(no results)"
-    return _wrap_untrusted(text)
-
-
-def _tool_tavily_extract(args: dict) -> str:
-    urls = args.get("urls")
-    if isinstance(urls, str):
-        urls = [urls]
-    if not isinstance(urls, list):
-        raise RuntimeError("urls must be a string or list of strings")
-    resp = _post("/extract", {"urls": urls})
-    lines: list[str] = []
-    for r in resp.get("results", []) or []:
-        url = r.get("url") or ""
-        content = (r.get("raw_content") or r.get("content") or "")[:4000]
-        lines.append(f"URL: {url}\n\n{content}\n\n---")
-    for f in resp.get("failed_results", []) or []:
-        lines.append(f"FAILED: {f.get('url')}: {f.get('error')}")
     text = "\n".join(lines) if lines else "(no results)"
     return _wrap_untrusted(text)
 
 
 TOOL_IMPL = {
     "tavily_search": _tool_tavily_search,
-    "tavily_extract": _tool_tavily_extract,
 }
 
 SERVER_INFO = {"name": "tavily-shim", "version": "1.0.0"}

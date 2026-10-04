@@ -1074,11 +1074,12 @@ def _direct_exa(prompt: str) -> tuple[bool, str]:
 
 # Only name parameters the guest shims actually declare, or the agent burns
 # turns on calls the schema rejects. `web_search_exa` accepts `query` and
-# `numResults` ONLY (agent/shims/exa_shim.py:26-34) and hardcodes
-# `type: "auto"` server-side (:95) — there is no `type` or `livecrawl` knob to
+# `numResults` and `fullText` ONLY (agent/shims/exa_shim.py) and hardcodes
+# `type: "auto"` server-side — there is no `type` or `livecrawl` knob to
 # set, and no `type='deep'` mode. The tavily shim implements `tavily_search`
-# and `tavily_extract` ONLY (agent/shims/tavily_shim.py:74,98); there is no
-# `tavily_research` or `tavily_crawl`.
+# ONLY; there is no `tavily_extract`, `tavily_research` or `tavily_crawl`.
+# There is no URL-fetch tool: pages are read via search full text or
+# `render_page` on a URL this run already saw (agent/CLAUDE.md).
 DEPTH_GUIDANCE: dict[Depth, str] = {
     "fast": (
         "Research depth: FAST. Call `mcp__exa__web_search_exa` once with "
@@ -1089,8 +1090,8 @@ DEPTH_GUIDANCE: dict[Depth, str] = {
         "Research depth: NORMAL. Decompose the prompt into 2-3 "
         "single-search-answerable sub-questions. Up to 3 "
         "`mcp__exa__web_search_exa` calls (one per sub-question) with "
-        "`numResults=8`. Fetch the top 2 most relevant URLs via "
-        "`mcp__exa__web_fetch_exa` for fuller context — load-bearing "
+        "`numResults=8`. Read the top 2 most relevant results in full with "
+        "`mcp__render__render_page` on their URLs — load-bearing "
         "claims need a fetched source, not a snippet. Cross-reference. "
         "Stop as soon as every sub-question is answered or confirmed "
         "unanswerable."
@@ -1098,11 +1099,11 @@ DEPTH_GUIDANCE: dict[Depth, str] = {
     "deep": (
         "Research depth: DEEP. Decompose into sub-questions and call "
         "`mcp__exa__web_search_exa` with `numResults=15`. Fan out to 2-3 "
-        "sub-questions. Fetch the top 5 URLs via "
-        "`mcp__exa__web_fetch_exa`. Cross-check the load-bearing claims "
-        "against a second provider with "
-        "`mcp__tavily-remote-mcp__tavily_search` and "
-        "`mcp__tavily-remote-mcp__tavily_extract`. After each round, "
+        "sub-questions. Read the top 5 results in full (`fullText: true`, "
+        "or `mcp__render__render_page` on a result URL). Cross-check the "
+        "load-bearing claims against a second provider with "
+        "`mcp__tavily-remote-mcp__tavily_search` "
+        "(`include_raw_content: true`). After each round, "
         "reflect on remaining gaps and conflicts; search only the gaps. "
         "Aim for broad coverage and explicit cross-referencing. Stop "
         "when gaps are closed or the call budget is spent."

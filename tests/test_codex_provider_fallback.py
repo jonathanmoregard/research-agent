@@ -216,8 +216,8 @@ class CodexProviderFallbackTests(unittest.TestCase):
         self.assertTrue(all(value is False for value in config["features"].values()))
 
         expected_tools = {
-            "exa": {"web_search_exa", "web_fetch_exa"},
-            "tavily-remote-mcp": {"tavily_search", "tavily_extract"},
+            "exa": {"web_search_exa"},
+            "tavily-remote-mcp": {"tavily_search"},
             "render": {
                 "render_page",
                 "intercept_page",

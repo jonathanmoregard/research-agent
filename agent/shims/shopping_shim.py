@@ -734,7 +734,7 @@ def _tool_tradera_search(args: dict) -> str:
     if not TRADERA_APP_ID or not TRADERA_APP_KEY:
         raise RuntimeError(
             "Tradera API search is not configured (TRADERA_APP_ID / "
-            "TRADERA_APP_KEY absent). Fall back to mcp__exa__web_fetch_exa on "
+            "TRADERA_APP_KEY absent). Fall back to mcp__render__render_page on "
             "https://www.tradera.com/search?q=<query>, which returns listings."
         )
     body = _gated(

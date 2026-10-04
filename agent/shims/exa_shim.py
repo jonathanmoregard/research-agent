@@ -29,31 +29,23 @@ _UNTRUSTED_TAG = re.compile(
 TOOLS = [
     {
         "name": "web_search_exa",
-        "description": "Search the web via Exa AI. Returns top N results with highlights.",
+        "description": "Search the web via Exa AI. Returns top N results with highlights, or full page text with fullText=true.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query"},
                 "numResults": {"type": "integer", "description": "Max results (1-100)", "default": 5},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "web_fetch_exa",
-        "description": "Fetch full text content of one or more URLs via Exa.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "urls": {
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}},
-                    ],
-                    "description": "Single URL or list of URLs to fetch",
+                "fullText": {
+                    "type": "boolean",
+                    "description": (
+                        "Return each result's full page text (up to ~8000 chars) "
+                        "instead of highlights. Use this to read search results "
+                        "in depth; there is no separate URL-fetch tool."
+                    ),
+                    "default": False,
                 },
             },
-            "required": ["urls"],
+            "required": ["query"],
         },
     },
 ]
@@ -84,14 +76,20 @@ def _wrap_untrusted(text: str) -> str:
     return f'<untrusted_external_content source="exa">\n{safe}\n</untrusted_external_content>'
 
 
-def _format_result(r: dict) -> str:
+FULL_TEXT_CHARS = 8000
+
+
+def _format_result(r: dict, full_text: bool = False) -> str:
     title = r.get("title") or "(untitled)"
     url = r.get("url") or ""
     published = r.get("publishedDate") or "N/A"
     author = r.get("author") or "N/A"
     hl = r.get("highlights") or []
     text = r.get("text") or ""
-    body = "\n".join(hl) if hl else text[:2000]
+    if full_text and text:
+        body = text[:FULL_TEXT_CHARS]
+    else:
+        body = "\n".join(hl) if hl else text[:2000]
     return f"Title: {title}\nURL: {url}\nPublished: {published}\nAuthor: {author}\n\n{body}\n\n---"
 
 
@@ -99,33 +97,25 @@ def _tool_web_search_exa(args: dict) -> str:
     query = args.get("query") or ""
     num = int(args.get("numResults") or 5)
     num = max(1, min(num, 100))
+    full_text = args.get("fullText") is True
+    contents: dict = {"highlights": True}
+    if full_text:
+        contents = {"text": {"maxCharacters": FULL_TEXT_CHARS}}
     body = _post(
         "/search",
         {
             "query": query,
             "type": "auto",
             "numResults": num,
-            "contents": {"highlights": True},
+            "contents": contents,
         },
     )
-    text = "\n".join(_format_result(r) for r in (body.get("results") or [])) or "(no results)"
-    return _wrap_untrusted(text)
-
-
-def _tool_web_fetch_exa(args: dict) -> str:
-    urls = args.get("urls")
-    if isinstance(urls, str):
-        urls = [urls]
-    if not isinstance(urls, list):
-        raise RuntimeError("urls must be a string or list of strings")
-    body = _post("/contents", {"urls": urls, "text": True})
-    text = "\n".join(_format_result(r) for r in (body.get("results") or [])) or "(no results)"
+    text = "\n".join(_format_result(r, full_text) for r in (body.get("results") or [])) or "(no results)"
     return _wrap_untrusted(text)
 
 
 TOOL_IMPL = {
     "web_search_exa": _tool_web_search_exa,
-    "web_fetch_exa": _tool_web_fetch_exa,
 }
 
 SERVER_INFO = {"name": "exa-shim", "version": "1.0.0"}
