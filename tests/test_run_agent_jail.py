@@ -13,11 +13,19 @@ Invariants pinned (each was violated before the 2026-10-03 fix):
   - Write is scoped to /scratch, so the RW /tool-cache share is not
     agent-writable;
   - the report still reaches /out and the agent's exit code survives.
+
+And since 2026-10-11: no credential VALUE is in bwrap's argv. argv is
+world-readable through /proc/<pid>/cmdline (`ps aux`) and becomes the
+description of the memguard systemd scope; `--setenv KEY value` leaked
+live keys to agent sessions that ran `ps aux`. The keys reach the jail by
+environment inheritance instead, which the fake models: the jail env is
+bwrap's own environ with its --setenv/--unsetenv/--clearenv applied.
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -38,6 +46,13 @@ CANARIES = {
     )
 }
 
+# Provider credentials. The guest script always exports both names; the
+# run-agent.sh provider branch decides which (if any) reaches the jail.
+PROVIDER_CANARIES = {
+    "CLAUDE_CODE_OAUTH_TOKEN": "CANARY-CLAUDE-TOKEN",
+    "CODEX_AUTH_JSON": '{"tokens":{"access_token":"CANARY-CODEX-AUTH"}}',
+}
+
 FAKE_BWRAP = r'''#!/usr/bin/env python3
 import json, os, sys
 argv = sys.argv[1:]
@@ -55,6 +70,21 @@ while i < len(argv):
         break
     i += 1
 canaries = json.loads(os.environ["CANARY_JSON"])
+# The environment bwrap hands the jailed command: its own environ (bwrap
+# keeps it unless --clearenv) with the env flags applied in order.
+jail_env = dict(os.environ)
+j = 0
+while j < len(argv) and argv[j] != "--":
+    a = argv[j]
+    if a == "--clearenv":
+        jail_env = {}
+    elif a == "--setenv":
+        jail_env[argv[j + 1]] = argv[j + 2]
+        j += 2
+    elif a == "--unsetenv":
+        jail_env.pop(argv[j + 1], None)
+        j += 1
+    j += 1
 hits = []
 for src, dst in binds:
     # System trees (/nix/store, /etc, ...) are not per-call; per-call
@@ -69,7 +99,8 @@ for src, dst in binds:
         except OSError:
             continue
         hits += [(dst, k) for k, v in canaries.items() if v in data]
-json.dump({"argv": argv, "binds": binds, "hits": hits, "scratch": scratch},
+json.dump({"argv": argv, "binds": binds, "hits": hits, "scratch": scratch,
+           "jail_env": jail_env},
           open(os.environ["BWRAP_LOG"], "w"))
 if scratch:
     open(os.path.join(scratch, os.environ["REPORT_NAME"]), "w").write("# report\nok\n")
@@ -88,8 +119,22 @@ def jail(tmp_path):
     out.mkdir()
     prompt = tmp_path / "prompt.txt"
     prompt.write_text("research something")
+    # `command -v codex` gate for the codex provider; never actually run.
+    codex = bin_dir / "codex"
+    codex.write_text("#!/bin/sh\nexit 99\n")
+    codex.chmod(0o755)
+    # The codex path copies /workspace/agent/codex-config.toml (the guest's
+    # read-only share). Map that prefix onto this checkout for the copy.
+    real_cp = shutil.which("cp")
+    cp = bin_dir / "cp"
+    cp.write_text(
+        "#!/usr/bin/env bash\n"
+        'args=("${@//\\/workspace\\/agent/' + str(REPO_ROOT / "agent") + '}")\n'
+        f'exec {real_cp} "${{args[@]}}"\n'
+    )
+    cp.chmod(0o755)
 
-    def run(provider="claude", rc=0):
+    def run(provider="claude", rc=0, drop=()):
         log = tmp_path / "bwrap.json"
         env = {
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
@@ -103,9 +148,12 @@ def jail(tmp_path):
             "TEST_ROOT": str(tmp_path),
             "REPORT_NAME": f"{UUID}.md",
             "FAKE_RC": str(rc),
-            "CLAUDE_CODE_OAUTH_TOKEN": "CANARY-CLAUDE-TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN": PROVIDER_CANARIES["CLAUDE_CODE_OAUTH_TOKEN"],
+            "CODEX_AUTH_JSON": PROVIDER_CANARIES["CODEX_AUTH_JSON"],
             **CANARIES,
         }
+        for name in drop:
+            del env[name]
         p = subprocess.run(["bash", str(RUN_AGENT), UUID, str(prompt)],
                            env=env, capture_output=True, text=True, timeout=60)
         rec = json.loads(log.read_text()) if log.exists() else None
@@ -161,3 +209,34 @@ def test_report_published_and_exit_code_kept(jail):
     assert rec["scratch"] and not Path(rec["scratch"]).exists()
     # The jail never gets a bind of the host-visible report file.
     assert all(not src.startswith(str(final.parent)) for src, _ in rec["binds"])
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_no_credential_value_in_bwrap_argv(jail, provider):
+    p, rec, _ = jail(provider=provider)
+    assert p.returncode == 0, p.stderr
+    values = list(CANARIES.values()) + ["CANARY-CLAUDE-TOKEN", "CANARY-CODEX-AUTH"]
+    leaked = sorted({v for v in values for a in rec["argv"] if v in a})
+    assert leaked == [], f"credential values in bwrap argv: {leaked}"
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_jail_env_still_carries_the_tool_keys(jail, provider):
+    _, rec, _ = jail(provider=provider)
+    env = rec["jail_env"]
+    for name, value in CANARIES.items():
+        assert env.get(name) == value, f"{name} missing from the jail env"
+    if provider == "claude":
+        assert env.get("CLAUDE_CODE_OAUTH_TOKEN") == "CANARY-CLAUDE-TOKEN"
+    else:
+        # Codex reads auth from the bound auth.json, never the env.
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "CODEX_AUTH_JSON" not in env
+
+
+def test_optional_keys_default_to_empty_in_jail_env(jail):
+    """An optional shim key absent upstream still reaches the jail as "",
+    exactly as `--setenv NAME "${NAME:-}"` used to deliver it."""
+    p, rec, _ = jail(drop=("EUIPO_CLIENT_SECRET",))
+    assert p.returncode == 0, p.stderr
+    assert rec["jail_env"].get("EUIPO_CLIENT_SECRET") == ""

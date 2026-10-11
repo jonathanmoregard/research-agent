@@ -470,7 +470,8 @@ def _secrets() -> dict[str, str]:
 
     Provider credentials never touch a new disk file inside this process. The values flow
     straight into the ssh stdin payload to the microvm and from
-    there into the agent's environment via `--setenv`.
+    there into the agent's environment by inheritance, never argv
+    (see run-agent.sh).
 
     Resolution per secret: env var (per `_SECRET_ENV`) → for
     `claude-token`, `~/.claude/.credentials.json` → GNOME keyring.
