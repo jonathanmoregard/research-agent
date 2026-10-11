@@ -181,7 +181,7 @@ PROMPT_CONTENT="$(cat "${PROMPT_FILE}")"
 # No credential is ever written to a file the jail can see. agent/.mcp.json
 # is used as shipped: it carries no secrets and no `env` blocks, because
 # Claude Code starts stdio MCP servers with its own environment, which
-# already holds the keys from the --setenv list below. (This used to render
+# already holds the keys exported below. (This used to render
 # the keys into a copy of .mcp.json bind-mounted into the agent's cwd,
 # where the agent's Read tool could open it.) Codex likewise passes the
 # names listed in codex-config.toml `env_vars` from its environment.
@@ -354,6 +354,26 @@ publish_report() {
   fi
 }
 
+# Credentials reach the jail by environment INHERITANCE, never as argv.
+# bwrap runs without --clearenv, so the jailed command starts with this
+# script's environment plus the --setenv entries below. A value in argv
+# (`--setenv KEY value`) is world-readable in /proc/<pid>/cmdline (`ps aux`)
+# for the whole call, and systemd-run makes the scope's description out of
+# it; agent sessions that ran `ps aux` captured live keys that way.
+# /proc/<pid>/environ, by contrast, is readable only with ptrace rights over
+# the process. Keep every secret off the bwrap and systemd-run command
+# lines, here and in any future --setenv.
+#
+# `export` is a builtin, so no process ever carries these values in argv.
+# The two required keys abort the call under `set -u` when missing; the
+# optional ones default to "" so every shim sees the name defined.
+# CLAUDE_CODE_OAUTH_TOKEN rides the same inherited environment on the
+# claude path and was unset above on the codex path.
+export EXA_API_KEY="${EXA_API_KEY}" TAVILY_API_KEY="${TAVILY_API_KEY}"
+export EUIPO_CLIENT_ID="${EUIPO_CLIENT_ID:-}" EUIPO_CLIENT_SECRET="${EUIPO_CLIENT_SECRET:-}"
+export EBAY_CLIENT_ID="${EBAY_CLIENT_ID:-}" EBAY_CLIENT_SECRET="${EBAY_CLIENT_SECRET:-}"
+export TRADERA_APP_ID="${TRADERA_APP_ID:-}" TRADERA_APP_KEY="${TRADERA_APP_KEY:-}"
+
 agent_rc=0
 "${MEMGUARD_ARGV[@]}" \
 bwrap \
@@ -383,14 +403,6 @@ bwrap \
   --setenv PATH "/run/current-system/sw/bin:/run/current-system/sw/sbin" \
   --setenv RESEARCH_SCRATCH_PATH "${SCRATCH_FILE}" \
   --setenv RESEARCH_RUN_ID "${REPORT_UUID}" \
-  --setenv EXA_API_KEY "${EXA_API_KEY}" \
-  --setenv TAVILY_API_KEY "${TAVILY_API_KEY}" \
-  --setenv EUIPO_CLIENT_ID "${EUIPO_CLIENT_ID:-}" \
-  --setenv EUIPO_CLIENT_SECRET "${EUIPO_CLIENT_SECRET:-}" \
-  --setenv EBAY_CLIENT_ID "${EBAY_CLIENT_ID:-}" \
-  --setenv EBAY_CLIENT_SECRET "${EBAY_CLIENT_SECRET:-}" \
-  --setenv TRADERA_APP_ID "${TRADERA_APP_ID:-}" \
-  --setenv TRADERA_APP_KEY "${TRADERA_APP_KEY:-}" \
   "${CACHE_ARGS[@]}" \
   --setenv CLAUDE_STREAM_IDLE_TIMEOUT_MS "1800000" \
   -- \
