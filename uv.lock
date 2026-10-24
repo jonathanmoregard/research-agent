@@ -800,6 +800,7 @@ dependencies = [
     { name = "anthropic" },
     { name = "curl-cffi" },
     { name = "injection-scanner" },
+    { name = "markdown-it-py" },
     { name = "mcp" },
     { name = "openai" },
 ]
@@ -815,6 +816,7 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.96.0" },
     { name = "curl-cffi", specifier = ">=0.7" },
     { name = "injection-scanner", git = "https://github.com/jonathanmoregard/injection-scanner?rev=ffd272a57d073ff6628bb440ee10d623df43d3ce" },
+    { name = "markdown-it-py", specifier = ">=4.0.0" },
     { name = "mcp", specifier = ">=1.28.1" },
     { name = "openai", specifier = ">=2.32.0" },
 ]

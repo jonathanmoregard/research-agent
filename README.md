@@ -7,10 +7,17 @@ Isolated web-research subsystem for Claude Code and Codex. The host session has 
 One MCP tool, exposed to the host agent session:
 
 ```
-research(prompt: str) -> { status: "done" | "error", report_path: str, error?: str }
+research(prompt: str, depth: str = "normal", model: str = "", inline_full: bool = False)
+  -> { status: "done", report_path: str, report_chars: int, summary: str, ... }
+   | { status: "error", error: str, ... }
 ```
 
-The main session writes nothing about web access itself — it just calls this and reports the path back to the user.
+The full wrapped report stays on disk at `report_path`; only `summary` (the
+report's title plus its Summary section, or its opening ~1500 chars) comes back
+inline, in the same untrusted-content framing. Callers read `report_path` when
+they need the detail. `inline_full=True` returns the whole report as `report`
+instead of `summary`. `retry_research(report_id, inline_full=False)` delivers
+the same way. The main session writes nothing about web access itself.
 
 ## Architecture
 
@@ -41,7 +48,7 @@ bubblewrap jail                      (ephemeral, per call)
         v
 injection-scanner                    (host-side, after ssh returns)
         |
-        | pass  -> reports/<uuid>.md, return wrapped report
+        | pass  -> reports/<uuid>.md, return path + wrapped summary
         | fail  -> reports/_quarantine/<uuid>.md, return error
         v
 host agent session receives result

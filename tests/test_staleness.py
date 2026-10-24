@@ -94,7 +94,7 @@ def test_stamped_preserves_signature_for_schema_generation():
     and silently break the tool's parameters."""
     import inspect
     params = inspect.signature(server.research).parameters
-    assert list(params) == ["prompt", "depth", "model"]
+    assert list(params) == ["prompt", "depth", "model", "inline_full"]
     assert server.research.__doc__ and "depth" in server.research.__doc__
 
 

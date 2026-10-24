@@ -145,16 +145,16 @@ def case_retry_pass_delivers(tmp: Path) -> list[str]:
             failures.append("delivered file missing untrusted wrap")
         if CANARY_BODY not in delivered:
             failures.append("delivered file missing the sanitized body")
-    # Feature: pass returns the wrapped report in the `report` field so
-    # the caller can inline it without a separate Read.
-    report = result.get("report")
-    if not isinstance(report, str):
-        failures.append(f"pass response missing `report` field: {result}")
+    # Pass returns a wrapped `summary` inline; the full report stays at
+    # report_path (tests/test_report_summary_return.py covers inline_full).
+    summary = result.get("summary")
+    if not isinstance(summary, str):
+        failures.append(f"pass response missing `summary` field: {result}")
     else:
-        if "<untrusted_external_content" not in report:
-            failures.append("`report` field missing untrusted wrap")
-        if CANARY_BODY not in report:
-            failures.append("`report` field missing sanitized body")
+        if "<untrusted_external_content" not in summary:
+            failures.append("`summary` field missing untrusted wrap")
+        if CANARY_BODY not in summary:
+            failures.append("`summary` field missing sanitized body")
     return failures
 
 

@@ -113,7 +113,9 @@ async def _research_once(prompt: str, depth: str) -> dict:
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            result = await session.call_tool("research", {"prompt": prompt, "depth": depth})
+            result = await session.call_tool(
+                "research", {"prompt": prompt, "depth": depth, "inline_full": True}
+            )
             for item in result.content:
                 if hasattr(item, "text"):
                     try:
