@@ -1398,14 +1398,15 @@ def _dial_agent(
     return result.returncode, (result.stdout + result.stderr)
 
 
-# How long one report (or artifact) scan may queue for a slot in the
-# fleet-wide Lakera limiter (injection_scanner/throttle.py) before the scanner
-# reports `lakera_unavailable:throttled`. The scanner's default is 0 s: refuse
-# at once when the bucket is empty. On 2026-10-03 a burst of ~56 research calls
-# drained the bucket and 15 reports fell back to the strict no-Lakera path
-# that evening. Waiting briefly turns most of those into real Lakera scans; a
-# report that still finds no slot falls back exactly as before.
-_SCAN_LAKERA_MAX_WAIT_S = 120.0
+# How long one report (or artifact) scan may queue for a slot in EACH L2
+# vendor's fleet-wide limiter (injection_scanner/throttle.py) before that
+# vendor reports `<vendor>_unavailable:throttled`. The vendors wait
+# concurrently, so this bounds the L2 wall time too. The scanner's default is
+# 0 s: refuse at once when a bucket is empty. On 2026-10-03 a burst of ~56
+# research calls drained the Lakera bucket and 15 reports fell back to the
+# strict quota path that evening. Waiting briefly turns most of those into
+# real panel verdicts; a report that still finds no slot falls back as before.
+_SCAN_L2_MAX_WAIT_S = 120.0
 
 
 def _scan_text(content: str):
@@ -1416,7 +1417,7 @@ def _scan_text(content: str):
     snapshot the bytes under O_NOFOLLOW, then hand the string here.
     """
     from injection_scanner.intercept import scan_text as _intercept_scan_text
-    return _intercept_scan_text(content, lakera_max_wait_s=_SCAN_LAKERA_MAX_WAIT_S)
+    return _intercept_scan_text(content, l2_max_wait_s=_SCAN_L2_MAX_WAIT_S)
 
 
 def _safe_read(path: Path) -> str:
@@ -1859,10 +1860,10 @@ def research(
             re-scan the quarantined report.
             That reject also carries `scanner_infra` when — and only when —
             the rejection was a scanner SETUP/INFRA outage rather than a
-            detection: {"layer": "lakera"|"honeypot"|"judge"|
-            "unicode_sanitize"|"secret_shapes"|"decode"|"other",
+            detection: {"layer": "l2"|"lakera"|"model_armor"|"honeypot"|
+            "judge"|"unicode_sanitize"|"secret_shapes"|"decode"|"other",
             "condition": "unavailable"|"no_key"|"key_config_error"|
-            "bad_response"|"lib_missing"|"throttled"|"limiter_error"|
+            "url_config_error"|"bad_response"|"lib_missing"|"throttled"|"limiter_error"|
             "service_unavailable"|"other", "exc_type"?: str,
             "http_status"?: int}. Every value is drawn from a closed
             vocabulary — it is a diagnosis, never text from the report or
@@ -2061,7 +2062,7 @@ def research(
 # not share a disposition:
 #
 #   CONTENT-DERIVED — a detection. `secret_shape:*`, `encoded_secret:*`,
-#     `unicode_anomaly:*`, `lakera:prompt_attack`, honeypot triggers,
+#     `unicode_anomaly:*`, `<vendor>:prompt_attack`, honeypot triggers,
 #     `wrap_escape:*`, `oversized:*`. The reason is a function of
 #     attacker-controlled report bytes (even a rule NAME tells the caller
 #     which planted shape matched, and a length tells it how much text
@@ -2083,8 +2084,8 @@ def research(
 #
 # "This report was blocked" is NOT the secret; the report's CONTENT is.
 # So an outage stays an outage even when the layer it happened in only
-# runs on already-suspicious text: `lakera_arbitration:judge_unavailable:*`
-# fires only after Lakera flagged the report, and it is still INFRA,
+# runs on already-suspicious text: `l2_arbitration:judge_unavailable:*`
+# fires only after the L2 panel flagged the report, and it is still INFRA,
 # because the operator needs to know the judge panel is down. What stays
 # CONTENT-DERIVED is anything whose reason encodes attacker-controlled
 # bytes or names which rule/shape matched.
@@ -2105,14 +2106,14 @@ _INFRA_REASON_HEAD_SUFFIX = "_unavailable"
 
 # Reason prefixes that WRAP another layer's reason. intercept.py re-emits
 # the honeypot's own result reason under `honeypot:`, and the L4 judge's
-# under `lakera_arbitration:`, so a genuine outage arrives one segment
+# under `l2_arbitration:`, so a genuine outage arrives one segment
 # deeper than it was raised. Kept as an explicit set rather than "look at
 # segment 1 too", so `secret_shape:thing_unavailable` — a rule NAME that
 # merely ends in the suffix — cannot be mistaken for an outage.
-_INFRA_WRAPPER_PREFIXES = frozenset({"honeypot", "lakera_arbitration"})
+_INFRA_WRAPPER_PREFIXES = frozenset({"honeypot", "l2_arbitration"})
 
 # Standalone setup codes. Today they only ever appear as the tail of
-# `lakera_unavailable:<code>`; listed here so a future call site emitting
+# `<vendor>_unavailable:<code>`; listed here so a future call site emitting
 # one bare is still classified as infra rather than silently opaque.
 _INFRA_BARE_REASONS = frozenset({"no-key", "key-config-error", "bad-response"})
 
@@ -2138,7 +2139,9 @@ class _InfraLayer(Enum):
     UNICODE_SANITIZE = "unicode_sanitize"
     SECRET_SHAPES = "secret_shapes"
     DECODE = "decode"
-    LAKERA = "lakera"
+    L2 = "l2"                        # the L2 panel machinery itself
+    LAKERA = "lakera"                # L2 vendor
+    MODEL_ARMOR = "model_armor"      # L2 vendor
     HONEYPOT = "honeypot"
     JUDGE = "judge"
     OTHER = "other"
@@ -2149,6 +2152,7 @@ class _InfraCondition(Enum):
     UNAVAILABLE = "unavailable"      # reachable-but-failing / generic outage
     NO_KEY = "no_key"                # credential absent
     KEY_CONFIG_ERROR = "key_config_error"  # credential present but unloadable
+    URL_CONFIG_ERROR = "url_config_error"  # endpoint / project ids invalid
     BAD_RESPONSE = "bad_response"    # provider answered, shape unusable
     LIB_MISSING = "lib_missing"      # provider SDK not installed
     THROTTLED = "throttled"          # shared quota budget unavailable
@@ -2158,15 +2162,20 @@ class _InfraCondition(Enum):
 
 
 # Tail tokens that pin the condition more precisely than "unavailable".
-# Keys are the literal tokens injection_scanner emits (lakera reason tails
+# Keys are the literal tokens injection_scanner emits (L2 vendor reason tails
 # and honeypot scenario signals); values are enum members. A token not in
 # here never reaches the caller — it just leaves the condition at its
-# default.
+# default. Model Armor's vendor-side conditions (`too-large`, `token-error`,
+# `skipped`, `partial-invocation`) and the panel's `bad-result` deliberately
+# stay the generic UNAVAILABLE: `too-large` is a threshold on the report's
+# length, and the rest name nothing an operator fixes differently from "the
+# vendor is down". The raw reason is in the audit record.
 _INFRA_CONDITION_TOKENS: dict[str, "_InfraCondition"] = {
     "no-key": _InfraCondition.NO_KEY,
     "no-anthropic-api-key": _InfraCondition.NO_KEY,
     "no-openai-api-key": _InfraCondition.NO_KEY,
     "key-config-error": _InfraCondition.KEY_CONFIG_ERROR,
+    "url-config-error": _InfraCondition.URL_CONFIG_ERROR,
     "bad-response": _InfraCondition.BAD_RESPONSE,
     "throttled": _InfraCondition.THROTTLED,
     "limiter-error": _InfraCondition.LIMITER_ERROR,
