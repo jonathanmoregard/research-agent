@@ -2230,7 +2230,7 @@ _INFRA_EXC_TYPES = frozenset({
     "CancelledError", "InvalidStateError", "BrokenExecutor",
     "BrokenThreadPool", "BrokenProcessPool",
     # injection_scanner
-    "KeyConfigError", "SmokeFailure",
+    "KeyConfigError", "SmokeFailure", "ResponseTooLarge", "UnexpectedHTTPStatus",
     # Anthropic / OpenAI SDK
     "APIError", "APIConnectionError", "APITimeoutError", "APIStatusError",
     "APIResponseValidationError", "AuthenticationError", "PermissionDeniedError",

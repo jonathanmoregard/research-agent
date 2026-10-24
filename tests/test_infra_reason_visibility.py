@@ -589,3 +589,13 @@ def test_reject_response_default_is_unchanged():
     assert set(out) == OPAQUE_KEYS
     assert out["error"] == OPAQUE_ERROR
     assert out["report_id"] == "rid"
+
+
+@pytest.mark.parametrize("exc", ["ResponseTooLarge", "UnexpectedHTTPStatus"])
+def test_scanner_transport_exception_types_are_named(exc):
+    """vendor_http's own exception types are library vocabulary, so an
+    operator sees `ResponseTooLarge` rather than `other`."""
+    for vendor in ("lakera", "model_armor"):
+        diag = srv._infra_diagnosis(f"{vendor}_unavailable:{exc}")
+        assert diag["exc_type"] == exc
+        _assert_closed_vocabulary(diag)
