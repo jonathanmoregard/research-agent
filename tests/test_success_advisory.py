@@ -168,8 +168,8 @@ def test_rejected_artifact_does_not_claim_successful_quota_fallback(
 ):
     rejected = Verdict(
         ok=False,
-        reason="l2_arbitration:attack:gpt-4o-mini",
-        layers=_layers(LAKERA_THROTTLED, "pass", Outcome.DEGRADED_QUOTA, judge="attack:gpt-4o-mini"),
+        reason="l2_arbitration:attack:openai_4o_mini",
+        layers=_layers(LAKERA_THROTTLED, "pass", Outcome.DEGRADED_QUOTA, judge="attack:openai_4o_mini"),
         sanitize_stats={},
         sanitized_text="rejected artifact OCR",
     )
