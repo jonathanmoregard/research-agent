@@ -17,7 +17,7 @@ dependencies = [
 research-agent-mcp = "mcp_server.server:main"
 
 [tool.uv.sources]
-injection-scanner = { git = "https://github.com/jonathanmoregard/injection-scanner", rev = "ffd272a57d073ff6628bb440ee10d623df43d3ce" }
+injection-scanner = { git = "https://github.com/jonathanmoregard/injection-scanner", rev = "fdaadd90f468ff13807155f8a699ddd51f6f6125" }
 
 [build-system]
 requires = ["hatchling"]
