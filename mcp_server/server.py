@@ -1398,6 +1398,16 @@ def _dial_agent(
     return result.returncode, (result.stdout + result.stderr)
 
 
+# How long one report (or artifact) scan may queue for a slot in the
+# fleet-wide Lakera limiter (injection_scanner/throttle.py) before the scanner
+# reports `lakera_unavailable:throttled`. The scanner's default is 0 s: refuse
+# at once when the bucket is empty. On 2026-10-03 a burst of ~56 research calls
+# drained the bucket and 15 reports fell back to the strict no-Lakera path
+# that evening. Waiting briefly turns most of those into real Lakera scans; a
+# report that still finds no slot falls back exactly as before.
+_SCAN_LAKERA_MAX_WAIT_S = 120.0
+
+
 def _scan_text(content: str):
     """Run the layered intercept shim on pre-read `content`. Returns the Verdict.
 
@@ -1406,7 +1416,7 @@ def _scan_text(content: str):
     snapshot the bytes under O_NOFOLLOW, then hand the string here.
     """
     from injection_scanner.intercept import scan_text as _intercept_scan_text
-    return _intercept_scan_text(content)
+    return _intercept_scan_text(content, lakera_max_wait_s=_SCAN_LAKERA_MAX_WAIT_S)
 
 
 def _safe_read(path: Path) -> str:
