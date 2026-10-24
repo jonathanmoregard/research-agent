@@ -1844,15 +1844,16 @@ def research(
             the findings, sources or detail, or hand the path to a
             subagent. With inline_full=True, `report` (the full file
             content) replaces `summary`.
-            When Lakera quota pressure forced the strict fallback, success
-            also carries `scanner_advisory`: {"layer": "lakera",
-            "condition": "throttled",
+            When quota pressure left the L2 classifier panel short and forced
+            the strict fallback, success also carries `scanner_advisory`:
+            {"layer": "l2", "condition": "throttled",
+            "vendors": [<"lakera"|"model_armor">, ...],
             "fallback": "strict_honeypot_unanimous_judges",
             "action": "warn_user"}. The calling model must tell the user
-            that Lakera did not scan this report because quota/rate limiting
-            was active and that strict honeypot + unanimous judges were used
-            instead. Every value is fixed vocabulary; no report or provider
-            text appears in this advisory.
+            that the named classifiers did not scan this report because
+            quota/rate limiting was active and that strict honeypot +
+            unanimous judges were used instead. Every value is fixed
+            vocabulary; no report or provider text appears in this advisory.
         On failure: {"status": "error", "error": str, "report_id"?: str,
                      "timings_ms": {...}}.
             When `error` is "scanner rejected report (quarantined)",
@@ -2120,18 +2121,11 @@ _INFRA_BARE_REASONS = frozenset({"no-key", "key-config-error", "bad-response"})
 # The single key the infra path is allowed to add to a reject response.
 _INFRA_KEY = "scanner_infra"
 
-# A successful scan can still be degraded when exact Lakera quota pressure
-# activates injection-scanner's strict honeypot + unanimous-judge fallback.
-# These are the only two upstream literals eligible for that path. Exact
-# membership prevents another outage, malformed provider reply, or
-# attacker-shaped suffix from being presented as quota pressure.
+# A successful scan can still be degraded: when quota pressure leaves the L2
+# panel short of its verdict floor (`l2_outcome` DEGRADED_QUOTA), the scanner
+# delivers only after strict honeypot + unanimous-judge arbitration. The
+# success response then carries this advisory; see `_quota_degraded_vendors`.
 _SCANNER_ADVISORY_KEY = "scanner_advisory"
-_LAKERA_QUOTA_ADVISORY_REASONS = frozenset(
-    {
-        "lakera_unavailable:HTTPError:429",
-        "lakera_unavailable:throttled",
-    }
-)
 
 
 class _InfraLayer(Enum):
@@ -2145,6 +2139,37 @@ class _InfraLayer(Enum):
     HONEYPOT = "honeypot"
     JUDGE = "judge"
     OTHER = "other"
+
+
+# Each L2 vendor's exact quota-class reasons (injection_scanner l2: exact
+# membership, no prefix matching). Keyed by enum member so the advisory's
+# vendor list is built from members we name, never from a layer string.
+_L2_QUOTA_REASONS: dict[_InfraLayer, frozenset[str]] = {
+    _InfraLayer.LAKERA: frozenset(
+        {"lakera_unavailable:HTTPError:429", "lakera_unavailable:throttled"}
+    ),
+    _InfraLayer.MODEL_ARMOR: frozenset(
+        {"model_armor_unavailable:HTTPError:429", "model_armor_unavailable:throttled"}
+    ),
+}
+
+
+def _quota_degraded_vendors(verdict) -> set[_InfraLayer] | None:
+    """The L2 vendors whose quota shortfall put a DELIVERED verdict on the
+    strict fallback, or None when the verdict was rejected or the panel was
+    not DEGRADED_QUOTA. Only the scanner's closed `l2` summary decides whether
+    the fallback ran; per-vendor reasons only pick which members to name."""
+    from injection_scanner.intercept import l2_outcome
+    from injection_scanner.l2 import Outcome
+
+    layers = verdict.layers if isinstance(verdict.layers, dict) else None
+    if not verdict.ok or layers is None or l2_outcome(verdict) is not Outcome.DEGRADED_QUOTA:
+        return None
+    return {
+        vendor
+        for vendor, reasons in _L2_QUOTA_REASONS.items()
+        if layers.get(vendor.value) in reasons
+    }
 
 
 class _InfraCondition(Enum):
@@ -2588,26 +2613,18 @@ def _scan_and_deliver(
     dst.unlink(missing_ok=True)
     from mcp_server.artifact_gate import gate_artifacts, rewrite_artifact_links
 
-    # Artifacts pass through the same scanner after the report. Track exact
-    # quota fallback across both surfaces so a report-body Lakera pass cannot
-    # hide degraded coverage on a saved screenshot. Only the boolean crosses
-    # this closure; no layer map or OCR/report bytes reach the response.
-    layers = verdict.layers if isinstance(verdict.layers, dict) else {}
-    quota_degraded = layers.get("lakera") in _LAKERA_QUOTA_ADVISORY_REASONS
+    # Artifacts pass through the same scanner after the report. Track quota
+    # fallback across both surfaces so a full-panel report scan cannot hide
+    # degraded coverage on a saved screenshot. Only enum members cross this
+    # closure; no layer map or OCR/report bytes reach the response.
+    degraded = _quota_degraded_vendors(verdict)
 
     def _scan_artifact_with_advisory(content: str):
-        nonlocal quota_degraded
+        nonlocal degraded
         artifact_verdict = _scan_text(content)
-        artifact_layers = (
-            artifact_verdict.layers
-            if isinstance(artifact_verdict.layers, dict)
-            else {}
-        )
-        if (
-            artifact_verdict.ok
-            and artifact_layers.get("lakera") in _LAKERA_QUOTA_ADVISORY_REASONS
-        ):
-            quota_degraded = True
+        artifact_degraded = _quota_degraded_vendors(artifact_verdict)
+        if artifact_degraded is not None:
+            degraded = (degraded or set()) | artifact_degraded
         return artifact_verdict
 
     t_art = time.monotonic()
@@ -2646,13 +2663,14 @@ def _scan_and_deliver(
     }
     # Name every output field and value. Never copy the Verdict or its layers:
     # future scanner fields, provider errors, and attacker-shaped report data
-    # must default to invisible at this boundary. `verdict.ok` plus either
-    # exact reason can only be produced by the pinned scanner after strict
-    # honeypot success and unanimous cross-family benign arbitration.
-    if quota_degraded:
+    # must default to invisible at this boundary. `verdict.ok` with a
+    # DEGRADED_QUOTA panel can only be produced by the pinned scanner after
+    # strict honeypot success and unanimous cross-family benign arbitration.
+    if degraded is not None:
         out[_SCANNER_ADVISORY_KEY] = {
-            "layer": "lakera",
+            "layer": "l2",
             "condition": "throttled",
+            "vendors": [v.value for v in _L2_QUOTA_REASONS if v in degraded],
             "fallback": "strict_honeypot_unanimous_judges",
             "action": "warn_user",
         }
