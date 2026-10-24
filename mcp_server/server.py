@@ -3,7 +3,8 @@ research-agent MCP server (host-side).
 
 Exposes one tool:
 
-    research(prompt: str) -> { status, report_path, error? }
+    research(prompt, depth, model?, inline_full?)
+        -> { status, report_path, report_chars, summary | report, error? }
 
 Flow per call:
   1. Host MCP server receives prompt.
@@ -218,6 +219,18 @@ _SCAN_TIMING_BUCKET_MS = 5000
 # benign-looking text would otherwise balloon the caller's context and
 # could hit MCP-transport truncation that strips the trailing wrap tag.
 _MAX_CONTENT_BYTES = 512 * 1024
+
+# Inline excerpt budgets, in characters of sanitized report text before
+# wrapping. On 1327 delivered reports (2026-10-24) the `## Summary` section
+# ran p50 1.4k / p90 2.2k / p99 3.1k chars, so the section cap keeps almost
+# every summary whole; a report without one gets a shorter lead. The summary
+# heading is only looked for inside the leading scan window, which also
+# bounds the Markdown parse (heading-dense input parses superlinearly).
+_SUMMARY_MAX_CHARS = 3000
+_LEAD_EXCERPT_CHARS = 1500
+_SUMMARY_SCAN_CHARS = 8000
+_SUMMARY_TITLES = frozenset({"summary", "tl;dr", "tldr", "executive summary"})
+_EXCERPT_CUT_MARKER = "\n\n[… excerpt ends; full report at report_path]"
 
 from mcp.server.fastmcp import FastMCP
 
@@ -1735,13 +1748,59 @@ def _wrap_content(report_id: str, sanitized: str) -> str:
     )
 
 
+def _clip(text: str, limit: int) -> str:
+    """`text` cut to at most `limit` chars, at a line break when one falls in
+    the second half of the budget, with a marker pointing at the full file."""
+    if len(text) <= limit:
+        return text
+    cut = text.rfind("\n", 0, limit)
+    if cut < limit // 2:
+        cut = limit
+    return text[:cut].rstrip() + _EXCERPT_CUT_MARKER
+
+
+def _report_summary(text: str) -> str:
+    """The leading summary of a sanitized report, for inline delivery.
+
+    With a `## Summary` / TL;DR section (the agent's report format puts one
+    right after the title) this is the preamble before the first section
+    plus that section, capped at _SUMMARY_MAX_CHARS. Otherwise it is the
+    report's first _LEAD_EXCERPT_CHARS. Always an excerpt of `text` (plus
+    the cut marker); the caller wraps it, so encoding runs on the cut text.
+    """
+    from markdown_it import MarkdownIt
+
+    # markdown-it normalises line endings before numbering lines; do the same
+    # so its line map indexes `lines`.
+    lead = text[:_SUMMARY_SCAN_CHARS].replace("\r\n", "\n").replace("\r", "\n")
+    lines = lead.split("\n")
+    tokens = MarkdownIt("commonmark").disable("inline").parse(lead)
+    heads = [  # (start line, level tag, normalised title) of every h1/h2
+        (tok.map[0], tok.tag, tokens[i + 1].content.strip().rstrip(":").strip().lower())
+        for i, tok in enumerate(tokens)
+        if tok.type == "heading_open" and tok.tag in ("h1", "h2") and tok.map
+    ]
+    for n, (start, _tag, title) in enumerate(heads):
+        if title not in _SUMMARY_TITLES:
+            continue
+        end = heads[n + 1][0] if n + 1 < len(heads) else len(lines)
+        first_h2 = next((s for s, tag, _ in heads if tag == "h2"), start)
+        excerpt = "\n".join(lines[: min(start, first_h2)] + lines[start:end]).strip()
+        if end == len(lines) and len(text) > _SUMMARY_SCAN_CHARS:
+            excerpt += _EXCERPT_CUT_MARKER  # section runs past the scan window
+        return _clip(excerpt, _SUMMARY_MAX_CHARS)
+    return _clip(text, _LEAD_EXCERPT_CHARS)
+
+
 mcp = FastMCP("research-agent")
 
 
 @mcp.tool()
 @_stamped
-def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
-    """Run a web-research task in the isolated agent and return the report path.
+def research(
+    prompt: str, depth: str = "normal", model: str = "", inline_full: bool = False
+) -> dict:
+    """Run a web-research task in the isolated agent; return its summary and path.
 
     Args:
         prompt: The research question or instructions for the agent.
@@ -1758,14 +1817,22 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
             model identity matters.
             Not valid with depth='fast' — the fast path is a direct Exa
             call with no agent, so no model runs at all.
+        inline_full: Return the whole report inline as `report` instead of
+            `summary`. Default False: reports run 2-10k tokens, so only
+            set it when you need every detail in this context anyway.
 
     Returns:
-        On success: {"status": "done", "report_path": str, "report": str,
-                     "timings_ms": {"agent": int, "scan": int, "total": int}}.
-            `report` is the wrapped sanitized report — already framed in
-            <untrusted_external_content>/<system-reminder> tags so the
-            caller can inline it directly. `report_path` points at the
-            same content on disk for retry / re-reading.
+        On success: {"status": "done", "report_path": str,
+                     "report_chars": int, "summary": str,
+                     "artifacts": {...}, "timings_ms": {...}}.
+            `summary` is the report's title plus its Summary section (or,
+            without one, its opening ~1500 chars), already framed in
+            <untrusted_external_content>/<system-reminder> tags. The full
+            report stays on disk at `report_path` (same framing,
+            `report_chars` long): read it with the Read tool when you need
+            the findings, sources or detail, or hand the path to a
+            subagent. With inline_full=True, `report` (the full file
+            content) replaces `summary`.
             When Lakera quota pressure forced the strict fallback, success
             also carries `scanner_advisory`: {"layer": "lakera",
             "condition": "throttled",
@@ -1973,7 +2040,8 @@ def research(prompt: str, depth: str = "normal", model: str = "") -> dict:
         report_path.unlink(missing_ok=True)
 
     return _scan_and_deliver(
-        content, report_id, prompt, agent_ms, t_received, t_scan_start
+        content, report_id, prompt, agent_ms, t_received, t_scan_start,
+        inline_full=inline_full,
     )
 
 
@@ -2412,6 +2480,7 @@ def _scan_and_deliver(
     t_received: float,
     t_scan_start: float,
     content_retries: int = 0,
+    inline_full: bool = False,
 ) -> dict:
     """Scan in-memory `content` and either deliver or quarantine.
 
@@ -2536,10 +2605,18 @@ def _scan_and_deliver(
     wrapped = _wrap_content(report_id, text)
     _atomic_write_excl(dst, wrapped)
     t_done = time.monotonic()
+    # Inline text is cut from the same sanitized `text` and framed by the
+    # same wrapper as the file; nothing reaches the caller unwrapped.
+    inline = (
+        {"report": wrapped}
+        if inline_full
+        else {"summary": _wrap_content(report_id, _report_summary(text))}
+    )
     out = {
         "status": "done",
         "report_path": str(dst),
-        "report": wrapped,
+        "report_chars": len(wrapped),
+        **inline,
         "artifacts": {"saved": saved, "quarantined": quarantined},
         "timings_ms": {
             "agent": agent_ms,
@@ -2565,7 +2642,7 @@ def _scan_and_deliver(
 
 @mcp.tool()
 @_stamped
-def retry_research(report_id: str) -> dict:
+def retry_research(report_id: str, inline_full: bool = False) -> dict:
     """Re-run the scanner on a previously quarantined report.
 
     Use when a prior `research(...)` call returned
@@ -2576,7 +2653,10 @@ def retry_research(report_id: str) -> dict:
     runs the exact same scan+deliver pipeline `research()` uses. If it
     still fails, it goes straight back to quarantine (with a fresh
     audit.jsonl entry) and the caller again sees only a generic error +
-    report_id. If it now passes, the wrapped report is delivered normally.
+    report_id. If it now passes, the report is delivered exactly like a
+    `research(...)` success: `report_path`, `report_chars` and a wrapped
+    `summary` by default — read `report_path` with the Read tool when you
+    need the detail — or the full wrapped `report` with inline_full=True.
 
     `report_id` is regex-gated to `[a-f0-9]{32}` to prevent path traversal
     — callers cannot point this at any file outside the quarantine dir.
@@ -2623,6 +2703,7 @@ def retry_research(report_id: str) -> dict:
     return _scan_and_deliver(
         content, report_id, f"retry:{report_id}", 0, t_received, t_scan_start,
         content_retries=content_retries,
+        inline_full=inline_full,
     )
 
 

@@ -8,6 +8,7 @@ dependencies = [
     "anthropic>=0.96.0",
     "curl-cffi>=0.7",
     "injection-scanner",
+    "markdown-it-py>=4.0.0",
     "mcp>=1.28.1",
     "openai>=2.32.0",
 ]
@@ -16,7 +17,7 @@ dependencies = [
 research-agent-mcp = "mcp_server.server:main"
 
 [tool.uv.sources]
-injection-scanner = { git = "https://github.com/jonathanmoregard/injection-scanner", rev = "ffd272a57d073ff6628bb440ee10d623df43d3ce" }
+injection-scanner = { git = "https://github.com/jonathanmoregard/injection-scanner", rev = "fdaadd90f468ff13807155f8a699ddd51f6f6125" }
 
 [build-system]
 requires = ["hatchling"]
