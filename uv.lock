@@ -339,9 +339,10 @@ wheels = [
 [[package]]
 name = "injection-scanner"
 version = "0.1.0"
-source = { git = "https://github.com/jonathanmoregard/injection-scanner?rev=fdaadd90f468ff13807155f8a699ddd51f6f6125#fdaadd90f468ff13807155f8a699ddd51f6f6125" }
+source = { git = "https://github.com/jonathanmoregard/injection-scanner?rev=d44e990770cbf5183ab1d81efea3d510d8155071#d44e990770cbf5183ab1d81efea3d510d8155071" }
 dependencies = [
     { name = "anthropic" },
+    { name = "cryptography" },
     { name = "openai" },
 ]
 
@@ -820,7 +821,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", specifier = ">=0.96.0" },
     { name = "curl-cffi", specifier = ">=0.7" },
-    { name = "injection-scanner", git = "https://github.com/jonathanmoregard/injection-scanner?rev=fdaadd90f468ff13807155f8a699ddd51f6f6125" },
+    { name = "injection-scanner", git = "https://github.com/jonathanmoregard/injection-scanner?rev=d44e990770cbf5183ab1d81efea3d510d8155071" },
     { name = "markdown-it-py", specifier = ">=4.0.0" },
     { name = "mcp", specifier = ">=1.28.1" },
     { name = "openai", specifier = ">=2.32.0" },
