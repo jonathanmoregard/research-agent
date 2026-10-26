@@ -6,14 +6,11 @@ in a network-isolated checkout where pytest is not installed.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 import tempfile
 import tomllib
 import unittest
 from unittest.mock import patch
-
-os.environ.setdefault("RESEARCH_AGENT_LOG", "/tmp/research-agent-test.log")
 
 from mcp_server import server
 
