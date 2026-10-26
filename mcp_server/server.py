@@ -3039,15 +3039,25 @@ def _run_boot_smoke_once() -> tuple[bool, str]:
     return True, ""
 
 
-def _smoke_and_publish() -> tuple[bool, str]:
+def _smoke_and_publish(seen_last_check: float | None = None) -> tuple[bool, str]:
     """Run the self-test under `_SCANNER_SMOKE_LOCK` and publish the verdict.
 
     Every path that runs a smoke goes through here. An unexpected exception
     (an unimportable or broken scanner package) is published as degraded,
     not raised: unavailable is refused exactly like regressed, and a gate
     call must never surface a traceback in place of a fail-closed refusal.
+
+    `seen_last_check` is the `last_check` the caller observed BEFORE it
+    queued for the lock. If it has moved by the time the lock is acquired, a
+    peer already checked while we waited, and we adopt that result instead of
+    running another smoke: readiness is offline but still waits on keyring
+    subprocesses and limiter locks, so a burst of gate calls must cost one
+    check, not one per caller. Compared by value, not elapsed time, so it
+    does not depend on where `time.monotonic()` starts.
     """
     with _SCANNER_SMOKE_LOCK:
+        if seen_last_check is not None and _SCANNER_HEALTH["last_check"] != seen_last_check:
+            return _SCANNER_HEALTH["ok"], _SCANNER_HEALTH["reason"]
         try:
             ok, reason = _run_boot_smoke_once()
         except Exception as e:  # unavailable == degraded; never raised at a caller
@@ -3116,8 +3126,9 @@ def _scanner_health_gate() -> tuple[bool, str]:
     # the re-check would never fire again. Note the direction of that failure
     # is still closed (we fall through to the refusal below), so the clamp
     # buys self-healing, not safety.
-    if time.monotonic() - _SCANNER_HEALTH["last_check"] >= _SCANNER_RECHECK_SECS:
-        ok, reason = _smoke_and_publish()
+    seen = _SCANNER_HEALTH["last_check"]
+    if time.monotonic() - seen >= _SCANNER_RECHECK_SECS:
+        ok, reason = _smoke_and_publish(seen_last_check=seen)
         if ok:
             _LOG.info("scanner recovered — resuming normal service")
             return True, ""

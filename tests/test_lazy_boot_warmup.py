@@ -224,9 +224,10 @@ def test_warmup_and_gate_never_smoke_concurrently(monkeypatch):
     assert results == [(True, "")]
 
 
-def test_two_concurrent_gate_rechecks_never_overlap(monkeypatch):
+def test_two_concurrent_gate_rechecks_smoke_once(monkeypatch):
     """Two research() calls arriving together past the recheck throttle are
-    serialised, so the last check to finish is the last one published."""
+    serialised, and the one that queued behind a peer's check adopts that
+    result instead of running a second smoke."""
     server._SCANNER_WARMUP_DONE.set()
     server._SCANNER_HEALTH.update(
         ok=False, reason="degraded", last_check=_stale_last_check()
@@ -248,6 +249,41 @@ def test_two_concurrent_gate_rechecks_never_overlap(monkeypatch):
 
     assert probe.overlapped is False
     assert results == [(True, ""), (True, "")]
+    assert probe.runs == 1
+
+
+def test_a_burst_of_degraded_rechecks_smokes_once_and_shares_the_failure(monkeypatch):
+    """A failing check is shared the same way: a burst of callers that all saw
+    the same stale `last_check` costs one smoke, not one per caller (readiness
+    still waits on keyring subprocesses and limiter locks)."""
+    server._SCANNER_WARMUP_DONE.set()
+    server._SCANNER_HEALTH.update(
+        ok=False, reason="degraded", last_check=_stale_last_check()
+    )
+    runs = []
+    gate_open = threading.Event()
+
+    def failing_smoke():
+        gate_open.wait(5)
+        runs.append(1)
+        return False, "lakera_unavailable:no-key"
+
+    monkeypatch.setattr(server, "_run_boot_smoke_once", failing_smoke)
+    results = []
+    threads = [
+        threading.Thread(
+            target=lambda: results.append(server._scanner_health_gate()), daemon=True
+        )
+        for _ in range(12)
+    ]
+    for t in threads:
+        t.start()
+    gate_open.set()
+    for t in threads:
+        t.join(20)
+
+    assert len(runs) == 1
+    assert results == [(False, "lakera_unavailable:no-key")] * 12
 
 
 # --- (f) main() binds stdio immediately --------------------------------------
