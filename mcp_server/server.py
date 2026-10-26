@@ -2787,163 +2787,6 @@ def _claim_quarantined(quarantine: Path, src: Path, report_id: str):
     return content, content_retries
 
 
-_SCANNER_REPO = "https://github.com/jonathanmoregard/injection-scanner.git"
-_SCANNER_BRANCH = "main"
-_SCANNER_SHA_CACHE = Path.home() / ".cache" / "research-agent" / "scanner-sha"
-_SCANNER_INSTALL_LOCK = Path.home() / ".cache" / "research-agent" / "scanner-install.lock"
-
-
-def _configured_scanner_sha() -> str | None:
-    """Return an immutable SHA requested by the installed distribution.
-
-    `uv sync` records the lockfile's requested Git revision and resolved
-    commit in PEP 610 `direct_url.json`. Trust it only when both are the same
-    full hexadecimal SHA. A branch such as `main`, a short SHA, malformed
-    metadata, or disagreement between request and installed commit returns
-    `None` and leaves the legacy remote-main updater in charge.
-    """
-    try:
-        from importlib import metadata
-
-        dist = metadata.distribution("injection-scanner")
-        relative = next(
-            path
-            for path in (dist.files or ())
-            if str(path).endswith(".dist-info/direct_url.json")
-        )
-        obj = json.loads(dist.locate_file(relative).read_text(encoding="utf-8"))
-        vcs = obj["vcs_info"]
-        revision = vcs["requested_revision"]
-        commit = vcs["commit_id"]
-        if not isinstance(revision, str) or not isinstance(commit, str):
-            return None
-        revision = revision.lower()
-        commit = commit.lower()
-        if (
-            len(revision) != 40
-            or any(char not in "0123456789abcdef" for char in revision)
-            or commit != revision
-        ):
-            return None
-        return revision
-    except Exception:  # noqa: BLE001 — metadata absence means use legacy path
-        return None
-
-
-def _resolve_scanner_remote_sha(log) -> str | None:
-    """Return origin/main SHA via `git ls-remote`. None on offline or
-    network failure — caller treats that as "skip update, keep installed
-    version". Times out at 5s so an offline boot doesn't hang the MCP
-    spawn forever."""
-    import subprocess
-    try:
-        r = subprocess.run(
-            ["git", "ls-remote", _SCANNER_REPO, _SCANNER_BRANCH],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log.warning("scanner update: ls-remote unavailable (%s) — keeping installed version", e)
-        return None
-    if r.returncode != 0:
-        log.warning("scanner update: ls-remote returned %d — keeping installed version", r.returncode)
-        return None
-    sha = r.stdout.split(maxsplit=1)[0] if r.stdout else ""
-    if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha.lower()):
-        log.warning("scanner update: ls-remote produced unparseable SHA %r — keeping installed version", sha[:20])
-        return None
-    return sha
-
-
-def _resolve_scanner_target_sha(log) -> str | None:
-    """Resolve the configured immutable revision, else current remote main.
-
-    The project lock is authoritative. Without this guard, the boot updater
-    can overwrite an intentionally pinned scanner with an older `main` after
-    a fresh cache or any unrelated main-branch movement.
-    """
-    return _configured_scanner_sha() or _resolve_scanner_remote_sha(log)
-
-
-def _maybe_update_scanner() -> None:
-    """Refresh injection-scanner to the project-configured target SHA.
-
-    An immutable revision installed from the lockfile wins. Mutable installs
-    retain the legacy origin/main lookup. The steady state is one metadata or
-    ls-remote check plus a SHA-file read; a bump is bounded by the uv install
-    timeout.
-
-    Concurrency: 4+ research-agent processes can spawn from parallel
-    Claude Code tool calls. We hold a flock around the install so two
-    concurrent --force-reinstall calls can't corrupt site-packages.
-
-    Offline / network-failed: degrades to "keep installed version, log
-    a warning". The MCP server still boots — we don't want a research
-    call to fail because GitHub is down for 30 seconds. _boot_smoke
-    runs after this, so a stale scanner still has to pass the canary
-    set before the server binds.
-    """
-    import fcntl
-    import logging
-    import subprocess
-
-    log = logging.getLogger("research-agent.boot")
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
-
-    t_remote = time.monotonic()
-    remote_sha = _resolve_scanner_target_sha(log)
-    _LOG.info(
-        "boot scanner-resolve took_ms=%d resolved=%s",
-        int((time.monotonic() - t_remote) * 1000), remote_sha or "none",
-    )
-    if remote_sha is None:
-        return
-
-    try:
-        cached = _SCANNER_SHA_CACHE.read_text(encoding="ascii").strip()
-    except FileNotFoundError:
-        cached = ""
-
-    if cached == remote_sha:
-        return  # steady state — fast path
-
-    _SCANNER_INSTALL_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    with _SCANNER_INSTALL_LOCK.open("w") as lf:
-        # Block until any concurrent installer finishes. After we
-        # acquire, re-read the cache — the other process may have
-        # already installed the same SHA, and we should skip.
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            cached = _SCANNER_SHA_CACHE.read_text(encoding="ascii").strip()
-        except FileNotFoundError:
-            cached = ""
-        if cached == remote_sha:
-            return  # peer installed; nothing more to do
-
-        log.info("scanner update: bumping from %s to %s", cached or "<none>", remote_sha)
-        # Force-reinstall pinned to the resolved SHA so we install
-        # exactly what we measured — not a re-resolved tip that may
-        # have moved between ls-remote and install.
-        spec = f"injection-scanner @ git+{_SCANNER_REPO}@{remote_sha}"
-        venv_python = Path(sys.executable)
-        r = subprocess.run(
-            ["uv", "pip", "install", "--python", str(venv_python),
-             "--no-cache", "--quiet", "--upgrade", "--force-reinstall", spec],
-            capture_output=True, text=True, timeout=120,
-        )
-        if r.returncode != 0:
-            log.error(
-                "scanner update: install failed (rc=%d) — keeping installed version. stderr=%s",
-                r.returncode, r.stderr.strip()[:500],
-            )
-            return
-        _SCANNER_SHA_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _SCANNER_SHA_CACHE.with_suffix(".tmp")
-        tmp.write_text(remote_sha, encoding="ascii")
-        tmp.replace(_SCANNER_SHA_CACHE)
-        log.info("scanner update: installed %s", remote_sha)
-
-
 # Scanner health gate. A failed self-test used to `SystemExit(2)` before
 # mcp.run() bound stdio — which forced the operator to RECONNECT the MCP
 # after any transient scanner hiccup (a cold key read, a momentary
@@ -2962,8 +2805,8 @@ def _maybe_update_scanner() -> None:
 # at the first real scan instead, fail-closed and agent-readable.
 #
 # The warmup that establishes health runs on a background thread instead
-# of before mcp.run() (see `_scanner_warmup` / `main`), because the scanner
-# self-update before it does network I/O. It RACES the first tool call, so
+# of before mcp.run() (see `_scanner_warmup` / `main`), so the handshake
+# never waits on it. It RACES the first tool call, so
 # health starts DEGRADED, not healthy: fail-closed from t=0, and only a
 # passing smoke flips it. Initialising it healthy would open exactly the
 # window this design exists to close — a research() arriving before the
@@ -2998,15 +2841,13 @@ _SCANNER_WARMUP_DONE = threading.Event()
 _SCANNER_SMOKE_LOCK = threading.Lock()
 
 # How long a research() call arriving mid-warmup blocks for the verdict before
-# refusing. The steady-state warmup is one scanner-version lookup plus the
-# offline smoke, well inside this; the tail that exceeds it is the
-# scanner-reinstall path, where refusing with "warming up" beats holding the
-# call open for a 120 s `uv pip install`.
+# refusing. The warmup is the offline smoke, well inside this; the tail that
+# exceeds it is a stuck keyring lookup or limiter lock, where refusing with
+# "warming up" beats holding the call open.
 #
 # lo=0 s is deliberate: "never wait, refuse immediately" is a coherent and
-# still fail-closed operator choice. hi=300 s is the warmup's own worst case
-# (the 120 s `uv pip install` cap at _maybe_update_scanner, with slack) —
-# waiting longer than the warmup can possibly take cannot change the answer,
+# still fail-closed operator choice. hi=300 s caps a typo'd value — waiting
+# minutes for a smoke that should take seconds cannot change the answer,
 # it only holds the tool call open.
 _SCANNER_WARMUP_WAIT_SECS = _read_secs(
     os.environ.get("RESEARCH_SCANNER_WARMUP_WAIT_SECS"),
@@ -3098,8 +2939,7 @@ def _scanner_health_gate() -> tuple[bool, str]:
     A call arriving during warmup BLOCKS for the verdict (bounded by
     `_SCANNER_WARMUP_WAIT_SECS`) rather than refusing at once or running its
     own check: `last_check` is 0.0 at import, so without the wait the first
-    gate call would re-check before the warmup's scanner update had landed
-    and test the old scanner.
+    gate call would run a second smoke alongside the warmup's.
 
     Fail-closed is preserved in every branch: if the wait expires with the
     warmup still running we refuse with "warming up" rather than proceed,
@@ -3113,7 +2953,7 @@ def _scanner_health_gate() -> tuple[bool, str]:
         if _SCANNER_HEALTH["ok"]:
             return True, ""
         if not _SCANNER_WARMUP_DONE.is_set():
-            # Still warming past the budget — a scanner reinstall, say.
+            # Still warming past the budget — a stuck keyring lookup, say.
             # Refuse with a clear reason instead of holding the call open.
             _LOG.warning(
                 "scanner still warming after %.0fs — refusing fail-closed",
@@ -3139,27 +2979,25 @@ def _scanner_health_gate() -> tuple[bool, str]:
 def _scanner_warmup() -> None:
     """Boot work moved off the MCP pre-handshake path.
 
-    `_maybe_update_scanner()` (a `git ls-remote`, and on a bump a 120 s
-    `uv pip install`) used to run before `mcp.run()` bound stdio. The client
+    Boot work used to run before `mcp.run()` bound stdio. The client
     enforces a hard 30 s startup deadline, and boot round-trips were burning
     p90 16 s of it — 3.3% of spawns died on CONNECT_TIMEOUT (measured
     2026-09-05, 3708 spawns).
 
     Running it here instead means the handshake completes immediately and
-    the scanner is updated and verified concurrently. `_SCANNER_HEALTH`
-    starts degraded so nothing is served while this is in flight.
+    the scanner is verified concurrently. `_SCANNER_HEALTH` starts degraded
+    so nothing is served while this is in flight.
+
+    The scanner version is whatever `uv.lock` pins: the Nix wrapper launches
+    via `uv run --project`, which syncs the venv to the lock before this
+    process starts. There is no boot-time scanner update.
 
     Never raises: this is a daemon thread with no one to catch for it, and a
     thread that dies before setting `_SCANNER_WARMUP_DONE` would strand every
-    gate call on the full wait. The update is best-effort (a stale scanner
-    still has to pass the smoke below); a smoke that blows up is published as
+    gate call on the full wait. A smoke that blows up is published as
     degraded by `_smoke_and_publish`.
     """
     try:
-        try:
-            _maybe_update_scanner()
-        except Exception:  # best-effort; the smoke below is the real gate
-            _LOG.exception("scanner update failed — continuing with installed version")
         _boot_smoke()
     finally:
         _SCANNER_WARMUP_DONE.set()
@@ -3201,7 +3039,7 @@ def main() -> None:
 
     Nothing that touches the network may run before `mcp.run()` — stdio
     only binds there, and the client gives the whole startup 30 s. The
-    scanner update and self-test go to a daemon thread (`_scanner_warmup`)
+    scanner self-test goes to a daemon thread (`_scanner_warmup`)
     that runs alongside the bound server; `_log_credentials_state` stays
     because it is a local `os.stat`. Fail-closed is unaffected:
     `_SCANNER_HEALTH` starts degraded, so the server is connected but
