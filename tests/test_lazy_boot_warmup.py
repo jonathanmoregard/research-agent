@@ -2,7 +2,7 @@
 
 `main()` must reach `mcp.run()` without waiting on any network I/O — the
 client enforces a hard 30 s startup deadline and the old boot path
-(`_maybe_update_scanner` + `_boot_smoke`) spent p90 ~10 s / max ~22 s of it
+(scanner update + `_boot_smoke`) spent p90 ~10 s / max ~22 s of it
 before stdio was ever bound.
 
 Because warmup now races the first tool call, the fail-closed guarantee has
@@ -122,34 +122,20 @@ def test_gate_waits_for_a_warmup_that_lands_mid_call(monkeypatch):
 def test_passing_warmup_flips_health_to_ok(monkeypatch):
     _pre_warmup()
     calls = []
-    monkeypatch.setattr(server, "_maybe_update_scanner", lambda: calls.append("update"))
     monkeypatch.setattr(
         server, "_run_boot_smoke_once", lambda: (calls.append("smoke"), (True, ""))[1]
     )
 
     server._scanner_warmup()
 
-    assert calls == ["update", "smoke"], "update must precede the smoke it validates"
+    assert calls == ["smoke"]
     assert server._SCANNER_HEALTH["ok"] is True
     assert server._SCANNER_WARMUP_DONE.is_set()
-
-
-def test_warmup_sets_the_done_event_even_when_the_update_raises(monkeypatch):
-    """A crashing updater must not strand every later gate call on the wait."""
-    _pre_warmup()
-    monkeypatch.setattr(server, "_maybe_update_scanner", _boom)
-    monkeypatch.setattr(server, "_run_boot_smoke_once", lambda: (True, ""))
-
-    server._scanner_warmup()
-
-    assert server._SCANNER_WARMUP_DONE.is_set()
-    assert server._SCANNER_HEALTH["ok"] is True
 
 
 def test_warmup_stays_degraded_when_the_smoke_import_raises(monkeypatch):
     """An unimportable scanner is an unavailable scanner: fail closed."""
     _pre_warmup()
-    monkeypatch.setattr(server, "_maybe_update_scanner", lambda: None)
     monkeypatch.setattr(server, "_run_boot_smoke_once", _boom)
 
     server._scanner_warmup()
@@ -163,7 +149,6 @@ def test_warmup_stays_degraded_when_the_smoke_import_raises(monkeypatch):
 
 def test_failing_warmup_leaves_research_refused(monkeypatch):
     _pre_warmup()
-    monkeypatch.setattr(server, "_maybe_update_scanner", lambda: None)
     monkeypatch.setattr(
         server, "_run_boot_smoke_once", lambda: (False, "lakera_unavailable:no-key")
     )
@@ -205,7 +190,6 @@ class _OverlapProbe:
 def test_warmup_and_gate_never_smoke_concurrently(monkeypatch):
     _pre_warmup()
     probe = _OverlapProbe()
-    monkeypatch.setattr(server, "_maybe_update_scanner", lambda: None)
     monkeypatch.setattr(server, "_run_boot_smoke_once", probe)
     monkeypatch.setattr(server, "_SCANNER_WARMUP_WAIT_SECS", 10.0)
 
@@ -302,7 +286,6 @@ def _main_with_blocked_warmup(monkeypatch):
     monkeypatch.setattr(server, "_scanner_warmup", _blocking_warmup)
     monkeypatch.setattr(server, "_log_credentials_state", lambda: None)
     # Nothing that touches the network may run on main()'s own thread.
-    monkeypatch.setattr(server, "_maybe_update_scanner", _boom)
     monkeypatch.setattr(server, "_boot_smoke", _boom)
     monkeypatch.setattr(server.mcp, "run", lambda: ran.set())
 
