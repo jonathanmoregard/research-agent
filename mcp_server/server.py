@@ -32,7 +32,6 @@ state isolation is enforced by bubblewrap, not by VM restart.
 from __future__ import annotations
 
 import contextlib
-import contextvars
 import errno
 import fcntl
 import json
@@ -185,50 +184,6 @@ def _stamped(fn):
         return out
 
     return wrapper
-
-
-# Scraper holds (artifact_gate.hold_run) opened by the current research()
-# call; _releases_run_holds closes them on every exit path.
-_RUN_HOLDS: contextvars.ContextVar[list | None] = contextvars.ContextVar(
-    "research_run_holds", default=None)
-
-
-def _releases_run_holds(fn):
-    """Close every scraper hold the wrapped call opened, however it exits.
-
-    research() returns from a dozen places after the agent ran; the hold
-    must end at each, because a held run's artifacts keep the scraper roll
-    waiting (§12.3). A dying process needs nothing: the kernel closes it.
-    """
-    import functools
-
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        token = _RUN_HOLDS.set([])
-        try:
-            return fn(*args, **kwargs)
-        finally:
-            for sock in _RUN_HOLDS.get() or []:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-            _RUN_HOLDS.reset(token)
-
-    return wrapper
-
-
-def _hold_run(run_id: str) -> None:
-    from mcp_server.artifact_gate import hold_run
-
-    holds = _RUN_HOLDS.get()
-    sock = hold_run(run_id)
-    if sock is None:
-        return
-    if holds is None:  # not under _releases_run_holds: never leak a hold
-        sock.close()
-        return
-    holds.append(sock)
 
 
 def _staleness() -> dict | None:
@@ -2110,7 +2065,6 @@ mcp = FastMCP("research-agent")
 
 @mcp.tool()
 @_stamped
-@_releases_run_holds
 def research(
     prompt: str, depth: str = "normal", model: str = "", inline_full: bool = False
 ) -> dict:
@@ -2236,10 +2190,6 @@ def research(
     else:
         # normal / deep — agent in bwrap jail. Serialized across processes
         # by _vm_lock: the single microvm OOMs if two agents run at once.
-        # Held before the agent can save a screenshot, released when this
-        # call returns: until then the scraper must not roll away its
-        # artifacts (§12.3).
-        _hold_run(report_id)
         report_path.touch()
         try:
             with _vm_lock(_VM_LOCK_WAIT_SECS):

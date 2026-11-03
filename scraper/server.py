@@ -8,21 +8,13 @@ POST /render
             "title", "html"}
           or {"status": "error", "error": "<short reason>"}
 
-POST /artifacts/<run_id>/hold
-    auth: Bearer. The run's collector (the MCP's research() call) opens
-    this when the run starts and keeps the connection open, unread, for
-    its whole life; replies 200 at once, then waits for EOF. When the
-    call returns or its process dies, the kernel closes the socket and
-    the run's un-pulled artifacts are discarded as orphans.
-
 GET /health → {"status": "ok", "code", "code_on_disk", "stale",
                "open_sessions", "pending_artifacts"}
     Unauthenticated. The drained roll (docs/egress-broker.md §12.3) reads
     it: `code` is the digest of the scraper code this process loaded,
     `code_on_disk` the same digest over the share now, `stale` their
     difference (the scraper checks its own code; root never hashes). It
-    restarts only at 0 open sessions and 0 artifacts a live run could
-    still pull (orphans of an ended hold do not count).
+    restarts only at 0 open sessions and 0 un-pulled artifacts.
 
 Per-request isolation: each call launches a fresh chromium process via
 Playwright and tears it down. No shared browser, no shared context. A
@@ -39,7 +31,6 @@ import json
 import os
 import re
 import sys
-import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -161,11 +152,6 @@ _SESSION_PATH = re.compile(
     r"^/session/([a-f0-9]{16})/(act|screenshot|save_artifact|close)$"
 )
 _ARTIFACTS_PATH = re.compile(r"^/artifacts/([a-f0-9]{32})$")
-_HOLD_PATH = re.compile(r"^/artifacts/([a-f0-9]{32})/hold$")
-# Bounds the threads a bearer holder can park on holds (one per research()
-# call in flight; the host runs a handful of slots).
-MAX_HOLDS = 64
-_holds = threading.BoundedSemaphore(MAX_HOLDS)
 
 
 def _load_token() -> str:
@@ -649,35 +635,7 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             self._do_session_op(m.group(1), m.group(2))
             return
-        m = _HOLD_PATH.match(self.path)
-        if m:
-            self._do_hold(m.group(1))
-            return
         self._json(404, {"status": "error", "error": "not found"})
-
-    def _do_hold(self, run_id: str) -> None:
-        if not self._check_auth():
-            return
-        if not _holds.acquire(blocking=False):
-            self._json(503, {"status": "error", "error": "too many holds"})
-            return
-        store = get_artifact_store()  # never the worker
-        store.hold(run_id)
-        try:
-            self._json(200, {"status": "ok", "holding": run_id})
-            self.wfile.flush()
-            # The read timeout bounds slow REQUESTS; a hold is meant to idle.
-            self.connection.settimeout(None)
-            while self.rfile.read(1):  # until EOF: call returned or process died
-                pass
-        except OSError:
-            pass
-        finally:
-            dropped = store.release(run_id)
-            _holds.release()
-            if dropped:
-                sys.stderr.write(f"[scraper] run {run_id} ended; dropped {dropped} "
-                                 "orphaned artifact(s)\n")
 
     def _submit(self, cmd: dict, timeout_s: float = 120.0) -> None:
         """Submit to the browser worker; normalize errors like /render does.
