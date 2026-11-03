@@ -88,6 +88,29 @@ while j < len(argv) and argv[j] != "--":
         jail_env.pop(argv[j + 1], None)
         j += 1
     j += 1
+# `--file FD DEST` materialises FD's content as DEST inside the sandbox;
+# `--perms MODE` applies to the next such operation.
+files, perms, k = {}, None, 0
+while k < len(argv) and argv[k] != "--":
+    if argv[k] == "--perms":
+        perms = argv[k + 1]
+        k += 2
+        continue
+    if argv[k] == "--file":
+        fd = int(argv[k + 1])
+        chunks = []
+        while True:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            chunks.append(b)
+        files[argv[k + 2]] = {"content": b"".join(chunks).decode(), "perms": perms}
+        perms = None
+        k += 3
+        continue
+    if argv[k] in ("--bind-data", "--ro-bind-data"):
+        perms = None
+    k += 1
 hits = []
 for src, dst in binds:
     # System trees (/nix/store, /etc, ...) are not per-call; per-call
@@ -103,7 +126,7 @@ for src, dst in binds:
             continue
         hits += [(dst, k) for k, v in canaries.items() if v in data]
 json.dump({"argv": argv, "binds": binds, "hits": hits, "scratch": scratch,
-           "jail_env": jail_env},
+           "jail_env": jail_env, "files": files},
           open(os.environ["BWRAP_LOG"], "w"))
 if scratch:
     open(os.path.join(scratch, os.environ["REPORT_NAME"]), "w").write("# report\nok\n")
@@ -258,26 +281,56 @@ def test_optional_keys_default_to_empty_in_jail_env(jail):
 
 BROKER_TOKEN = "CANARY-BROKER-TOKEN"
 BROKER = {"RESEARCH_GUEST_PROTOCOL": "broker-v1", "RESEARCH_BROKER_TOKEN": BROKER_TOKEN}
-# §8.1: the exact names a broker-mode jail may carry.
-ALLOWED = {"HOME", "PATH", "LANG", "RESEARCH_SCRATCH_PATH", "RESEARCH_RUN_ID",
-           "RESEARCH_BROKER_URL", "RESEARCH_BROKER_TOKEN",
-           "CLAUDE_STREAM_IDLE_TIMEOUT_MS", "PRV_CACHE_DIR", "BOLAGSVERKET_CACHE_DIR"}
+SECRETS_PATH = "/run/agent-secrets"
+# §8.1 channel 1: the non-secret names, set explicitly.
+CHANNEL_1 = {"HOME", "PATH", "LANG", "RESEARCH_SCRATCH_PATH", "RESEARCH_RUN_ID",
+             "RESEARCH_BROKER_URL", "CLAUDE_STREAM_IDLE_TIMEOUT_MS", "PRV_CACHE_DIR"} | (
+    {"BOLAGSVERKET_CACHE_DIR"} if os.path.isdir("/tool-cache") else set())
+
+
+def _pre(rec):
+    return rec["argv"][:rec["argv"].index("--")]
+
+
+def _setenv_names(rec):
+    pre = _pre(rec)
+    return [pre[i + 1] for i, a in enumerate(pre) if a == "--setenv"]
 
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])
-def test_broker_jail_env_is_exactly_the_allowlist(jail, provider):
-    """Keys exported anywhere upstream (here: all 8, as if a stale wrapper
-    still set them) must not reach a broker-mode jail."""
+def test_broker_jail_env_is_default_deny(jail, provider):
+    """--clearenv, then exactly channel 1 by --setenv; no --unsetenv
+    denylist, which would let a variable exported upstream tomorrow through.
+    Here all 8 keys are exported upstream, as by a stale wrapper."""
     p, rec, _ = jail(provider=provider, extra=BROKER)
     assert p.returncode == 0, p.stderr
+    pre = _pre(rec)
+    assert "--clearenv" in pre
+    assert "--unsetenv" not in pre
+    # --clearenv first: nothing set before it survives.
+    assert pre.index("--clearenv") < pre.index("--setenv")
+    names = _setenv_names(rec)
+    expected = CHANNEL_1 | ({"CODEX_HOME"} if provider == "codex" else set())
+    assert sorted(names) == sorted(expected)
     env = rec["jail_env"]
-    allowed = ALLOWED | ({"CLAUDE_CODE_OAUTH_TOKEN"} if provider == "claude" else {"CODEX_HOME"})
-    assert set(env) <= allowed, f"not on the allowlist: {sorted(set(env) - allowed)}"
-    assert env["RESEARCH_BROKER_TOKEN"] == BROKER_TOKEN
+    assert set(env) == expected
     assert env["RESEARCH_BROKER_URL"] == "http://10.0.2.2:8124"
-    assert not set(CANARIES) & set(env)
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_broker_secrets_reach_the_jail_only_through_the_secrets_file(jail, provider):
+    """§8.1 channel 2: `bwrap --file <fd> /run/agent-secrets`, 0600."""
+    p, rec, _ = jail(provider=provider, extra=BROKER)
+    assert p.returncode == 0, p.stderr
+    f = rec["files"][SECRETS_PATH]
+    assert f["perms"] == "0600"
+    lines = sorted(f["content"].splitlines())
+    want = [f"RESEARCH_BROKER_TOKEN={BROKER_TOKEN}"]
     if provider == "claude":
-        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "CANARY-CLAUDE-TOKEN"
+        want.append("CLAUDE_CODE_OAUTH_TOKEN=CANARY-CLAUDE-TOKEN")
+    assert lines == sorted(want)
+    assert not any(v in f["content"] for v in CANARIES.values())
+    assert "CANARY-CODEX-AUTH" not in f["content"]
 
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])
@@ -287,6 +340,37 @@ def test_broker_jail_keeps_secrets_out_of_argv(jail, provider):
     values = [BROKER_TOKEN, "CANARY-CLAUDE-TOKEN", "CANARY-CODEX-AUTH", *CANARIES.values()]
     leaked = sorted({v for v in values for a in rec["argv"] if v in a})
     assert leaked == [], f"credential values in bwrap argv: {leaked}"
+
+
+def test_broker_entry_point_exports_the_secrets_and_execs_the_cli(jail, tmp_path):
+    """Run the real entry-point script (bash) against the secrets file the
+    script produced — with a token that would break naive quoting."""
+    nasty = "tok'en \"$(touch PWNED)\" ;`id` $HOME\\n end"
+    p, rec, _ = jail(extra=dict(BROKER, RESEARCH_BROKER_TOKEN=nasty))
+    assert p.returncode == 0, p.stderr
+    agent = _agent_argv(rec)
+    assert agent[:2] == ["/run/current-system/sw/bin/bash", "-c"]
+    script, cli = agent[2], agent[4:]
+    assert cli[:2] == ["claude", "-p"]
+    secrets = tmp_path / "agent-secrets"
+    secrets.write_text(rec["files"][SECRETS_PATH]["content"])
+    out = subprocess.run(
+        ["bash", "-c", script.replace(SECRETS_PATH, str(secrets)), "agent-entry",
+         "bash", "-c", 'printf "%s\\0%s" "$RESEARCH_BROKER_TOKEN" "$CLAUDE_CODE_OAUTH_TOKEN"'],
+        capture_output=True, text=True, cwd=tmp_path, env={"PATH": os.environ["PATH"]},
+        timeout=30)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split("\0") == [nasty, "CANARY-CLAUDE-TOKEN"]
+    assert not (tmp_path / "PWNED").exists()
+
+
+def test_broker_entry_point_refuses_without_the_secrets_file(jail, tmp_path):
+    _, rec, _ = jail(extra=BROKER)
+    script = _agent_argv(rec)[2]
+    out = subprocess.run(
+        ["bash", "-c", script.replace(SECRETS_PATH, str(tmp_path / "missing")),
+         "agent-entry", "true"], capture_output=True, text=True, timeout=30)
+    assert out.returncode != 0
 
 
 def test_broker_protocol_without_token_exits_11(jail):
@@ -299,9 +383,11 @@ def test_legacy_jail_has_no_env_scrub(jail):
     """No version field → today's jail: keys inherited, no env flags added."""
     p, rec, _ = jail()
     assert p.returncode == 0, p.stderr
-    pre = rec["argv"][:rec["argv"].index("--")]
+    pre = _pre(rec)
     assert "--unsetenv" not in pre and "--clearenv" not in pre
+    assert rec["files"] == {}
     assert "RESEARCH_BROKER_URL" not in rec["jail_env"]
+    assert _agent_argv(rec)[:2] == ["claude", "-p"]
 
 
 @pytest.mark.parametrize("extra,line", [

@@ -383,40 +383,51 @@ publish_report() {
   fi
 }
 
-# Credentials reach the jail by environment INHERITANCE, never as argv.
-# bwrap runs without --clearenv, so the jailed command starts with this
-# script's environment plus the --setenv entries below. A value in argv
-# (`--setenv KEY value`) is world-readable in /proc/<pid>/cmdline (`ps aux`)
-# for the whole call, and systemd-run makes the scope's description out of
-# it; agent sessions that ran `ps aux` captured live keys that way.
-# /proc/<pid>/environ, by contrast, is readable only with ptrace rights over
-# the process. Keep every secret off the bwrap and systemd-run command
-# lines, here and in any future --setenv.
+# Credentials never travel as argv. A value in argv (`--setenv KEY value`)
+# is world-readable in /proc/<pid>/cmdline (`ps aux`) for the whole call, and
+# systemd-run makes the scope's description out of it; agent sessions that
+# ran `ps aux` captured live keys that way. Keep every secret off the bwrap
+# and systemd-run command lines, here and in any future --setenv.
 #
+# broker-v1 (§8.1): default-deny. `--clearenv`, then two channels:
+#   1. non-secret names by explicit `--setenv` (here, and HOME/PATH/... in
+#      the bwrap call below; CODEX_HOME in CODEX_BIND_ARGS);
+#   2. secret values — the run token, and CLAUDE_CODE_OAUTH_TOKEN on the
+#      claude path — as `NAME=value` lines written into a pipe that bwrap
+#      materialises as /run/agent-secrets (0600) INSIDE the sandbox. The
+#      jail's entry point sources it and execs the CLI, so a secret is in no
+#      argv and on no host-visible path.
+# Nothing is inherited, so a variable exported upstream tomorrow stays out
+# of the jail unless someone names it here. Never filter with --unsetenv.
 #
-# broker-v1: the jail env is an explicit allowlist (§8.1). Every name this
-# shell exports that is not a kept secret gets `--unsetenv NAME` (a name, not
-# a value), and the non-secret allowlist entries are `--setenv`; the two
-# secrets — the run token and, on the claude path, CLAUDE_CODE_OAUTH_TOKEN —
-# are the only inherited values. This is `--clearenv` without putting either
-# secret on the command line: `--clearenv` would drop inherited values, so
-# the secrets would have to travel as `--setenv` argv. No third-party key
-# reaches a broker-mode jail even if one is exported upstream.
+# Legacy: credentials reach the jail by environment INHERITANCE (bwrap runs
+# without --clearenv; the jailed command starts with this script's
+# environment plus the --setenv entries below). /proc/<pid>/environ is
+# readable only with ptrace rights over the process.
 ENV_ARGS=()
+SECRET_ARGS=()
+ENTRY_ARGV=()
 if [[ "${GUEST_PROTOCOL}" == "broker-v1" ]]; then
-  unset EXA_API_KEY TAVILY_API_KEY EUIPO_CLIENT_ID EUIPO_CLIENT_SECRET \
-    EBAY_CLIENT_ID EBAY_CLIENT_SECRET TRADERA_APP_ID TRADERA_APP_KEY
-  KEEP_ENV=" RESEARCH_BROKER_TOKEN "
-  [[ "${PROVIDER}" == "claude" ]] && KEEP_ENV+="CLAUDE_CODE_OAUTH_TOKEN "
-  mapfile -t EXPORTED < <(compgen -e)
-  for name in "${EXPORTED[@]}"; do
-    [[ "${KEEP_ENV}" == *" ${name} "* ]] || ENV_ARGS+=(--unsetenv "${name}")
-  done
-  # `_` is set by bash for each exec'd child and is not in `compgen -e`.
-  ENV_ARGS+=(
-    --unsetenv _
+  ENV_ARGS=(
+    --clearenv
     --setenv LANG "${LANG:-C.UTF-8}"
     --setenv RESEARCH_BROKER_URL "http://10.0.2.2:8124"
+  )
+  # printf is a builtin and the process substitution only forks, so no
+  # process carries a value in argv. %q quotes for the bash entry point.
+  SECRETS_FD=""
+  exec {SECRETS_FD}< <(
+    printf 'RESEARCH_BROKER_TOKEN=%q\n' "${RESEARCH_BROKER_TOKEN}"
+    if [[ "${PROVIDER}" == "claude" ]]; then
+      printf 'CLAUDE_CODE_OAUTH_TOKEN=%q\n' "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+    fi
+  )
+  SECRET_ARGS=(--perms 0600 --file "${SECRETS_FD}" /run/agent-secrets)
+  # shellcheck disable=SC2016  # expanded by the jail's bash, not here
+  ENTRY_ARGV=(
+    /run/current-system/sw/bin/bash -c
+    'set -a; . /run/agent-secrets || exit 13; set +a; exec "$@"'
+    agent-entry
   )
 else
   # Legacy (today's jail, byte-for-byte).
@@ -435,6 +446,7 @@ agent_rc=0
 "${MEMGUARD_ARGV[@]}" \
 bwrap \
   "${ENV_ARGS[@]}" \
+  "${SECRET_ARGS[@]}" \
   --ro-bind /nix/store /nix/store \
   --ro-bind /run/current-system /run/current-system \
   --ro-bind /run/systemd/resolve /run/systemd/resolve \
@@ -464,6 +476,7 @@ bwrap \
   "${CACHE_ARGS[@]}" \
   --setenv CLAUDE_STREAM_IDLE_TIMEOUT_MS "1800000" \
   -- \
+  "${ENTRY_ARGV[@]}" \
   "${AGENT_ARGV[@]}" || agent_rc=$?
 
 publish_report
