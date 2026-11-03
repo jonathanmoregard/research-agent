@@ -261,8 +261,19 @@ def canaries(a: Agent, nonce: str) -> None:
 
 
 def envcheck(a: Agent) -> None:
-    """The jail's view (§12.5 T5): no test key value in env or any /proc/*/environ."""
+    """The jail's view (§12.5 T5): no test key value in env or any /proc/*/environ.
+
+    A process whose environ cannot be READ is reported, never skipped. This
+    is a key-leak canary, so "I could not look" must not arrive as "clean" —
+    an unreadable process is exactly where a leaked key would survive the
+    check. Same convention as the G3 protocheck, which fails closed on a
+    mode-0000 marker rather than passing over the process. A process that
+    merely exited between listdir and open is a different thing and is
+    skipped: there is nothing left to inspect, and in a jail with its own
+    PID namespace short-lived shim children come and go constantly.
+    """
     dirty = any(KEY_MARK in v for v in os.environ.values())
+    unreadable = 0
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
@@ -270,9 +281,15 @@ def envcheck(a: Agent) -> None:
             with open(f"/proc/{pid}/environ", "rb") as f:
                 if KEY_MARK.encode() in f.read():
                     dirty = True
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # gone, not hidden
         except OSError:
-            pass
+            unreadable += 1
     a.result("envcheck", "dirty" if dirty else "clean")
+    # A count, not a message: an integer crosses the boundary, no path or
+    # process name. The lane asserts this is 0, so a check that silently
+    # inspected nothing cannot read as a pass.
+    a.result("envcheck_unreadable", str(unreadable))
     # TLS from inside the jail with the environment the jail actually has
     # (broker mode: --clearenv, so no SSL_CERT_FILE): §8.1's open question,
     # for the Python stack the shims use.
