@@ -19,7 +19,7 @@ from curl_cffi import requests as cfrequests  # type: ignore
 try:  # imported as agent.shims.* (tests)
     from agent.shims import broker_client
 except ImportError:  # run as a script in the jail: the sibling file
-    import broker_client  # type: ignore[no-redef]
+    import broker_client  # type: ignore[no-redef]  # arftl-allow: suppression-marker — both import forms are required (see comments above); mypy necessarily sees two bindings
 
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 TAVILY_BASE = "https://api.tavily.com"

@@ -44,7 +44,7 @@ import urllib.request
 try:  # imported as agent.shims.* (tests)
     from agent.shims import broker_client
 except ImportError:  # run as a script in the jail: the sibling file
-    import broker_client  # type: ignore[no-redef]
+    import broker_client  # type: ignore[no-redef]  # arftl-allow: suppression-marker — both import forms are required (see comments above); mypy necessarily sees two bindings
 
 # Identify honestly. These are official APIs; nothing here imitates a browser.
 USER_AGENT = "research-agent-shopping-shim/1.0 (personal read-only search)"

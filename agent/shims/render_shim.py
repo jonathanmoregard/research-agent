@@ -25,7 +25,7 @@ import urllib.request
 try:  # imported as agent.shims.* (tests)
     from agent.shims import broker_client
 except ImportError:  # run as a script in the jail: the sibling file
-    import broker_client  # type: ignore[no-redef]
+    import broker_client  # type: ignore[no-redef]  # arftl-allow: suppression-marker — both import forms are required (see comments above); mypy necessarily sees two bindings
 
 API_URL = os.environ.get("SCRAPER_API_URL", "http://10.0.2.2:8123/render")
 # Derive the intercept URL from the same scraper-API base unless explicitly

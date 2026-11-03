@@ -21,7 +21,7 @@ from curl_cffi import requests as cfrequests  # type: ignore
 try:  # imported as agent.shims.* (tests)
     from agent.shims import broker_client
 except ImportError:  # run as a script in the jail: the sibling file
-    import broker_client  # type: ignore[no-redef]
+    import broker_client  # type: ignore[no-redef]  # arftl-allow: suppression-marker — both import forms are required (see comments above); mypy necessarily sees two bindings
 
 EXA_API_KEY = os.environ.get("EXA_API_KEY", "")
 EXA_BASE = "https://api.exa.ai"

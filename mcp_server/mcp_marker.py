@@ -85,6 +85,11 @@ def sweep(directory: str | Path, proc: str | Path = "/proc") -> None:
         if classify(pid, directory, proc) == "stale":
             try:
                 os.unlink(Path(directory) / pid)
+            # arftl-allow: swallowed-exception — sweeping a marker already classified
+            # stale. Failing to remove it is safe in the direction that matters:
+            # classify() re-reads it and still answers "stale", so the G3 gate never
+            # counts it as a live legacy-capable process. A sweep that could abort
+            # startup would be the worse failure.
             except OSError:
                 pass
 
@@ -119,5 +124,10 @@ def remove(path: Path | None) -> None:
     try:
         if int(path.read_text(encoding="ascii").strip()) == start_ticks(os.getpid()):
             os.unlink(path)
+    # arftl-allow: swallowed-exception — removing our own marker on a clean exit,
+    # guarded by a start-time match so we never delete a recycled PID's marker.
+    # A leftover marker is not a correctness problem: classify() finds the process
+    # gone and reports "stale". Raising here would turn a tidy-up into a shutdown
+    # error on a path that runs during interpreter teardown.
     except (OSError, ValueError):
         pass

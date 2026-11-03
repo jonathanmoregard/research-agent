@@ -253,6 +253,9 @@ class Broker:
         finally:
             try:
                 os.unlink(path)  # load once; a crash after this loses runs, not tokens
+            # arftl-allow: swallowed-exception — the handover file is consumed, not
+            # required. If the unlink fails the only effect is that the next start
+            # re-reads it and drops everything already expired, which is harmless.
             except OSError:
                 pass
         if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
@@ -425,6 +428,9 @@ def _hang_up(conn) -> None:
     returns without dispatching, since received() says it was cut."""
     try:
         conn.shutdown(socket.SHUT_RDWR)
+    # arftl-allow: swallowed-exception — the point is to wake a blocked reader.
+    # A peer that has already gone away raises ENOTCONN here, which IS the desired
+    # end state, so there is nothing to report and nothing to retry.
     except OSError:
         pass
 
@@ -472,6 +478,10 @@ def _dev_sockets() -> dict[str, socket.socket]:
     path = os.environ.get("RESEARCH_BROKER_ADMIN_SOCKET", config.ADMIN_SOCKET)
     try:
         os.unlink(path)
+    # arftl-allow: swallowed-exception — clearing a stale socket path before bind.
+    # ENOENT is the normal case (nothing there). A path that exists and cannot be
+    # removed surfaces immediately as the bind() failure below, which is not
+    # swallowed, so this cannot hide a broken listener.
     except OSError:
         pass
     admin = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

@@ -31,6 +31,10 @@ Transport = Callable[[str, str, dict, "bytes | None", float, bool], "tuple[int, 
 def curl_transport(method: str, url: str, headers: dict, body: bytes | None,
                    timeout_s: float, impersonate: bool) -> tuple[int, bytes]:
     """curl_cffi: Exa's and EUIPO's WAFs reject stdlib TLS fingerprints."""
+    # curl_cffi ships no type stubs, so this import cannot be checked. It is
+    # deliberately function-local: importing it at module scope would make the
+    # whole broker unimportable wherever curl_cffi is absent.
+    # arftl-allow: suppression-marker — untyped third-party import, no stubs exist
     from curl_cffi import requests as cfrequests  # type: ignore
 
     try:

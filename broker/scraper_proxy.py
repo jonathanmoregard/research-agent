@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 
 from broker import config
-from broker.runs import RouteError, Run
+from broker.runs import RouteError, Run, log
 from scraper import urlpolicy
 
 # Reads the scraper's reply; render carries up to 512 KiB HTML + 256 KiB
@@ -53,6 +53,11 @@ class Scraper:
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {token}"})
         try:
+            # arftl-allow: suppression-marker — B310 warns about urlopen with a
+            # caller-influenced scheme. The URL here is built from a hardcoded
+            # http://127.0.0.1 base (config.SCRAPER_BASE) plus a fixed route path,
+            # so file:// and friends are unreachable by construction; the model
+            # never supplies any part of it.
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec B310 - fixed http://127.0.0.1 base
                 status, raw = resp.status, resp.read(MAX_SCRAPER_REPLY_BYTES + 1)
         except urllib.error.HTTPError as e:
@@ -290,5 +295,8 @@ def close_all(scraper: Scraper, run: Run) -> None:
         try:
             scraper.post(f"/session/{sid}/close", {"run_id": run.run_id},
                          config.SCRAPER_TIMEOUT_S["close"])
-        except RouteError:
-            pass
+        except RouteError as e:
+            # Best-effort by design (the scraper's idle TTL is the backstop), but
+            # not silent: a scraper that is refusing closes is worth seeing in the
+            # journal, and a silent pass here would hide it for a whole TTL.
+            log(f"close_all: sid={sid} close failed: {e.status} {e.reason}")

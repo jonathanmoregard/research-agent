@@ -174,6 +174,14 @@ def install_request_guard(context, nav_allowed=None, on_blocked_nav=None) -> Non
                 if on_blocked_nav is not None:
                     try:
                         on_blocked_nav(url)
+                    # arftl-allow: swallowed-exception — deliberately fail-closed.
+                    # This swallow sits BEFORE the route.fulfill(204) below, so a
+                    # caller-supplied callback that raises cannot stop the block;
+                    # letting it propagate out of a Playwright route handler could
+                    # leave the navigation unhandled, i.e. fail OPEN. The cost of
+                    # swallowing is a lost diagnostic, never a permitted request.
+                    # netguard imports no logging by design (it runs inside the
+                    # chromium VM); the refusal itself is still recorded upstream.
                     except Exception:
                         pass
                 # Answered locally with 204 No Content: nothing leaves the
