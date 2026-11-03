@@ -1004,7 +1004,11 @@ Each item gets a red test first.
 - [ ] §3.6 number normalisation + browser-action budget.
 - [ ] §3.7 `FixedURL` entries + drift test over all prompt and tool-text URLs.
 - [ ] §2.3 search-query URL refusal; per-route timeouts with asserted ordering.
-- [ ] §2.4 per-attempt registration; `_SECRET_ENV` trim.
+- [ ] §2.4 per-attempt registration, with the ≥240 s timeout and ENOENT retry of §12.2.
+- [ ] §12.4 era-file read, dual-mode dispatch, and the legacy branch's **env-only** key resolver
+      (it must not reach `_keyring_lookup`).
+- [ ] ~~`_SECRET_ENV` trim~~ — **moved to PR 4** (§12.1). Doing it in PR 2 would break the legacy
+      branch that PR 2 still has to serve.
 - [ ] §8.1 `--clearenv` + exact env allowlist in `run-agent.sh`.
 - [ ] §8.1 conftest network guard covering both `socket` and `curl_cffi`; T-1 fixed.
 - [ ] Budgets single-sourced in `broker/config.py` + drift test against `agent/CLAUDE.md`.
@@ -1040,6 +1044,10 @@ Anchors in this section:
 | On ssh rc=255, `_dial_agent` re-dials up to 2 times and waits up to 200 s for sshd. | `server.py:524-525`, `:1345-1385` | An undrained VM restart usually costs a full agent re-run, not a failure, but it is not guaranteed (a near-timeout run fails). So the drain is required, not optional. |
 | The research-VM watchdog restarts the VM after 3 failed sshd probes, unless `/run/research-agent/active` is fresh. | nixos `research-agent-microvm-healthcheck.nix:62-110` | A drained restart must look "busy" to the watchdog, or it would fight the roll. |
 | The lane host cannot boot microVMs (no nested KVM). | nixos `tests/microvm.nix:24` | The switchover lane emulates the two VMs as NixOS test nodes (§12.5). |
+| `_secret()` resolves every secret env var → (`claude-token` only: `~/.claude/.credentials.json`) → **GNOME keyring**. | `server.py:440-457` | Removing the wrapper's env exports (nixos-B) does **not** remove the legacy key capability — the keyring still answers. The legacy branch must be env-only, and nixos-B must clear the keyed keyring entries (§12.4). |
+| The broker's `save_state()` runs **after** `server_close()` has joined in-flight request threads. | `broker/server.py:430-435` | A SIGKILL at `TimeoutStopSec` loses the entire run registry. The drain must persist *before* it starts waiting, not only after (§12.2). |
+| Slot files are opened `O_CREAT \| O_RDWR \| O_CLOEXEC, 0o600` by the MCP process (uid 1000). | `server.py:822` | Whoever creates a slot file first owns it. A root-run roll unit that creates one locks jonathan out with `EACCES` (§12.3). |
+| `_run_agent` — and therefore every rc=255 re-dial inside it — runs **inside** `with _vm_lock(...)`. | `server.py:1858-1860` | A re-dial can never re-enter a slot the roll has taken: the run never released it. The roll needs no hysteresis against re-dials (§12.3). |
 
 ### 12.1 Sequence and PR split
 
@@ -1048,10 +1056,10 @@ merge waits for the previous step's live gate (§12.6).
 
 | # | PR | Repo | What it does | Gate before the next merge |
 |---|---|---|---|---|
-| 1 | **nixos-A expand** | nixos-config | Adds the broker units (inert until code), the VM→`:8124` rule **next to** `:8123`, the drained roll machinery for both VMs, the broker code-watch path unit, the watchdog drain awareness, a `legacyPaths` transition option (default `true`) and the `vm-egress-switchover` lane. Keys, keyed hosts, the scraper-token share and the wrapper exports all stay. | G1 |
+| 1 | **nixos-A expand** | nixos-config | Adds the broker units (inert until code), the VM→`:8124` rule **next to** `:8123`, the drained roll machinery for both VMs, the broker code-watch path unit, the watchdog drain awareness, **`/etc/research-agent/egress-era` = `legacy-ok`** (§12.4), **`systemd.tmpfiles` rules creating the slot files owned by jonathan** (§12.3), a `legacyPaths` transition option (default `true`) and the `vm-egress-switchover` lane. Keys, keyed hosts, the scraper-token share and the wrapper exports all stay. | G1 |
 | 2 | **research-agent switch** | research-agent | This branch: broker, gate, scraper changes, **plus dual-mode**. The new `server.py`, `run-agent.sh`, shims and scraper serve both the broker protocol and the legacy protocol (§12.4). | G2, G3 |
-| 3 | **nixos-B contract** | nixos-config | Sets `legacyPaths = false` and deletes the option (keyed hosts, `:8123`, scraper-token share). Drops the wrapper's key exports. Makes the seven secrets root-owned. Rewrites comments to the final state. Bumps the lane's research-agent pin to the merged commit. | G4 |
-| 4 | **research-agent cleanup** | research-agent | Deletion-only: the legacy branches in `server.py`, `run-agent.sh`, the shims and the scraper (unbound sessions). `run-agent.sh` then exits 11 without a token (§2.4). Unused since G3, so zero-downtime by construction. Can ride along with the next research-agent change. | G5 |
+| 3 | **nixos-B contract** | nixos-config | Sets `legacyPaths = false` and deletes the option (keyed hosts, `:8123`, scraper-token share). **Flips `/etc/research-agent/egress-era` to `broker-only`** — this, not key absence, is what makes legacy impossible (§12.4). Drops the wrapper's key exports **and clears the 8 keyed entries from the GNOME keyring**. Makes the seven secrets root-owned. Rewrites comments to the final state. Bumps the lane's research-agent pin to the merged commit. | G4 |
+| 4 | **research-agent cleanup** | research-agent | Deletion-only: the legacy branches in `server.py`, `run-agent.sh`, the shims and the scraper (unbound sessions), the era-file read, and the legacy env-only key resolver. `run-agent.sh` then exits 11 without a token (§2.4). **The `_SECRET_ENV` trim lands here, not in PR 2** — §11 originally put it in PR 2, but S1′ and S2 legacy dials need all 8 keys resolvable from env while the legacy branch still exists (see the matrix). Unused since G3, so zero-downtime by construction. Can ride along with the next research-agent change. | G5 |
 
 Three PRs cannot do it. A fourth, deletion-only PR is the minimum, because the legacy path must
 exist at the moment of the code switch (old MCP processes are alive then) and must not exist in
@@ -1061,7 +1069,10 @@ the final state.
 
 | Hunk | Source | Goes to |
 |---|---|---|
-| `modules/nixos/research-broker.nix` (whole file) | `397f372` | **A**, with additions §12.2 (path unit, `ExecReload`, `TimeoutStopSec`, `StateDirectory`) |
+| `modules/nixos/research-broker.nix` (whole file) | `397f372` | **A**, with additions §12.2 (path unit, the code-watch oneshot **including its stop step**, `ExecReload`, `TimeoutStopSec`, `StateDirectory`) |
+| *new in A:* `environment.etc."research-agent/egress-era".text = "legacy-ok"` | — | **A**. Flipped to `broker-only` in **B**. The §12.4 control. |
+| *new in A:* `systemd.tmpfiles.rules` for `agent.lock.<i>`, owner `jonathan` | — | **A**. Stops the root-run roll from creating a slot file jonathan cannot open (§12.3). |
+| *new in B:* clear the 8 keyed secrets from the GNOME keyring | — | **B**. Without it, dropping the wrapper exports leaves `_secret()`'s keyring fallback as a live key source (§12.4). |
 | `profiles/workstation/default.nix` import of `research-broker.nix` (`@@ -58,6 +58,9`) | `397f372` | **A** |
 | `profiles/workstation/default.nix` comment block (`@@ -177,6 +180,13`) and the seven `owner/group → root` hunks (tavily, euipo×2, ebay×2, tradera×2) | `397f372` | **B**. Old-code MCP processes spawned during A/S2 must still be able to read the keys. |
 | `home/research-agent-mcp.nix`: `export RESEARCH_BROKER_ADMIN=…` (+3 lines) | `397f372` | **A** (additive; new code defaults to the same path anyway) |
@@ -1073,10 +1084,20 @@ the final state.
 | `tests/microvm.nix`: broker-stub runtime assertions (inert before code, loopback-only listener, admin socket refused to another user, sandbox sees exactly 8 credentials and none in env, empty `/home`, read-only code dir, reaches host `:8123` and an upstream via curl_cffi, exposure ≤ 2.5) and "agent reaches `:8124`" | `5a8676f` | **A**. In A the lane also asserts `:8123` **still** reachable and `api.exa.ai` **still** resolving (old code must work). |
 | `tests/microvm.nix`: "`:8123` refused", keyed hosts NXDOMAIN and never reach upstream, no scraper-bearer share, CNAME subtest moved to `api.anthropic.com`, the mutation run | `5a8676f` | **B** |
 
-`legacyPaths` is a transition switch, not a feature flag. It exists only between A and B; B
-flips it to false and deletes the option and its dead branches. It is needed so the A PR's lane
-can build the B configuration as a specialisation and test the contract step before A merges
-(§12.5).
+`legacyPaths` is a transition switch, not a feature flag. It is needed so the A PR's lane can
+build the B configuration as a specialisation and test the contract step before A merges (§12.5).
+
+**It cannot be fully deleted in B, because the lane outlives B.** B flips every *production* call
+site to the contract behaviour and deletes those branches, but `vm-egress-switchover` replays the
+whole switchover (T0-T4, T6) and so still needs to build the base and expand configurations after
+B has merged and the lane's research-agent pin has been bumped. So after B the option survives as
+a **test-only parameter**, referenced from `tests/` and nowhere else, defaulting to `false`.
+
+It is retired with the lane. Once G5 holds, the switchover is history and the lane's *transition*
+steps have no remaining regression value — but its final-state assertions do. So the retirement
+step is: move T5 and T5b (key absence, keyed-host NXDOMAIN, `:8123` refused, fail-closed under a
+stopped broker) into the permanent `vm-microvm` lane, then delete `vm-egress-switchover` and the
+`legacyPaths` option together. That retirement is a follow-up issue, not part of these four PRs.
 
 ### 12.2 The broker: start on first code, graceful reload on every change
 
@@ -1091,38 +1112,71 @@ when the pull later creates the file. Add to nixos-A:
     systemd watches the directory for those events;
   - `wantedBy = [ "paths.target" ]`.
 - `systemd.services.research-broker-code` (oneshot, root), in order:
-  1. If the sockets are inactive, run `systemctl start research-broker.socket research-broker-admin.socket`.
-  2. If `research-broker.service` is active and the tree hash of `broker/` plus
+  1. Debounce: `sleep 5` first, so a multi-file pull acts once.
+  2. **Code gone → stop the sockets.** If `broker/server.py` does **not** exist and either socket
+     is active, run `systemctl stop research-broker.socket research-broker-admin.socket
+     research-broker.service`. The service stop drains under the same `TimeoutStopSec=210`.
+  3. If `broker/server.py` exists and the sockets are inactive, run
+     `systemctl start research-broker.socket research-broker-admin.socket`.
+  4. If `research-broker.service` is active and the tree hash of `broker/` plus
      `scraper/urlpolicy.py` differs from the hash the broker reports at
      `GET /admin/health` (`{"code": "<sha256>"}`), run `systemctl reload research-broker`.
-  3. Debounce: `sleep 5` first, so a multi-file pull reloads once.
 
   This also catches a missed inotify event on the next change.
+
+  **Step 2 is what makes the G2 rollback real.** `ConditionPathExists` on the socket units is
+  evaluated only when something tries to *start* them; nothing re-evaluates it when `broker/`
+  disappears. So on a code revert the sockets would otherwise stay active with no code behind
+  them — and under §12.4's era file the MCP would keep choosing broker mode and failing closed.
+  The oneshot must stop them explicitly. `PathChanged` on the `broker/` directory fires on the
+  revert's rename-away, so the unit does get woken. T6 asserts both sockets inactive after the
+  revert (§12.5).
 
 **Graceful reload** (research-agent side, `broker/server.py`; nixos-A sets
 `ExecReload=kill -HUP $MAINPID`, `TimeoutStopSec=210`, `StateDirectory=research-broker`,
 `StateDirectoryMode=0700`, and `Restart=on-failure` stays):
 
 1. On `SIGHUP` (and on `SIGTERM`) the broker sets `stopping`.
-2. **Stop accepting at an idle instant.** The accept loop stops calling `accept()` when the
-   in-flight request count is 0. While a model thinks, requests are idle most of the time. If no
-   idle instant occurs within 600 s, it stops accepting anyway. The listening fds belong to
-   systemd, so new connections queue in the kernel backlog (`Backlog=` default 4096). They are
-   never refused.
-3. **Finish in-flight requests.** Each upstream call has its own timeout, and the longest route
-   is `session/act` at 165 s broker-side (§2.3). Therefore `TimeoutStopSec=210`. The broker
-   waits for the scraper's answer before exiting, so **no scraper worker command is orphaned**:
-   the scraper's own wait (150 s) and the worker budget (120 s, `scraper/sessions.py:28-35`) are
-   both inside it.
-4. **Persist the run registry** to `$STATE_DIRECTORY/runs.json`: token hashes, ledgers, budget
-   counters, sid→run map, and absolute `expires`. Write to a temp file, fsync, then rename. Mode
-   0600 under a 0700 DynamicUser state dir. Size is bounded by the §2.5 caps.
-5. Exit 0. The next queued connection activates the new code. It loads `runs.json`, drops
-   expired runs, deletes the file, then serves.
-6. Gap seen by a client: the queue wait (≤ the drain in step 3) plus Python start (< 1 s).
+2. **Persist the run registry immediately, before any waiting.** Write
+   `$STATE_DIRECTORY/runs.json`: token hashes, ledgers, budget counters, sid→run map, and
+   absolute `expires`. Temp file, fsync, rename. Mode 0600 under a 0700 DynamicUser state dir.
+   Size is bounded by the §2.5 caps.
 
-**Shim timeouts include that gap.** Every shim's HTTP timeout is its §2.3 value + 220 s
-(drain 210 s + start). An act therefore waits at most 180 + 220 s; that is latency, not failure.
+   This ordering is the point. `broker/server.py:430-435` currently persists only *after*
+   `server_close()` joins the in-flight threads, so any `systemctl stop` that reaches
+   `TimeoutStopSec` SIGKILLs the process with the registry still in memory and every live run
+   loses its token and ledger (`run not registered` on the next request). Persisting first makes
+   the worst case "state is up to 210 s stale" instead of "state is gone".
+3. **Stop accepting at once.** The accept loop stops immediately on the signal. The listening fds
+   belong to systemd, so new connections queue in the kernel backlog (`Backlog=` default 4096);
+   they are never refused, which is exactly what makes stopping immediately safe.
+
+   The earlier design waited for an in-flight count of 0, for up to 600 s, before it stopped
+   accepting. That was unreachable: 600 s > `TimeoutStopSec=210`, so under load systemd killed the
+   process mid-wait. It also bought nothing — the backlog already prevents refusals, so there is
+   no reason to keep accepting during a drain.
+4. **Finish in-flight requests.** Each upstream call has its own timeout, and the longest route
+   is `session/act` at 165 s broker-side (§2.3). Therefore `TimeoutStopSec=210`, which now
+   genuinely bounds the whole drain. The broker waits for the scraper's answer before exiting, so
+   **no scraper worker command is orphaned**: the scraper's own wait (150 s) and the worker budget
+   (120 s, `scraper/sessions.py:28-35`) are both inside it.
+5. **Persist again**, so the handover reflects work that completed during the drain.
+6. Exit 0. The next queued connection activates the new code. It loads `runs.json`, drops
+   expired runs, deletes the file, then serves.
+7. Gap seen by a client: the queue wait (≤ the drain in step 4) plus Python start (< 1 s).
+
+**Every client of the broker must absorb that gap — not just the shims.**
+
+- **Shims:** each shim's HTTP timeout is its §2.3 value + 220 s (drain 210 s + start). An act
+  therefore waits at most 180 + 220 s; that is latency, not failure.
+- **The MCP's run-registration client** (`server.py`, admin socket, written in the dual-mode PR):
+  connect timeout **≥ 240 s**, and it must **retry on `ENOENT` / `ECONNREFUSED`** with backoff for
+  the same budget rather than treating the first failure as final. Without this the drain is not
+  zero-downtime at all: §12.4 fails closed when "registration fails", and a bare `connect()` to the
+  admin socket during a reload is exactly that — so every research call started inside a 210 s
+  reload window would die with `research-broker unavailable`. The socket file is a systemd-owned
+  `AF_UNIX` listener, so during the reload the connection queues; the retry is only needed for the
+  instant between `server_close()` and the new process inheriting the fd.
 
 What a run sees: tokens and ledgers survive, so a run spanning a reload never gets
 `run not registered`. A non-graceful crash still loses state. That is a broker bug, not a
@@ -1152,19 +1206,49 @@ Algorithm:
 1. **Need check.** Research VM: `readlink current != readlink booted`, otherwise exit 0. Scraper
    code trigger: the tree hash of `scraper/` differs from the hash `scraper-http` reports on
    `GET /health` (new field; old scraper code reports none, which counts as "differs").
-2. **Wait for an idle window. Never interrupt a run.** Every 2 s, try `flock -n` on *every* slot
-   file `agent.lock.0 … agent.lock.$((SLOTS-1))`. Then:
-   - all acquired → **keep them**;
-   - otherwise → release whatever was acquired and retry.
+2. **Take every slot, holding what you win. Never interrupt a run.** Walk
+   `agent.lock.0 … agent.lock.$((SLOTS-1))` and take each with a **blocking** `flock` (per-slot
+   timeout; whole-step bound 24 h). **Keep every slot already acquired while waiting for the
+   next** — never release and retry.
+
+   The earlier design released all acquired slots whenever one was busy and retried from scratch.
+   Under any concurrency that starves: with 2 slots and 2 busy workers the roll can lose the race
+   indefinitely, so G1/G2 stall in the live runbook and T1/T2 go flaky in the lane (4 workers,
+   2 slots). Holding is strictly better and costs nothing: `research()` callers poll their own
+   lock non-blockingly for up to 1800 s, so a partially-held set delays new calls rather than
+   failing them — which is the same property the all-held window has.
 
    `SLOTS` comes from one nix option, `researchAgent.slots`, which also sets `RESEARCH_SLOTS` in
-   the MCP wrapper, so the two can never disagree. Holding all slots means no agent is running
-   and new `research()` calls queue on their own lock poll.
-   - **Research VM roll:** the window must be all-free for 60 s. That is a hysteresis so a
-     `retry_research` or fallback dial does not race in.
-   - **Scraper roll:** the window must be 300 s. The artifact pull happens after the slot is
-     released (`server.py:2501-2526`). The scan takes ~10-60 s, so 300 s keeps a scraper restart
-     from dropping un-pulled screenshots.
+   the MCP wrapper, so the two can never disagree.
+
+   **Slot files are created by jonathan, never by the roll.** `server.py:822` opens them
+   `O_CREAT | O_RDWR | O_CLOEXEC, 0o600`, so whoever creates one owns it — and the roll runs as
+   root. On a fresh host, after a slot-count increase, or in a new lane node, a root-created
+   `agent.lock.<i>` is mode 0600 root and jonathan's `O_RDWR` open then raises `EACCES`, failing
+   every research call. nixos-A therefore declares the slot files via `systemd.tmpfiles.rules`
+   (`f /home/jonathan/.cache/research-agent/agent.lock.<i> 0600 jonathan users -`, one per slot,
+   generated from `researchAgent.slots`), and the roll opens them **`O_RDONLY` without `O_CREAT`**
+   — `flock` needs no write access. A missing slot file is then a configuration error the roll
+   reports, not a file it silently creates with the wrong owner.
+
+   **Research VM roll:** no hysteresis. Holding all slots is already sufficient, because
+   `_run_agent` and every rc=255 re-dial inside it run *within* `with _vm_lock(...)`
+   (`server.py:1858-1860`) — a re-dial cannot re-enter a slot the roll holds, since the run that
+   would re-dial never released one. The previous 60 s all-free window was guarding against a race
+   that the lock structure already excludes.
+
+   **Scraper roll:** the criterion is the scraper's own reported state, not a clock. Roll when
+   `GET /health` reports **0 open sessions and 0 pending (un-pulled) artifacts** — two new
+   counters on that endpoint. The artifact pull happens after the slot is released
+   (`server.py:2501-2526`), so slot idleness alone does not mean the scraper is safe to restart;
+   its own queue depth does.
+
+   `scraperQuietSeconds` (default 300) survives only as a **safety cap**: if the counters have not
+   reached zero within it, the roll reports and waits rather than restarting. It is an input, not
+   the correctness criterion. The old design made 300 s the criterion, which is a fitted constant —
+   the pull follows the post-release injection scan, and under Lakera 429 backoff (observed: one
+   success per 4-5 min fleet-wide) that scan alone routinely exceeds 300 s, so the window would
+   have expired with screenshots still un-pulled and the restart would have dropped them.
 3. **Mark draining.** Touch `/run/research-agent/rolling`. nixos-A changes the watchdog
    (`research-agent-microvm-healthcheck.nix`) to treat it like a fresh heartbeat (skip probe,
    no strike), and the same for the scraper healthcheck.
@@ -1203,20 +1287,75 @@ not verified it. The lane asserts it (§12.5, T1: `microvm@research-agent` must 
 machinery plus `restartIfChanged=false`, no guest change) and A2 (`:8124` rule), deployed in
 order. That is one more PR.
 
+That assertion only carries weight because the lane keeps the **real** `microvm.vms.*`
+declarations and `mkForce`s only `ExecStart`/`ExecStop` (§12.5). Against a lane-authored stub unit
+it would pass trivially while telling us nothing about `microvm.nix`'s own
+`X-RestartIfChanged`/`restartTriggers` — i.e. the single question this paragraph exists to answer
+would have come back "verified" without having been tested. Run T1 before trusting it.
+
 ### 12.4 Compatibility at every step
 
 **Dual-mode** (research-agent PR):
 
-- **`server.py` (new) picks a protocol per dial:**
-  - **broker mode** when the admin socket path exists **and** the checkout it runs from has
-    `scripts/.guest-protocol` = `broker-v1` (a new marker file). This catches a reverted
-    checkout under a new in-memory server.
-  - **legacy mode** (today's 11-field stdin with keys, unchanged `_GUEST_SCRIPT` shape) when the
-    admin socket path is **absent (ENOENT)**, or the marker is missing, **and** the keys are in
-    its env.
-  - **fail closed** in every other case: socket present but registration fails, or legacy
-    needed without keys. Error `research-broker unavailable`.
-  - Every dial logs `mode=broker|legacy reason=…`.
+- **`server.py` (new) picks a protocol per dial. The era comes first, the socket second.**
+
+  The predicate that admits the legacy path is a **deploy-state** fact, never a runtime-liveness
+  one: `/etc/research-agent/egress-era`, a root-owned file emitted by the nixos module, holding one
+  word. It is not writable by the agent, not writable by the MCP process, and entirely unaffected
+  by whether the broker happens to be healthy.
+
+  | File | Deploy state | Legacy mode |
+  |---|---|---|
+  | absent | before nixos-A | **permitted** — this is today, and today has no broker |
+  | `legacy-ok` | nixos-A … up to nixos-B (S1-S3) | **permitted** |
+  | `broker-only` | nixos-B onward (S4, S5) | **refused**, whatever the socket's state |
+  | anything else | — | **fail closed** (unparseable era is not a licence) |
+
+  - **Era check first.** In the `broker-only` era the only outcomes are broker mode or fail closed.
+  - Inside the transition era (absent or `legacy-ok`):
+    - **broker mode** when the admin socket path exists **and** the checkout it runs from has
+      `scripts/.guest-protocol` = `broker-v1` (a new marker file). This catches a reverted
+      checkout under a new in-memory server.
+    - **legacy mode** (today's 11-field stdin with keys, unchanged `_GUEST_SCRIPT` shape) when the
+      admin socket path is **absent (ENOENT)** or the marker is missing.
+  - **fail closed** in every other case: socket present but registration fails; socket absent in
+    the `broker-only` era; legacy permitted but no keys in env; era value unrecognised. Error
+    `research-broker unavailable`.
+  - Every dial logs `mode=broker|legacy reason=… era=<value|absent>`.
+
+  **Why not socket presence alone** (the original design, corrected 2026-11-03 after advisor
+  review). Socket presence conflates "the broker is up" with "we are still in the transition era".
+  Under that predicate a broker crash-loop, a failed reload, or anything that stops
+  `research-broker.socket` **after the contract step** silently re-opens the keyed legacy path — a
+  fail-open on precisely the capability design A exists to remove. An operator debugging the broker
+  by stopping its socket would have re-armed key delivery into the VM, with no signal that they
+  had. The era file cannot do that: in `broker-only`, stopping the broker fails calls closed. That
+  is the correct trade — the zero-downtime promise covers the *planned* switchover steps, not an
+  unplanned broker outage, and §12.5 T5b now tests this branch explicitly.
+
+  **Why an era *value* rather than "a file nixos-A adds and nixos-B removes"** (the advisor's
+  prescription, deliberately not followed). With a file that A adds and B removes, *absence* has to
+  mean both "before A" and "after B" — the same ambiguity as socket presence, just relocated. The
+  pre-A reading must permit legacy (that is today's only working path, and it is what makes the
+  wrong-order state S1′ degrade safely instead of failing every call), while the post-B reading
+  must refuse it. One bit cannot carry both. An explicit value separates them, and an unrecognised
+  value fails closed rather than guessing.
+
+  **The era file is the control; keylessness is the backstop.** The design does not rest on one
+  file: from nixos-B the keys are not in the wrapper's env *and* not in the keyring, so even a
+  tampered or stale era file has nothing to ship. Conversely the era file holds even while keys are
+  still present (S1-S3). Either mechanism alone would have a gap; together they overlap across
+  every state.
+
+- **The legacy branch reads keys from `os.environ` only — never `_keyring_lookup`.**
+  `mcp_server/server.py:440-457` resolves every secret env → (`claude-token`: credentials.json) →
+  **GNOME keyring**. So "legacy needed without keys → fail closed" is unreachable as long as the
+  legacy branch goes through `_secret()`: after nixos-B drops the wrapper's key exports, a legacy
+  dial would still resolve `exa-api-key` and `tavily-api-key` from the keyring and ship them into
+  the guest. Dropping the env exports would not have removed the capability at all. The dual-mode
+  PR therefore gives the legacy branch its own env-only resolver, so that nixos-B's contract step
+  is genuinely load-bearing. nixos-B additionally clears the keyed entries from the keyring
+  (defence in depth, and it closes the same hole for any stale process).
 - **`_GUEST_SCRIPT` / `run-agent.sh` (new):** reads a version field first.
   - `broker-v1` → 4 fields, broker env, `--clearenv` jail (§8.1).
   - Anything else → today's 11 fields and env, so the legacy jail behaves byte-for-byte like
@@ -1239,10 +1378,10 @@ order. That is one more PR.
 |---|---|---|---|---|
 | S0 today | legacy ✓ | — | ✓ | |
 | S1 after A | legacy ✓. Hosts, `:8123` and the share are still there; the VM roll is drained. | — | ✓. The broker is inert. | |
-| S1′ research-agent merged **before** A deploys (wrong order) | legacy ✓ (new `run-agent.sh` legacy branch) | **legacy** (ENOENT → keys from env) ✓ | n/a | **Recommended handling: degrade safely**, not "refuse fast". It equals today's exposure, never more: keys are in the VM only for runs that would have had them anyway, and the condition becomes impossible once the A-installed socket exists. Refusing fast would violate zero downtime. A deploy-order check still runs: the G1 gate must pass before the research-agent merge, and `mode=legacy reason=no-broker` after G1 is an alert. |
+| S1′ research-agent merged **before** A deploys (wrong order) | legacy ✓ (new `run-agent.sh` legacy branch) | **legacy** ✓ (`egress-era` absent → transition era; keys from env) | n/a | **Recommended handling: degrade safely**, not "refuse fast". It equals today's exposure, never more: keys are in the VM only for runs that would have had them anyway. Refusing fast would violate zero downtime. This is why the era file carries a *value* rather than being present-or-absent — see §12.4. A deploy-order check still runs: the G1 gate must pass before the research-agent merge, and `mode=legacy reason=no-broker` after G1 is an alert. **This row is also why the `_SECRET_ENV` trim moves to PR 4** (§12.1): the legacy branch here needs all 8 keys resolvable from env, and it is env-only by §12.4. |
 | S2 after research-agent pull | legacy ✓ (new guest code, legacy branch) | broker ✓ | scraper: old until its roll, new after; both serve both | Two broker reloads and a scraper roll happen here, all drained. |
 | S3 contract gate | must be **zero** alive | broker ✓ | | see G3 |
-| S4 after B | ✗ **would fail**: no keyed hosts, no `:8123` (excluded by G3) | broker ✓ (wrapper no longer exports keys; legacy impossible) | | The research VM rolls, drained. |
+| S4 after B | ✗ **would fail**: no keyed hosts, no `:8123` (excluded by G3) | broker ✓, or fail closed. **Legacy is impossible because `egress-era` = `broker-only`** — not merely because the wrapper stopped exporting keys. Key absence alone would not have sufficed: `_secret()` falls back to the GNOME keyring (`server.py:440-457`), so a legacy dial could still have resolved `exa-api-key` and `tavily-api-key`. B clears those keyring entries too. | | The research VM rolls, drained. |
 | S5 after cleanup | — | broker ✓ | | |
 
 **A run that starts on old code and spans the pull** finishes:
@@ -1276,10 +1415,22 @@ The inputs are used only by `checks`, never by `nixosConfigurations`.
   `net.ipv4.conf.all.route_localnet=1`. The agent's `10.0.2.2:8124` therefore reaches
   `127.0.0.1:8124` on the host, as SLIRP does.
 - Scraper hostfwd: `socat TCP-LISTEN:8123,bind=127.0.0.1,fork TCP:scraper:8000` on the host.
-- VM restart: in the lane, `microvm@research-agent` / `microvm@scraper` are stub units whose
-  `ExecStop` ssh-reboots the corresponding node into the specialisation matching the host's
-  current one, and whose start waits for its sshd or `/health`. The roll units under test are
-  the production ones; only the restart command they call is a stub.
+- VM restart: the host node keeps the **real** `microvm.vms.research-agent` and
+  `microvm.vms.scraper` declarations, so the real `microvm.nix` host module generates
+  `microvm@<name>` with its real `restartTriggers` and `X-RestartIfChanged`. The lane then
+  `mkForce`s **only** `serviceConfig.ExecStart` and `ExecStop` on those units: `ExecStop`
+  ssh-reboots the corresponding test node into the specialisation matching the host's current one,
+  and `ExecStart` waits for its sshd or `/health`. Nothing else about the unit is replaced.
+
+  **The unit definition must stay real, or T1 proves nothing.** Replacing `microvm@<name>` with a
+  stub unit of the lane's own making means the unit carries the lane's drop-in rather than
+  `microvm.nix`'s `restartTriggers = [ toplevel ]` and
+  `X-RestartIfChanged = restartIfChanged` (`host/default.nix:149-157`, `options.nix:151-159`).
+  T1's assertion — that `switch-to-configuration` does not list `microvm@research-agent` under
+  restarting — is the *only* thing that discharges §12.3's explicitly-open question of whether
+  `-ng` reads `X-RestartIfChanged` from the new unit or the old one. Against a stub, that
+  assertion passes trivially and the open question stays open into production, where getting it
+  wrong restarts the research VM undrained at the nixos-A switch.
 
 **Harness on `host`.** Two load generators, each 2 parallel workers looping for the whole test.
 Results go as JSONL to `/var/log/switchover/*.jsonl`.
@@ -1311,13 +1462,14 @@ Every broker-mode call also runs the canary steps, which must come back `refused
 |---|---|---|
 | T0 | Base configs, old code; start `legacy-mcp`. | 3 calls succeed. |
 | T1 | `host: /run/current-system/specialisation/expand/bin/switch-to-configuration test` (as the auto-deploy would). | Switch output does **not** list `microvm@research-agent` under restarting. The roll fires, waits for an idle window and stub-reboots `agent` into `expand`. In-flight calls complete. **Zero failed calls.** `:8124` and `:8123` reachable from `agent`; `api.exa.ai` resolves; broker sockets inactive (condition). |
-| T2 | `git -C /home/jonathan/Repos/research-agent pull --ff-only`; start `new-mcp`. | The path unit starts the broker sockets. The scraper roll fires (code hash) and the scraper restarts in an idle window with no artifact loss (the screenshot step's artifacts present). `legacy-mcp` dials log `mode=legacy`, `new-mcp` dials log `mode=broker`. Zero failed calls. |
+| T2 | `git -C /home/jonathan/Repos/research-agent pull --ff-only`; start `new-mcp`. | The path unit starts the broker sockets. The scraper roll fires (code hash) and restarts once `/health` reports 0 sessions and 0 pending artifacts, with no artifact loss (the screenshot step's artifacts present). `new-mcp` dials log `mode=broker era=yes`. **`legacy-mcp`'s protocol is asserted guest-side, not from its own log:** commit 1's `server.py` has no `mode=` logging at all, so an assertion on `mode=legacy` in its output is vacuous. Instead the new `run-agent.sh` (which commit 1's inline `_GUEST_SCRIPT` execs) records the protocol it was handed — field count and absence of `RESEARCH_BROKER_TOKEN` — to the guest log, and the lane reads it there. Zero failed calls. |
 | T2b | Commit a no-op change under `broker/` to origin and pull again. | Broker reload: `runs.json` round-trip (one long browse run spans it and finishes), queued requests served, zero failed calls. |
 | T2c | Wrong-order check (separate fresh sub-run of host+agent at base config with new code). | New `server.py` → `mode=legacy reason=no-broker`, calls succeed. |
 | T3 | Stop `legacy-mcp` between calls (session end); run the G3 gate script. | Gate passes only now. Run it before the stop as well and assert it **fails**. |
 | T4 | `switch-to-configuration test` into `contract`. | Roll → agent reboots into `contract`. Zero failed calls. |
-| T5 | Final state. | Inside a running fake-agent jail: `env`, `/proc/*/environ`, `/workspace`, `/etc` contain none of the 8 test key values, and `/etc/scraper` is absent. `getent ahostsv4 api.exa.ai` fails on `agent`; `10.0.2.2:8123` refused from `agent`; the broker serves (`new-mcp` calls ok); every canary step `refused`; **`/var/log/canary` empty**; upstream logs show no request for a keyed host from the agent's address. |
-| T6 | Rollback drill: switch back to `expand` with the code reverted (`git revert` pushed to origin, pulled); then back to base. | Zero failed calls in both directions (§12.6 rollback). |
+| T5 | Final state. | Inside a running fake-agent jail: `env`, `/proc/*/environ`, `/workspace`, `/etc` contain none of the 8 test key values, and `/etc/scraper` is absent. `getent ahostsv4 api.exa.ai` fails on `agent`; `10.0.2.2:8123` refused from `agent`; the broker serves (`new-mcp` calls ok); every canary step `refused`; **`/var/log/canary` empty**; upstream logs show no request for a keyed host from the agent's address. **`/etc/research-agent/egress-era` reads `broker-only`**, and the keyring holds none of the 8 keyed secrets. |
+| T5b | **Fail-closed subtest — the security claim of §12.4, tested.** Under `contract`, `systemctl stop research-broker.socket research-broker-admin.socket research-broker.service`, then dial from an MCP process **spawned back at S2, with all 8 keys still in its env**. | The dial returns `research-broker unavailable` (`mode=` never `legacy`, `era=no`). **No key value reaches the guest:** the jail's `env` and `/proc/*/environ` are clean and `/var/log/canary` stays empty. Then restore the sockets and assert calls resume. Without this step the lane never exercises the socket-absent branch under the contract era at all — which is precisely the fail-open the original socket-presence predicate would have had, so a green lane would have told us nothing about the one thing that matters most. |
+| T6 | Rollback drill, in the mandated reverse order: **B⁻¹ first** (`switch-to-configuration` back into `expand`, which sets `/etc/research-agent/egress-era` back to `legacy-ok` and restores the key exports), **then** code⁻¹ (`git revert` pushed to origin, pulled); then back to base. | Zero failed calls in both directions (§12.6 rollback). After code⁻¹: **both broker sockets inactive** and `research-broker.service` inactive — the §12.2 step-2 stop ran, rather than leaving conditioned-but-active sockets with no code behind them. Also assert the **wrong order fails loudly**: in a separate sub-run, do code⁻¹ *without* B⁻¹ and assert the calls fail closed with `research-broker unavailable` rather than silently falling back to legacy. That is the designed behaviour, and the lane should pin it so nobody "fixes" it later. |
 | End | Aggregate JSONL. | `failed == 0` across all workers and steps; latency per step printed (not asserted beyond the 1800 s lock bound). |
 
 **CI.** Add `egress-switchover` to the `vm-minimal` matrix in nixos-config `.github/workflows/ci.yml:606-612`
@@ -1360,9 +1512,9 @@ for the whole switchover window, so a 60 s idle window remains possible. Each it
 |---|---|---|---|
 | 0 | #308 deployed; lane `vm-egress-switchover` green on the A PR; start the probe. | 30 min of clean probe at S0. | — |
 | 1 | Merge **nixos-A** (auto-deploys). | **G1:** `research-vm-roll@research-agent` finished (`booted == current`; journal shows "idle window → restart → ready"); guest `nft list ruleset` has both `:8123` and `:8124`; `systemctl show research-broker.socket -p ConditionResult` = `no`; the `.path` units are active; probe clean; one real normal research call ok. | Revert A on `main` (auto-deploys). The roll restarts the VM drained back to base; the broker units disappear (they were inert). |
-| 2 | Merge **research-agent**; the pull arrives (cron, or run it by hand to watch). | **G2:** both broker sockets active; `curl --unix-socket /run/research-broker/admin.sock …/admin/health` has the code hash = the checkout hash; the scraper roll finished (`/health` hash = checkout); `server.log` shows `mode=broker` for new processes and `mode=legacy` only for pre-pull PIDs; probe clean on **both** paths; §8.4 workflow checks pass; the broker canary (`?k=probe` refused) holds. | Revert the merge on `main` (cron pulls). New in-memory servers see the marker gone → legacy mode (keys still exported) ✓. The broker reload path unit sees `broker/` vanish → the condition stops the sockets after in-flight requests (`systemctl stop` with the same 210 s drain). The scraper roll reloads old scraper code in an idle window. |
+| 2 | Merge **research-agent**; the pull arrives (cron, or run it by hand to watch). | **G2:** both broker sockets active; `curl --unix-socket /run/research-broker/admin.sock …/admin/health` has the code hash = the checkout hash; the scraper roll finished (`/health` hash = checkout); `server.log` shows `mode=broker era=legacy-ok` for new processes; **legacy dials are attributed by PID, not by their own log line** — pre-pull `server.py` has no `mode=` logging, so the check is "every `mcp_server.server` PID lacking the `/run/user/1000/research-agent-mcp/<pid>` marker is a pre-pull PID" (the same marker G3 uses), cross-checked against the guest-side protocol record `run-agent.sh` writes; probe clean on **both** paths; §8.4 workflow checks pass; the broker canary (`?k=probe` refused) holds. | Revert the merge on `main` (cron pulls). New in-memory servers see the protocol marker gone and `egress-era` = `legacy-ok` → legacy mode (keys still exported) ✓. The code-watch oneshot sees `broker/` vanish and **explicitly stops** the sockets and the service, draining under the same 210 s (§12.2 step 2). *Not* `ConditionPathExists` — that is evaluated only on start, so nothing would have stopped already-active sockets. The scraper roll reloads old scraper code once `/health` reports idle. |
 | 3 | Wait for old MCP processes to end (sessions close or `/mcp` reconnect naturally). | **G3:** `research-mcp-protocheck` (new, in nixos-A): every live `mcp_server.server` PID has a `/run/user/1000/research-agent-mcp/<pid>` marker written by new `server.py` at start, **and** `server.log` has zero `mode=legacy` dials for 24 h. Lane green on the B PR (pins bumped). | Nothing to roll back. |
-| 4 | Merge **nixos-B**. | **G4:** roll finished into the contract guest; the §8.3 in-VM key canary (A4) is clean; `getent ahostsv4 api.exa.ai` fails in the guest; `:8123` refused from the guest; `/etc/scraper` absent; probe broker path clean (the legacy probe path is retired at this step and expected to fail, so it is excluded); real calls ok. | Revert B on `main`. The roll goes back to expand (hosts, `:8123` and share return); the wrapper exports keys again for new spawns. Live new-code processes stay in broker mode ✓. |
+| 4 | Merge **nixos-B**. | **G4:** roll finished into the contract guest; the §8.3 in-VM key canary (A4) is clean; `getent ahostsv4 api.exa.ai` fails in the guest; `:8123` refused from the guest; `/etc/scraper` absent; probe broker path clean (the legacy probe path is retired at this step and expected to fail, so it is excluded); real calls ok. | Revert B on `main`. The roll goes back to expand (hosts, `:8123` and share return); `egress-era` returns to `legacy-ok`; the wrapper exports keys again for new spawns and the keyring entries are restored. Live new-code processes stay in broker mode ✓. **B⁻¹ must precede code⁻¹.** Reverting the code while `egress-era` is still `broker-only` leaves every new-code process fail-closed with `research-broker unavailable` until its session reconnects — correct behaviour, but downtime. The reverse-order rule below is load-bearing here, not merely tidy; T6 pins both orders. |
 | 5 | Merge **cleanup**. | **G5:** the probe and real calls stay clean for 24 h; `mode=legacy` count stays 0. | Revert the cleanup (pure re-addition of unused code). |
 
 Rollback is always **reverse order** (B⁻¹ before code⁻¹ before A⁻¹). Every reverse step is the
@@ -1378,7 +1530,10 @@ Forward fixes stay the default; rollback is for a gate that fails without a quic
 | A legacy process alive at nixos-B | Its runs need the keyed hosts and `:8123`, which B removes. | G3 makes B wait for it. Contract timing depends on the user's sessions ending: latency of the deploy, not downtime. |
 | `X-RestartIfChanged` read from the old unit at the A switch | The A switch would restart the VM undrained (calls usually survive via the rc=255 re-dial, but not guaranteed). | The lane assertion at T1 detects it. Fallback: split A into A1/A2 (+1 PR). |
 | Broker crash (not a graceful reload) | It loses in-memory runs not yet persisted. | Not caused by the switchover. Persist-on-reload covers every planned restart. |
-| A scraper browse session open across a scraper roll | Sessions are VM-memory. | Cannot happen: the roll requires all slots idle (no run, hence no session in use) for 300 s. |
+| A scraper browse session open across a scraper roll | Sessions are VM-memory. | Cannot happen: the roll holds every slot (no run, hence no session in use) **and** waits for `/health` to report 0 sessions and 0 pending artifacts before restarting (§12.3). |
+| **Broker outage in the `broker-only` era** (crash-loop, failed reload, an operator stopping the socket) | §12.4 refuses legacy whatever the socket's state, so calls fail closed rather than silently re-opening the keyed path. | Accepted, and deliberate: this is the trade that closes the fail-open. The zero-downtime promise covers the planned switchover steps, not an unplanned broker outage. `Restart=on-failure` plus the code-watch oneshot cover the recoverable cases; T5b tests the branch. |
+| **code⁻¹ applied without B⁻¹ first** | New-code processes are fail-closed while `egress-era` is still `broker-only`, until each session reconnects. | Reverse-order rollback (B⁻¹ → code⁻¹ → A⁻¹) avoids it entirely. T6 asserts both the correct order's zero failures and the wrong order's loud failure. |
+| **The scraper's pending-artifact count never reaches zero** (sustained load, or a stuck pull) | The roll's criterion is the scraper's own queue depth, so a permanently non-idle scraper defers the roll indefinitely. | `scraperQuietSeconds` caps the wait; past it the roll reports and keeps waiting rather than restarting over un-pulled artifacts. Deferring a roll is latency; restarting on top of live artifacts would be data loss. A roll pending over 24 h notifies. |
 
 **Size of §12 work** (on top of §9):
 - nixos-A additions: roll template + path units + protocheck + watchdog marker + broker
@@ -1387,5 +1542,10 @@ Forward fixes stay the default; rollback is for a gate that fails without a quic
 - research-agent dual-mode + graceful reload/persist + `/health` code hash + fake agent
   ≈ +600 lines;
 - cleanup PR ≈ −350 lines.
+
+Added by the 2026-11-03 review fold-in: era file + tmpfiles slot rules + the code-watch stop step
+(nixos-A, ≈ +40); the legacy env-only key resolver and the era-file dispatch (research-agent,
+≈ +60); the keyring clear (nixos-B, ≈ +20); T5b, the T6 wrong-order sub-run and keeping the real
+`microvm.vms.*` declarations (lane, ≈ +120).
 
 About 2 extra agent-days, dominated by the lane.
