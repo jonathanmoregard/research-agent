@@ -316,6 +316,64 @@ def test_sighup_after_a_real_change_drains_and_the_next_process_has_the_new_code
     assert p2.wait(10) == 0
 
 
+def test_no_connection_is_kept_alive_after_its_reply(rig):
+    """Every reply closes its connection (HTTP/1.0 semantics), so an idle
+    keep-alive client never parks a handler thread the drain would join."""
+    p = rig.start()
+    c = socket.create_connection(("127.0.0.1", rig.port), timeout=5)
+    try:
+        c.sendall(b"GET /v1/health HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
+        got = b""
+        while chunk := c.recv(4096):  # b"" = the broker closed its side
+            got += chunk
+        assert got.startswith(b"HTTP/1.0 200"), got
+    finally:
+        c.close()
+    p.send_signal(signal.SIGTERM)
+    assert p.wait(10) == 0
+
+
+@pytest.mark.parametrize("client", ["silent", "trickle"])
+def test_drain_does_not_wait_for_a_client_that_never_finishes_its_request(rig, client):
+    """§12.2 step 4 joins requests IN FLIGHT. A connection that has not sent
+    a whole request is not one: waiting on it would let any VM process stall
+    every reload — a silent one by the 15 s read timeout, one trickling a
+    byte per 10 s indefinitely, until TimeoutStopSec SIGKILLs the drain and
+    every genuinely in-flight request with it."""
+    p = rig.start()
+    c = socket.create_connection(("127.0.0.1", rig.port), timeout=30)
+    stop = threading.Event()
+    if client == "trickle":
+        c.sendall(b"POST /v1/scraper/render HTTP/1.1\r\n")
+
+        def trickle():
+            while not stop.wait(10.0):
+                try:
+                    c.sendall(b"X")
+                except OSError:
+                    return
+        threading.Thread(target=trickle, daemon=True).start()
+    try:
+        time.sleep(1.0)  # accepted: a handler thread is now reading it
+        t0 = time.monotonic()
+        p.send_signal(signal.SIGTERM)
+        try:
+            p.wait(30)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait(5)
+            raise AssertionError(f"drain held >30 s by a {client} client") from None
+        took = time.monotonic() - t0
+        assert p.returncode == 0
+        assert took < 5, f"drain waited {took:.1f}s on a {client} client"
+        err = p.stderr.read()
+        assert "cut 1 connection(s)" in err and "drained, exiting" in err, err
+        assert rig.scraper.hits == [], "a cut request must never be dispatched"
+    finally:
+        stop.set()
+        c.close()
+
+
 def test_admin_health_reports_location_independent_code_hash(rig, tmp_path):
     """`code` is the digest of what this process loaded (§12.2 step 4); the
     broker runs from /run/rb, an operator hashes the checkout: the value must

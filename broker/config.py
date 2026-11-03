@@ -109,3 +109,10 @@ SHIM_SCRAPER_TIMEOUT_S = {
 # --- run lifetime -------------------------------------------------------------
 MAX_RUN_TTL_S = 6 * 3600
 SWEEP_INTERVAL_S = 30.0
+
+# --- drain (§12.2) ---------------------------------------------------------------
+# A drain joins requests in flight, i.e. fully received. A connection still
+# sending its request gets this long to finish, then is cut: a real client
+# sends its whole request within milliseconds of connecting, and waiting on
+# one that does not would let any VM process stall every reload.
+DRAIN_READ_GRACE_S = 2.0

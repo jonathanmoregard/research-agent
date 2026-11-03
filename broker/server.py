@@ -318,6 +318,21 @@ class _Handler(BaseHTTPRequestHandler):
             return None
         return body if isinstance(body, dict) else None
 
+    def setup(self) -> None:
+        super().setup()
+        self.server.reading(self.connection)
+
+    def _received(self) -> bool:
+        """The whole request is in: from here it is in flight and the drain
+        waits for it. False if the drain already cut this connection."""
+        return self.server.received(self.connection)
+
+    def finish(self) -> None:
+        try:
+            super().finish()
+        finally:
+            self.server.forget(self.connection)
+
     def log_message(self, format, *args):  # noqa: A002 — per-request line is ours
         pass
 
@@ -329,6 +344,8 @@ class VMHandler(_Handler):
         big = path.endswith("/act") or path == "/v1/scraper/intercept"
         body = self._body(config.MAX_BROWSER_BODY_BYTES if big else config.MAX_BODY_BYTES) \
             if self.command == "POST" else {}
+        if not self._received():
+            return
         status, reply, run, reason = self.app.handle_vm(
             self.command, path, self.headers.get("Authorization", ""), body)
         self._reply(status, reply)
@@ -345,6 +362,8 @@ class VMHandler(_Handler):
 class AdminHandler(_Handler):
     def _handle(self) -> None:
         body = self._body(config.MAX_ADMIN_BODY_BYTES) if self.command == "POST" else {}
+        if not self._received():
+            return
         status, reply = self.app.handle_admin(self.command, self.path, body)
         self._reply(status, reply)
 
@@ -354,8 +373,60 @@ class AdminHandler(_Handler):
 class _Draining:
     # Non-daemon request threads + block_on_close: server_close() waits for
     # every in-flight request, so a drain never orphans a scraper command.
+    # "In flight" means fully received: a connection still sending its
+    # request is tracked separately and cut by the drain (cut_unfinished),
+    # or server_close() would wait on whoever opens a socket and goes quiet
+    # (the 15 s read timeout) or trickles bytes (forever).
     daemon_threads = False
     block_on_close = True
+
+    def __init__(self, *args, **kwargs):
+        self._unfinished: set = set()
+        self._cut: set = set()
+        self._conn_lock = threading.Lock()
+        self._cutting = False
+        super().__init__(*args, **kwargs)
+
+
+    def reading(self, conn) -> None:
+        with self._conn_lock:
+            if not self._cutting:
+                self._unfinished.add(conn)
+                return
+            self._cut.add(conn)  # accepted just before the drain, started after
+        _hang_up(conn)
+
+    def received(self, conn) -> bool:
+        with self._conn_lock:
+            self._unfinished.discard(conn)
+            return conn not in self._cut
+
+    def forget(self, conn) -> None:
+        with self._conn_lock:
+            self._unfinished.discard(conn)
+            self._cut.discard(conn)
+
+    def unfinished(self) -> int:
+        with self._conn_lock:
+            return len(self._unfinished)
+
+    def cut_unfinished(self) -> int:
+        with self._conn_lock:
+            self._cutting = True
+            conns, self._unfinished = self._unfinished, set()
+            self._cut |= conns
+        for conn in conns:
+            _hang_up(conn)
+        return len(conns)
+
+
+def _hang_up(conn) -> None:
+    """Wake the handler blocked reading this connection (EOF); it then
+    returns without dispatching, since received() says it was cut."""
+    try:
+        conn.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
 
 
 class TCPServer(_Draining, ThreadingHTTPServer):
@@ -460,6 +531,14 @@ def serve(app: Broker, socks: dict[str, socket.socket]) -> int:
     _save(app)
     for s in servers:
         s.shutdown()          # stop accepting at once; systemd queues new connections
+    # Requests still arriving get a short grace, then are cut; only fully
+    # received requests are in flight and worth the join below.
+    deadline = time.monotonic() + config.DRAIN_READ_GRACE_S
+    while any(s.unfinished() for s in servers) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    cut = sum(s.cut_unfinished() for s in servers)
+    if cut:
+        log(f"drain: cut {cut} connection(s) that never finished their request")
     for s in servers:
         s.server_close()      # joins in-flight request threads (bounded by route timeouts)
     _save(app)                # the handover includes work finished during the drain
