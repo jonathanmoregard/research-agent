@@ -1750,6 +1750,39 @@ That is roughly **15-25 min**; give the job `timeout-minutes: 45`. Locally the s
 runs. It needs no external network: the fake agent replaces the LLM, and every upstream is the
 `upstream` node.
 
+**What a green lane does NOT prove.** The standing constraint is that *everything* is e2e tested
+including the switchover, so the honest boundary of this lane has to be written down next to it —
+otherwise "the lane is green" gets read as "the switchover is proven", which is a stronger claim
+than the lane can make. Recorded 2026-11-04 from the lane's own construction:
+
+1. **Neither guest really reboots.** The microVMs are separate NixOS test nodes, and the lane
+   `mkForce`s `ExecStart`/`ExecStop` on the real `microvm@` units, so a "reboot" is
+   `switch-to-configuration` on the node plus stopping and starting sshd. This is deliberate and
+   is what lets T1 assert against the *real* unit definition (above), but it means the lane never
+   exercises an actual guest boot — kernel, initrd, virtiofs/NFS remount, or anything that only
+   fails on a cold start.
+2. **The LLM is `fake_agent.py`.** The real `claude` / `codex` CLIs are never in the jail, which is
+   why §8.1's `--clearenv` question is only half discharged: the Python stack (urllib, curl_cffi)
+   is proven against the test CA, Node's own TLS is not. See §8.1.
+3. **The MCP stdio layer is bypassed on the host side.** `loadgen.py` imports the real
+   `mcp_server.server` and calls `_run_agent` directly, with an `mcp.server.fastmcp` stub on
+   `PYTHONPATH`. So `research()`'s literal return string is never checked; the lane matches the
+   `_BrokerUnavailable` exception instead. A regression in how the error is *rendered to the
+   calling agent* would pass. (The agent side is not stubbed — `fake_agent.py` does speak real MCP
+   stdio to the real shims.)
+4. **Agenix is replaced** by a stub `age.secrets` option, so nothing about real secret decryption,
+   ownership or activation ordering is tested here.
+5. **The injection scanner is bypassed**, so no report ever goes through L1/L2.
+6. **T5's keyring assertion is absent**, not merely stubbed: the lane has no keyring, so "the
+   keyring holds none of the 8 keyed secrets" is unverified by this lane. It needs a different
+   harness or a manual check at the live switchover.
+
+None of these is a reason to weaken an assertion. They are the list of things that still need
+either a different harness or the first live run, and §12.6's gates are where that happens.
+**Where a test fake and production code agree, suspect the fake** — the `.sessions` /
+`open_sessions` defect survived twelve green `vm-microvm` runs because `tests/microvm.nix`'s fake
+scraper emitted the same wrong field name the roll read.
+
 ### 12.6 Live runbook, gates and probe loop
 
 **Probe.** `research-switchover-probe` is a host script, run as jonathan. It loops every 120 s
