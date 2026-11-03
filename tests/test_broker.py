@@ -622,11 +622,24 @@ def test_stale_code_never_refuses_a_registration(env, tmp_path):
     (root / "broker" / "x.py").write_text("a = 2\n")
     reg = {"run_id": RUN_A, "depth": "normal", "ttl_s": 60}
     assert app.handle_admin("POST", "/admin/runs", reg)[0] == 200
-    assert not app.exit_requested.is_set()
     # Health keeps reporting the code this process LOADED, so the oneshot
     # sees the difference and reloads.
     status, reply = app.handle_admin("GET", "/admin/health", None)
     assert reply["code"] == loaded != server.code_digest(str(root))
+    assert app.code_changed()  # what SIGHUP asks (§12.2 step 4)
+
+
+def test_code_changed_is_false_for_the_loaded_tree_and_true_when_gone(env, tmp_path):
+    root = tmp_path / "code"
+    (root / "broker").mkdir(parents=True)
+    (root / "scraper").mkdir()
+    (root / "broker" / "x.py").write_text("a = 1\n")
+    app = server.Broker(dict(CREDS), transport=env.transport, registry=Registry(),
+                        code_root=str(root))
+    assert not app.code_changed()
+    (root / "broker" / "x.py").unlink()
+    (root / "broker").rmdir()
+    assert app.code_changed()
 
 
 def test_deregister_closes_sessions_and_summarises(env, capsys):

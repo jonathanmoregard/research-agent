@@ -18,7 +18,10 @@ directory holding broker/ and scraper/ is put on sys.path here, and only
 that directory (in production it holds exactly those two read-only binds).
 
 Lifecycle (docs/egress-broker.md §12.2):
-  * SIGHUP (`systemctl reload`) and SIGTERM drain the same way:
+  * SIGHUP (`systemctl reload`) first recomputes the code digest
+    (broker/digest.py). Unchanged: a no-op, the same process keeps serving
+    (no drain, no state write). Changed: the drain below.
+  * SIGTERM always drains:
       1. persist the run registry to $STATE_DIRECTORY at once, before any
          waiting, so a SIGKILL at TimeoutStopSec leaves state at most one
          drain stale instead of gone;
@@ -28,8 +31,8 @@ Lifecycle (docs/egress-broker.md §12.2):
       4. persist again, then exit 0.
     The next start loads the runs, so a restart mid-run is invisible to
     the run.
-  * Code reload is driven from outside: the code-watch oneshot compares
-    its tree hash with `code` from GET /admin/health and sends SIGHUP.
+  * The code-watch oneshot reloads on every path event without hashing
+    anything; the comparison is ours, against the digest taken at boot.
 """
 from __future__ import annotations
 
@@ -40,9 +43,16 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import hashlib  # noqa: E402
+# Digest the tree BEFORE importing it: a pull landing between the two then
+# leaves `code` older than the loaded modules, so the next SIGHUP reloads.
+# The other order would let stale code pass as current.
+from broker.digest import code_digest  # noqa: E402
+
+BOOT_DIGEST = code_digest(_ROOT)
+
 import json  # noqa: E402
 import re  # noqa: E402
+import select  # noqa: E402
 import signal  # noqa: E402
 import socket  # noqa: E402
 import socketserver  # noqa: E402
@@ -52,7 +62,6 @@ import time  # noqa: E402
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
 
 from broker import config, marketplaces, scraper_proxy, search, trademark, upstream  # noqa: E402
-from broker.digest import code_digest  # noqa: E402,F401 — re-exported for tests
 from broker.runs import Registry, RouteError, Run, log  # noqa: E402
 from scraper import urlpolicy  # noqa: E402
 
@@ -77,16 +86,16 @@ class Broker:
     def __init__(self, creds: dict[str, str], transport=upstream.curl_transport,
                  scraper: scraper_proxy.Scraper | None = None,
                  registry: Registry | None = None, state_dir: str | None = None,
-                 code_root: str = _ROOT, sleep=time.sleep):
+                 code_root: str = _ROOT, loaded_digest: str | None = None,
+                 sleep=time.sleep):
         self.creds = creds
         self.transport = transport
         self.scraper = scraper or scraper_proxy.Scraper()
         self.registry = registry or Registry()
         self.state_dir = state_dir
         self.code_root = code_root
-        self.loaded_digest = code_digest(code_root)
+        self.loaded_digest = loaded_digest or code_digest(code_root)
         self.sleep = sleep
-        self.exit_requested = threading.Event()
         self._sems = {name: threading.BoundedSemaphore(config.UPSTREAM_CONCURRENCY)
                       for name in list(config.ROUTE_BUDGETS)}
 
@@ -152,6 +161,13 @@ class Broker:
             return fn()
         finally:
             sem.release()
+
+    def code_changed(self) -> bool:
+        """SIGHUP's question: is the tree on disk not the code we loaded?"""
+        try:
+            return code_digest(self.code_root) != self.loaded_digest
+        except Exception:  # unreadable tree: reload, the oneshot handles "gone"
+            return True
 
     # --- admin listener ---------------------------------------------------------
     def handle_admin(self, method: str, path: str, body: dict | None) -> tuple[int, dict]:
@@ -398,6 +414,18 @@ def _dev_sockets() -> dict[str, socket.socket]:
 
 
 def serve(app: Broker, socks: dict[str, socket.socket]) -> int:
+    # Signals reach the main loop through a wakeup fd: CPython's C handler
+    # writes the signal number there from whichever thread the kernel chose.
+    # A Python-level handler alone runs only when the MAIN thread next runs
+    # bytecode, so a SIGTERM delivered to a request thread would wait out the
+    # main thread's sleep (SWEEP_INTERVAL_S) before the drain even began.
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_r, False)
+    os.set_blocking(wake_w, False)
+    signal.set_wakeup_fd(wake_w, warn_on_full_buffer=False)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda signum, frame: None)  # the fd carries it
+
     servers = [make_server(socks[config.FD_NAME_VM], VMHandler, app),
                make_server(socks[config.FD_NAME_ADMIN], AdminHandler, app)]
     threads = [threading.Thread(target=s.serve_forever, kwargs={"poll_interval": 0.5},
@@ -405,19 +433,28 @@ def serve(app: Broker, socks: dict[str, socket.socket]) -> int:
     for t in threads:
         t.start()
 
-    def _term(signum, frame):
-        log(f"signal {signum}: draining")
-        app.exit_requested.set()
-
-    # SIGHUP is `systemctl reload` (ExecReload=kill -HUP $MAINPID): the same
-    # drain as a stop; socket activation then starts the new code.
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(sig, _term)
-    while not app.exit_requested.wait(config.SWEEP_INTERVAL_S):
+    while True:
+        if not select.select([wake_r], [], [], config.SWEEP_INTERVAL_S)[0]:
+            try:
+                app.sweep()
+            except Exception as e:  # never let the sweeper kill the broker
+                log(f"sweep failed: {type(e).__name__}")
+            continue
         try:
-            app.sweep()
-        except Exception as e:  # never let the sweeper kill the broker
-            log(f"sweep failed: {type(e).__name__}")
+            got = set(os.read(wake_r, 64))
+        except BlockingIOError:
+            continue
+        stop = sorted(got & {signal.SIGTERM, signal.SIGINT})
+        if stop:
+            log(f"signal {stop[0]}: draining")
+            break
+        if signal.SIGHUP in got:
+            # `systemctl reload` on every code-path event (§12.2 step 4).
+            if app.code_changed():
+                log(f"signal {signal.SIGHUP}: code changed, draining for reload")
+                break
+            log(f"signal {signal.SIGHUP}: code unchanged "
+                f"({app.loaded_digest[:12]}), still serving")
     # Persist first: everything below can outlast TimeoutStopSec, and a
     # SIGKILL then must cost at most the drain's progress, not the registry.
     _save(app)
@@ -440,7 +477,8 @@ def _save(app: Broker) -> None:
 def main() -> int:
     creds = upstream.load_credentials()
     configured = sorted(k for k, v in creds.items() if v)
-    app = Broker(creds, state_dir=os.environ.get("STATE_DIRECTORY", "").split(":")[0] or None)
+    app = Broker(creds, state_dir=os.environ.get("STATE_DIRECTORY", "").split(":")[0] or None,
+                 loaded_digest=BOOT_DIGEST)
     app.load_state()
     socks = inherited_sockets() or _dev_sockets()
     missing = {config.FD_NAME_VM, config.FD_NAME_ADMIN} - set(socks)

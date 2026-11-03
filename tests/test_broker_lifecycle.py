@@ -155,6 +155,11 @@ class Rig:
             time.sleep(0.02)
         assert self.scraper.hits
 
+    def change_code(self):
+        """What a pull does: a real change to a file the digest covers."""
+        cfg = self.code / "broker" / "config.py"
+        cfg.write_text(cfg.read_text() + "\n# pulled\n")
+
     def close(self):
         for p in self.procs:
             if p.poll() is None:
@@ -226,6 +231,8 @@ def test_drain_persists_before_joining_in_flight(tmp_path, sig):
         t = threading.Thread(target=in_flight, daemon=True)
         t.start()
         rig.wait_for_hit(t.is_alive)
+        if sig == signal.SIGHUP:
+            rig.change_code()  # an unchanged-code SIGHUP is a no-op (§12.2 step 4)
         p1.send_signal(sig)
         saved = rig.state / "runs.json"
         deadline = time.monotonic() + 3
@@ -260,11 +267,59 @@ def test_drain_persists_before_joining_in_flight(tmp_path, sig):
         rig.close()
 
 
+def test_sighup_with_unchanged_code_keeps_the_same_process_serving(rig):
+    """§12.2 step 4: the code-watch oneshot reloads unconditionally on every
+    path event; the broker owns the comparison. Same digest → no drain, no
+    re-exec, no state write — a spurious event costs nothing."""
+    p = rig.start()
+    token = rig.register()
+    p.send_signal(signal.SIGHUP)
+    time.sleep(1.0)  # a drain with nothing in flight exits well inside this
+    assert p.poll() is None, "an unchanged-code SIGHUP must not drain"
+    assert not (rig.state / "runs.json").exists(), "no state write on a no-op"
+    # The same process, with its in-memory registry, still serves the run.
+    status, reply = rig.post("/v1/scraper/render", {"url": "https://start.example/"}, token)
+    assert status == 200, reply
+    p.send_signal(signal.SIGHUP)  # repeated events stay no-ops
+    time.sleep(0.5)
+    assert p.poll() is None
+    p.send_signal(signal.SIGTERM)  # SIGTERM always drains
+    assert p.wait(10) == 0
+    err = p.stderr.read()
+    assert err.count("code unchanged") == 2, err
+    assert err.count("draining") == 1, err
+    assert "state saved: 1 run(s)" in err
+
+
+def test_sighup_after_a_real_change_drains_and_the_next_process_has_the_new_code(rig):
+    p1 = rig.start()
+    token = rig.register()
+    rig.change_code()
+    p1.send_signal(signal.SIGHUP)
+    assert p1.wait(10) == 0
+    err1 = p1.stderr.read()
+    assert "code changed" in err1 and "state saved: 1 run(s)" in err1, err1
+    assert (rig.state / "runs.json").exists()
+
+    p2 = rig.start()  # socket activation on the next connection
+    status, reply = rig.admin_call("GET", "/admin/health")
+    assert status == 200
+    sys.path.insert(0, str(REPO))
+    try:
+        from broker.digest import code_digest
+    finally:
+        sys.path.remove(str(REPO))
+    assert reply["code"] == code_digest(str(rig.code)), "the new process loaded the new code"
+    status, reply = rig.post("/v1/scraper/render", {"url": "https://start.example/"}, token)
+    assert status == 200, reply  # the run survived the reload
+    p2.send_signal(signal.SIGTERM)
+    assert p2.wait(10) == 0
+
+
 def test_admin_health_reports_location_independent_code_hash(rig, tmp_path):
-    """The code-watch oneshot (§12.2 step 4) compares its own tree hash of
-    broker/ + scraper/urlpolicy.py with this field. The broker runs from
-    /run/rb, the oneshot hashes the checkout: the hash must not depend on
-    where the tree is mounted."""
+    """`code` is the digest of what this process loaded (§12.2 step 4); the
+    broker runs from /run/rb, an operator hashes the checkout: the value must
+    not depend on where the tree is mounted."""
     sys.path.insert(0, str(REPO))
     try:
         from broker.digest import code_digest
