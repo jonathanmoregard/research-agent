@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 import types
 import urllib.request
 from pathlib import Path
@@ -121,6 +122,20 @@ def test_health_counts_pending_artifacts_until_pulled(health, checkout):
     finally:
         store.take(RUN)  # what the MCP's pull does
     assert health()[1]["pending_artifacts"] == before
+
+
+def test_an_expired_artifact_is_not_pending(health, checkout, monkeypatch):
+    """pending() sweeps first: an artifact nobody pulled (its run crashed)
+    stops counting at ARTIFACT_TTL_S even while the browser worker, whose
+    loop also sweeps, is not running. That TTL is what bounds an orphan."""
+    store = sessions.ArtifactStore()
+    monkeypatch.setattr(sessions, "_artifact_store", store)
+    monkeypatch.setattr(sessions, "_worker", None)
+    store.add(RUN, "shot-1", b"\x89PNG-fake", "image/png")
+    assert health()[1]["pending_artifacts"] == 1
+    monkeypatch.setattr(sessions, "ARTIFACT_TTL_S", 0.0)
+    time.sleep(0.01)
+    assert health()[1]["pending_artifacts"] == 0
 
 
 class _FakeBrowser:
