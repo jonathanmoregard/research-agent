@@ -41,6 +41,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+try:  # imported as agent.shims.* (tests)
+    from agent.shims import broker_client
+except ImportError:  # run as a script in the jail: the sibling file
+    import broker_client  # type: ignore[no-redef]
+
 # Identify honestly. These are official APIs; nothing here imitates a browser.
 USER_AGENT = "research-agent-shopping-shim/1.0 (personal read-only search)"
 
@@ -435,7 +440,10 @@ def ebay_listing_url(it, marketplace: str = EBAY_DEFAULT_MARKETPLACE) -> str:
     return f"https://{host}/itm/{item_id}"
 
 
-def format_ebay_items(body, marketplace: str = EBAY_DEFAULT_MARKETPLACE) -> str:
+def format_ebay_items(body, marketplace: str = EBAY_DEFAULT_MARKETPLACE,
+                      broker_urls: bool = False) -> str:
+    """`broker_urls`: items came from the broker, which strips eBay's raw id
+    fields and returns the canonical listing URL it built as `url`."""
     if not isinstance(body, dict):
         return "(unexpected response shape)"
     items = body.get("itemSummaries")
@@ -472,8 +480,8 @@ def format_ebay_items(body, marketplace: str = EBAY_DEFAULT_MARKETPLACE) -> str:
                 f"seller {_clip(seller.get('feedbackPercentage'), 8)}% "
                 f"({_clip(seller.get('feedbackScore'), 10)})"
             )
-        lines.append("- " + " | ".join(parts)
-                     + f"\n    {ebay_listing_url(it, marketplace) or '(no usable URL)'}")
+        link = _url(it.get("url")) if broker_urls else ebay_listing_url(it, marketplace)
+        lines.append("- " + " | ".join(parts) + f"\n    {link or '(no usable URL)'}")
     return "\n".join(lines)
 
 
@@ -504,7 +512,17 @@ def _ebay_access_token() -> str:
 
 
 def _tool_ebay_search(args: dict) -> str:
-    url, headers = build_ebay_request(args)
+    url, headers = build_ebay_request(args)  # validates args on either path
+    if broker_client.enabled():
+        # The broker holds the keyset, the OAuth token and the etiquette.
+        body = broker_client.post("/v1/ebay/search", args, broker_client.KEYED_TIMEOUT_S)
+        marketplace = headers["X-EBAY-C-MARKETPLACE-ID"]
+        return _wrap_untrusted(
+            "ebay-browse-api",
+            f"eBay search — marketplace={marketplace} "
+            f"query={args.get('query')!r}\n\n"
+            + format_ebay_items(body, marketplace, broker_urls=True),
+        )
     if not EBAY_CLIENT_ID or not EBAY_CLIENT_SECRET:
         raise RuntimeError(
             "eBay search is not configured (EBAY_CLIENT_ID / "
@@ -730,7 +748,14 @@ def format_tradera_items(body) -> str:
 
 
 def _tool_tradera_search(args: dict) -> str:
-    url = build_tradera_request(args)
+    url = build_tradera_request(args)  # validates args on either path
+    if broker_client.enabled():
+        body = broker_client.post("/v1/tradera/search", args, broker_client.KEYED_TIMEOUT_S)
+        return _wrap_untrusted(
+            "tradera-api-v4",
+            f"Tradera search — query={args.get('query')!r} "
+            f"page={args.get('page') or 0}\n\n" + format_tradera_items(body),
+        )
     if not TRADERA_APP_ID or not TRADERA_APP_KEY:
         raise RuntimeError(
             "Tradera API search is not configured (TRADERA_APP_ID / "
@@ -791,6 +816,12 @@ CAPABILITIES = {"tools": {"listChanged": False}}
 
 
 def _error_text(tool: str, e: Exception) -> str:
+    if isinstance(e, broker_client.BrokerError):
+        # The broker's own wording (§2.6); an upstream body only inside the wrap.
+        detail = _clip(e.upstream_body, 300)
+        return f"ERROR: {e}" + (
+            "\n" + _wrap_untrusted(f"{tool}-error-body", detail) if detail else ""
+        )
     if isinstance(e, ApiError):
         detail = _clip(e.body, 300)
         return f"ERROR: {tool}: the API answered HTTP {e.status}." + (

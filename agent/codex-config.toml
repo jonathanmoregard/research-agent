@@ -33,34 +33,39 @@ code_mode_host = false
 unified_exec = false
 workspace_dependencies = false
 
+# Dual mode (docs/egress-broker.md §12.4): a broker-mode jail carries
+# RESEARCH_BROKER_URL/TOKEN and no key (bwrap --clearenv), so the key names
+# below pass nothing there; a legacy-mode jail carries the keys and no token.
+# The key names are removed with the legacy path in the cleanup PR (§12.1
+# PR 4), after which this file names no key (§8.1).
 [mcp_servers.exa]
 command = "python3"
 args = ["/workspace/agent/shims/exa_shim.py"]
-env_vars = ["EXA_API_KEY"]
+env_vars = ["RESEARCH_BROKER_URL", "RESEARCH_BROKER_TOKEN", "EXA_API_KEY"]
 enabled_tools = ["web_search_exa"]
 
 [mcp_servers.tavily-remote-mcp]
 command = "python3"
 args = ["/workspace/agent/shims/tavily_shim.py"]
-env_vars = ["TAVILY_API_KEY"]
+env_vars = ["RESEARCH_BROKER_URL", "RESEARCH_BROKER_TOKEN", "TAVILY_API_KEY"]
 enabled_tools = ["tavily_search"]
 
 [mcp_servers.render]
 command = "python3"
 args = ["/workspace/agent/shims/render_shim.py"]
-env_vars = ["RESEARCH_RUN_ID"]
+env_vars = ["RESEARCH_BROKER_URL", "RESEARCH_BROKER_TOKEN", "RESEARCH_RUN_ID"]
 enabled_tools = ["render_page", "intercept_page", "browse_open", "browse_act", "browse_screenshot", "browse_save_screenshot", "browse_close"]
 
 [mcp_servers.trademark]
 command = "python3"
 args = ["/workspace/agent/shims/trademark_shim.py"]
-env_vars = ["EUIPO_CLIENT_ID", "EUIPO_CLIENT_SECRET"]
+env_vars = ["RESEARCH_BROKER_URL", "RESEARCH_BROKER_TOKEN", "EUIPO_CLIENT_ID", "EUIPO_CLIENT_SECRET"]
 enabled_tools = ["trademark_search"]
 
 [mcp_servers.shopping]
 command = "python3"
 args = ["/workspace/agent/shims/shopping_shim.py"]
-env_vars = ["EBAY_CLIENT_ID", "EBAY_CLIENT_SECRET", "TRADERA_APP_ID", "TRADERA_APP_KEY"]
+env_vars = ["RESEARCH_BROKER_URL", "RESEARCH_BROKER_TOKEN", "EBAY_CLIENT_ID", "EBAY_CLIENT_SECRET", "TRADERA_APP_ID", "TRADERA_APP_KEY"]
 enabled_tools = ["ebay_search", "tradera_search"]
 
 [mcp_servers.bolagsverket]

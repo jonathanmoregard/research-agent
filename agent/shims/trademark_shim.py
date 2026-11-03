@@ -43,6 +43,11 @@ import time
 
 from curl_cffi import requests as cfrequests  # type: ignore
 
+try:  # imported as agent.shims.* (tests)
+    from agent.shims import broker_client
+except ImportError:  # run as a script in the jail: the sibling file
+    import broker_client  # type: ignore[no-redef]
+
 def _clean_env(name: str) -> str:
     """Read an env var, treating an unsubstituted ``${VAR}`` literal as unset.
 
@@ -254,15 +259,39 @@ def _format_hits(body) -> str:
             raw = json.dumps(rec)[:1000]
             out_lines.append(f"- (unparsed record) raw: {raw}")
             continue
-        out_lines.append(
-            f"- {h.get('mark') or '(no mark text)'}"
-            f" | app {h.get('applicationNumber') or '?'}"
-            f" | owner {h.get('owner') or '?'}"
-            f" | classes {h.get('niceClasses') or '?'}"
-            f" | {h.get('status') or '?'}"
-            f" | filed {h.get('filingDate') or '?'}"
-            + (f"\n    {h['url']}" if h.get("url") else "")
-        )
+        out_lines.append(_hit_line(h))
+    return "\n".join(out_lines)
+
+
+def _hit_line(h: dict) -> str:
+    return (
+        f"- {h.get('mark') or '(no mark text)'}"
+        f" | app {h.get('applicationNumber') or '?'}"
+        f" | owner {h.get('owner') or '?'}"
+        f" | classes {h.get('niceClasses') or '?'}"
+        f" | {h.get('status') or '?'}"
+        f" | filed {h.get('filingDate') or '?'}"
+        + (f"\n    {h['url']}" if h.get("url") else "")
+    )
+
+
+def _format_broker_hits(body) -> str:
+    """The broker returns hits already in `normalize_hit`'s shape (or
+    {"raw": ...} for an unparsed record), plus `raw` when no list was found."""
+    hits = body.get("hits") if isinstance(body, dict) else None
+    if not isinstance(hits, list) or not hits:
+        raw = body.get("raw") if isinstance(body, dict) else None
+        if isinstance(raw, str) and raw:
+            return f"(no recognized result list)\n--- raw (capped) ---\n{raw}"
+        return "0 result(s)"
+    out_lines = [f"{len(hits)} result(s) (showing up to {MAX_HITS}):\n"]
+    for h in hits[:MAX_HITS]:
+        if not isinstance(h, dict):
+            continue
+        if set(h) == {"raw"}:
+            out_lines.append(f"- (unparsed record) raw: {h['raw']}")
+            continue
+        out_lines.append(_hit_line(h))
     return "\n".join(out_lines)
 
 
@@ -314,7 +343,21 @@ def _tool_trademark_search(args: dict) -> str:
     exact = bool(args.get("exact", False))
     size = int(args.get("size") or 25)
     size = max(1, min(size, MAX_HITS))
-    filter_str = build_filter(name, nice_classes, status, exact)
+    filter_str = build_filter(name, nice_classes, status, exact)  # validates on either path
+    header = (
+        f"EUIPO trademark search — query={name!r} "
+        f"classes={nice_classes or 'all'} status={status or 'all'} "
+        f"exact={exact}\n\n"
+    )
+    if broker_client.enabled():
+        # The broker holds the client credentials and the OAuth token.
+        try:
+            body = broker_client.post("/v1/euipo/search", args, broker_client.KEYED_TIMEOUT_S)
+        except broker_client.BrokerError as e:
+            # The whole error is wrapped untrusted by _handle, as before.
+            detail = (e.upstream_body or "")[:300]
+            raise RuntimeError(f"{e}: {detail}" if detail else str(e)) from None
+        return header + _format_broker_hits(body)
     token = _get_token()
     r = cfrequests.get(
         f"{API_BASE}/trademarks",
@@ -330,11 +373,6 @@ def _tool_trademark_search(args: dict) -> str:
     if r.status_code >= 400:
         raise RuntimeError(f"EUIPO search HTTP {r.status_code}: {r.text[:300]}")
     body = r.json()
-    header = (
-        f"EUIPO trademark search — query={name!r} "
-        f"classes={nice_classes or 'all'} status={status or 'all'} "
-        f"exact={exact}\n\n"
-    )
     return header + _format_hits(body)
 
 

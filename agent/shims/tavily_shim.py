@@ -16,6 +16,11 @@ import sys
 
 from curl_cffi import requests as cfrequests  # type: ignore
 
+try:  # imported as agent.shims.* (tests)
+    from agent.shims import broker_client
+except ImportError:  # run as a script in the jail: the sibling file
+    import broker_client  # type: ignore[no-redef]
+
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 TAVILY_BASE = "https://api.tavily.com"
 IMPERSONATE = "chrome"
@@ -78,16 +83,24 @@ def _tool_tavily_search(args: dict) -> str:
     max_results = int(args.get("max_results") or 5)
     depth = args.get("search_depth") or "basic"
     raw = args.get("include_raw_content") is True
-    resp = _post(
-        "/search",
-        {
-            "query": query,
-            "max_results": max(1, min(max_results, 20)),
-            "search_depth": depth,
-            "include_answer": True,
-            "include_raw_content": raw,
-        },
-    )
+    if broker_client.enabled():
+        # The broker holds the key and always asks for the answer (§12.4).
+        resp = broker_client.post(
+            "/v1/tavily/search",
+            {"query": query, "max_results": max(1, min(max_results, 20)),
+             "search_depth": depth, "include_raw_content": raw},
+            broker_client.KEYED_TIMEOUT_S)
+    else:
+        resp = _post(
+            "/search",
+            {
+                "query": query,
+                "max_results": max(1, min(max_results, 20)),
+                "search_depth": depth,
+                "include_answer": True,
+                "include_raw_content": raw,
+            },
+        )
     lines: list[str] = []
     if resp.get("answer"):
         lines.append(f"Answer: {resp['answer']}\n")

@@ -22,6 +22,11 @@ import sys
 import urllib.error
 import urllib.request
 
+try:  # imported as agent.shims.* (tests)
+    from agent.shims import broker_client
+except ImportError:  # run as a script in the jail: the sibling file
+    import broker_client  # type: ignore[no-redef]
+
 API_URL = os.environ.get("SCRAPER_API_URL", "http://10.0.2.2:8123/render")
 # Derive the intercept URL from the same scraper-API base unless explicitly
 # overridden, so a single SCRAPER_API_URL env override moves both endpoints
@@ -416,6 +421,20 @@ def _post_scraper(endpoint_url: str, payload: dict, timeout_ms: int,
     return out
 
 
+def _post(route: str, scraper_url: str, broker_path: str, payload: dict,
+          timeout_ms: int, max_bytes: int | None = None) -> dict:
+    """Dual mode (§12.4, §4.4). With a broker token: the broker's scraper
+    route — the broker holds the scraper bearer, gates the URL and derives
+    the run from the token, so no run_id is ever sent. Without: today's
+    direct call to the scraper VM."""
+    if broker_client.enabled():
+        return broker_client.post(broker_path, payload, broker_client.SCRAPER_TIMEOUT_S[route],
+                                  max_bytes=max_bytes or MAX_BODY_BYTES)
+    if max_bytes is None:  # the legacy call, exactly as before
+        return _post_scraper(scraper_url, payload, timeout_ms)
+    return _post_scraper(scraper_url, payload, timeout_ms, max_bytes=max_bytes)
+
+
 def _slice_utf8(content: str, offset: int, cap: int) -> tuple[str, int | None]:
     """Return up to `cap` bytes of `content` from byte `offset`, and the
     offset to continue from (None when nothing is left).
@@ -453,8 +472,9 @@ def _tool_render_page(args: dict) -> str:
     offset = args.get("offset") or 0
     if not isinstance(offset, int) or offset < 0:
         raise RuntimeError("offset must be a non-negative integer")
-    out = _post_scraper(API_URL, {"url": url, "timeout_ms": timeout_ms}, timeout_ms,
-                        max_bytes=MAX_RENDER_TRANSPORT_BYTES)
+    out = _post("render", API_URL, "/v1/scraper/render",
+                {"url": url, "timeout_ms": timeout_ms}, timeout_ms,
+                max_bytes=MAX_RENDER_TRANSPORT_BYTES)
     if fmt == "text" and isinstance(out.get("text"), str):
         label = "TEXT (visible, links as [text](url))"
         content = out["text"]
@@ -501,7 +521,7 @@ def _tool_intercept_page(args: dict) -> str:
         "capture_patterns": capture_patterns,
         "timeout_ms": timeout_ms,
     }
-    out = _post_scraper(INTERCEPT_URL, payload, timeout_ms)
+    out = _post("intercept", INTERCEPT_URL, "/v1/scraper/intercept", payload, timeout_ms)
     captured = out.get("captured") or []
     header = [
         f"Requested-URL: {_clip(out.get('requested_url') or url, MAX_LISTED_URL)}",
@@ -557,9 +577,8 @@ def _tool_browse_open(args: dict) -> list:
     payload: dict = {"url": url}
     if isinstance(args.get("viewport"), dict):
         payload["viewport"] = args["viewport"]
-    out = _post_scraper(f"{SESSION_BASE}/session/open", payload,
-                        BROWSE_OPEN_TIMEOUT_MS,
-                        max_bytes=MAX_BROWSE_BODY_BYTES)
+    out = _post("open", f"{SESSION_BASE}/session/open", "/v1/scraper/session/open",
+                payload, BROWSE_OPEN_TIMEOUT_MS, max_bytes=MAX_BROWSE_BODY_BYTES)
     return _observation_blocks(out)
 
 
@@ -568,18 +587,19 @@ def _tool_browse_act(args: dict) -> list:
     actions = args.get("actions") or []
     if not isinstance(actions, list) or not actions:
         raise RuntimeError("actions must be a non-empty list")
-    out = _post_scraper(f"{SESSION_BASE}/session/{sid}/act",
-                        {"actions": actions}, BROWSE_ACT_TIMEOUT_MS,
-                        max_bytes=MAX_BROWSE_BODY_BYTES)
+    out = _post("act", f"{SESSION_BASE}/session/{sid}/act",
+                f"/v1/scraper/session/{sid}/act",
+                {"actions": actions}, BROWSE_ACT_TIMEOUT_MS,
+                max_bytes=MAX_BROWSE_BODY_BYTES)
     return _observation_blocks(out)
 
 
 def _tool_browse_screenshot(args: dict) -> list:
     sid = _check_sid(args)
-    out = _post_scraper(f"{SESSION_BASE}/session/{sid}/screenshot",
-                        {"full_page": bool(args.get("full_page"))},
-                        BROWSE_OP_TIMEOUT_MS,
-                        max_bytes=MAX_BROWSE_BODY_BYTES)
+    out = _post("screenshot", f"{SESSION_BASE}/session/{sid}/screenshot",
+                f"/v1/scraper/session/{sid}/screenshot",
+                {"full_page": bool(args.get("full_page"))},
+                BROWSE_OP_TIMEOUT_MS, max_bytes=MAX_BROWSE_BODY_BYTES)
     return [_image_block(out)]
 
 
@@ -588,13 +608,18 @@ def _tool_browse_save_screenshot(args: dict) -> str:
     name = args.get("name") or ""
     if not isinstance(name, str) or not name:
         raise RuntimeError("name is required")
-    if not RUN_ID:
-        raise RuntimeError(
-            "RESEARCH_RUN_ID not set — artifact saving unavailable in this jail"
-        )
-    out = _post_scraper(f"{SESSION_BASE}/session/{sid}/save_artifact",
-                        {"name": name, "run_id": RUN_ID},
-                        BROWSE_OP_TIMEOUT_MS)
+    if broker_client.enabled():
+        # The broker fills in run_id from the token, never from a request.
+        out = _post("save_artifact", "", f"/v1/scraper/session/{sid}/save_artifact",
+                    {"name": name}, BROWSE_OP_TIMEOUT_MS)
+    else:
+        if not RUN_ID:
+            raise RuntimeError(
+                "RESEARCH_RUN_ID not set — artifact saving unavailable in this jail"
+            )
+        out = _post_scraper(f"{SESSION_BASE}/session/{sid}/save_artifact",
+                            {"name": name, "run_id": RUN_ID},
+                            BROWSE_OP_TIMEOUT_MS)
     stored = out.get("name") or name
     return (
         f"Saved screenshot as report artifact '{stored}'. Reference it in the "
@@ -604,8 +629,8 @@ def _tool_browse_save_screenshot(args: dict) -> str:
 
 def _tool_browse_close(args: dict) -> str:
     sid = _check_sid(args)
-    _post_scraper(f"{SESSION_BASE}/session/{sid}/close", {},
-                  BROWSE_OP_TIMEOUT_MS)
+    _post("close", f"{SESSION_BASE}/session/{sid}/close",
+          f"/v1/scraper/session/{sid}/close", {}, BROWSE_OP_TIMEOUT_MS)
     return f"Session {sid} closed."
 
 

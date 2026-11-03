@@ -18,6 +18,11 @@ import sys
 
 from curl_cffi import requests as cfrequests  # type: ignore
 
+try:  # imported as agent.shims.* (tests)
+    from agent.shims import broker_client
+except ImportError:  # run as a script in the jail: the sibling file
+    import broker_client  # type: ignore[no-redef]
+
 EXA_API_KEY = os.environ.get("EXA_API_KEY", "")
 EXA_BASE = "https://api.exa.ai"
 IMPERSONATE = "chrome"
@@ -98,6 +103,14 @@ def _tool_web_search_exa(args: dict) -> str:
     num = int(args.get("numResults") or 5)
     num = max(1, min(num, 100))
     full_text = args.get("fullText") is True
+    if broker_client.enabled():
+        # The broker holds the key and builds the Exa request (§12.4).
+        body = broker_client.post(
+            "/v1/exa/search", {"query": query, "numResults": num, "fullText": full_text},
+            broker_client.KEYED_TIMEOUT_S)
+        text = "\n".join(_format_result(r, full_text) for r in (body.get("results") or [])
+                         if isinstance(r, dict)) or "(no results)"
+        return _wrap_untrusted(text)
     contents: dict = {"highlights": True}
     if full_text:
         contents = {"text": {"maxCharacters": FULL_TEXT_CHARS}}
