@@ -53,12 +53,11 @@ class Scraper:
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {token}"})
         try:
-            # arftl-allow: suppression-marker — B310 warns about urlopen with a
-            # caller-influenced scheme. The URL here is built from a hardcoded
-            # http://127.0.0.1 base (config.SCRAPER_BASE) plus a fixed route path,
-            # so file:// and friends are unreachable by construction; the model
-            # never supplies any part of it.
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec B310 - fixed http://127.0.0.1 base
+            # B310 warns about urlopen with a caller-influenced scheme. The URL
+            # here is built from a hardcoded http://127.0.0.1 base plus a fixed
+            # route path, so file:// and friends are unreachable by construction;
+            # the model never supplies any part of it.
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec B310 - fixed http://127.0.0.1 base  # arftl-allow: suppression-marker
                 status, raw = resp.status, resp.read(MAX_SCRAPER_REPLY_BYTES + 1)
         except urllib.error.HTTPError as e:
             status, raw = e.code, e.read(4096)
