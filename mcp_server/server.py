@@ -549,10 +549,18 @@ _EGRESS_ERAS = ("legacy-ok", "broker-only")
 _GUEST_PROTOCOL_PATH = Path(__file__).resolve().parent.parent / "scripts" / ".guest-protocol"
 _GUEST_PROTOCOL_BROKER = "broker-v1"
 _BROKER_ADMIN_DEFAULT = "/run/research-broker/admin.sock"
-# A registration that starts inside a broker reload waits out the drain
-# (TimeoutStopSec=210) plus the new process's start. Shorter would fail
-# exactly the calls zero-downtime promises to keep (§12.2).
+# Admin-socket budgets, split by PHASE, not errno (§2.6). systemd holds the
+# listening fd across a reload, so a reload never fails connect(): the
+# connection queues in the backlog and the reply waits out the drain
+# (TimeoutStopSec=210) plus the new process's start. That wait is the READ.
 _BROKER_REGISTER_BUDGET_S = 240.0
+# ENOENT / ECONNREFUSED mean systemd is NOT holding the listener (socket unit
+# stopped or never started) — never a reload. Retry only long enough to
+# cover a unit-restart race, then take the era's verdict.
+_BROKER_CONNECT_RETRY_S = 15.0
+# Deregistration is cleanup (the TTL is the backstop): it must never make a
+# finished result wait out a drain.
+_BROKER_DEREGISTER_TIMEOUT_S = 5.0
 _BROKER_REPLY_CAP = 64 * 1024
 # The 8 third-party keys the legacy protocol ships, by env var.
 _LEGACY_KEY_ENV = {k: v for k, v in _SECRET_ENV.items() if k != "claude-token"}
@@ -596,13 +604,22 @@ def _egress_mode() -> tuple[str, str, str]:
     except OSError:
         marker = ""
     has_marker = marker == _GUEST_PROTOCOL_BROKER
-    has_socket = os.path.exists(_broker_admin_path())
+    admin = _broker_admin_path()
+    has_socket = os.path.exists(admin)
     if era == "broker-only":
         if not has_marker:
             return "closed", "no-protocol-marker", label
-        # Socket absent is still broker mode: registration retries it for its
-        # budget (a socket-unit restart), then fails closed. Never legacy.
-        return "broker", "broker-present" if has_socket else "broker-absent", label
+        # Legacy is impossible here; a missing socket gets only the short
+        # unit-restart grace before the era's verdict (closed).
+        deadline = time.monotonic() + _BROKER_CONNECT_RETRY_S
+        while not has_socket and time.monotonic() < deadline:
+            time.sleep(min(0.1, max(deadline - time.monotonic(), 0)))
+            has_socket = os.path.exists(admin)
+        if not has_socket:
+            return "closed", "broker-absent", label
+        return "broker", "broker-present", label
+    # Transition era: a missing socket is today's pre-broker host — legacy at
+    # once, no grace wait on every pre-nixos-A dial.
     if not has_socket:
         return "legacy", "no-broker", label
     if not has_marker:
@@ -621,40 +638,41 @@ def _legacy_keys() -> dict[str, str]:
     return {name: os.environ.get(var) or "" for name, var in _LEGACY_KEY_ENV.items()}
 
 
-def _broker_admin(method: str, path: str, body: dict | None) -> dict:
-    """One admin-socket request, retried through a reload window.
+def _broker_admin(method: str, path: str, body: dict | None, *,
+                  connect_retry_s: float, read_timeout_s: float) -> dict:
+    """One admin-socket request (§2.6: budgets split by phase).
 
-    ENOENT (socket unit restarting) and ECONNREFUSED (nobody holding the
-    listener) are retried with backoff for `_BROKER_REGISTER_BUDGET_S`; a
-    connection that is accepted into the systemd-held backlog simply waits
-    for the next broker process, so the read gets the same budget. Anything
-    else is final. Raises _BrokerUnavailable.
+    connect: ENOENT / ECONNREFUSED are retried with backoff for
+    `connect_retry_s` only — systemd is not holding the listener, so this is
+    no reload. read: once connected, the request may sit in the systemd-held
+    backlog for a whole drain; it gets `read_timeout_s`. Anything else is
+    final. Raises _BrokerUnavailable.
     """
     import http.client
     import socket
 
     sock_path = _broker_admin_path()
-    deadline = time.monotonic() + _BROKER_REGISTER_BUDGET_S
+    connect_deadline = time.monotonic() + connect_retry_s
     delay = 0.1
     while True:
-        remaining = max(deadline - time.monotonic(), 0.1)
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(remaining)
+        s.settimeout(5.0)  # AF_UNIX connect is local; only a full backlog blocks
         try:
             s.connect(sock_path)
         except (FileNotFoundError, ConnectionRefusedError):
             s.close()
-            left = deadline - time.monotonic()
+            left = connect_deadline - time.monotonic()
             if left <= 0:
                 raise _BrokerUnavailable("unreachable") from None
             time.sleep(min(delay, left))  # the last try lands at the deadline
-            delay = min(delay * 2, 5.0)
+            delay = min(delay * 2, 2.0)
             continue
         except OSError:
             s.close()
             raise _BrokerUnavailable("connect") from None
         break
-    conn = http.client.HTTPConnection("localhost", timeout=remaining)
+    s.settimeout(read_timeout_s)
+    conn = http.client.HTTPConnection("localhost", timeout=read_timeout_s)
     conn.sock = s
     try:
         data = json.dumps(body).encode() if body is not None else None
@@ -684,7 +702,7 @@ def _broker_register(report_id: str, depth: str, provider: str,
     reply = _broker_admin("POST", "/admin/runs", {
         "run_id": report_id, "depth": depth, "provider": provider,
         "prompt_urls": prompt_urls, "ttl_s": AGENT_TIMEOUT + 300,
-    })
+    }, connect_retry_s=_BROKER_CONNECT_RETRY_S, read_timeout_s=_BROKER_REGISTER_BUDGET_S)
     token = reply.get("token")
     if not isinstance(token, str) or not token:
         raise _BrokerUnavailable("bad-reply")
@@ -695,7 +713,8 @@ def _broker_deregister(report_id: str) -> None:
     """DELETE /admin/runs/<id>. Best effort: the broker's TTL sweep is the
     backstop, so a failure is logged, never raised."""
     try:
-        _broker_admin("DELETE", f"/admin/runs/{report_id}", None)
+        _broker_admin("DELETE", f"/admin/runs/{report_id}", None,
+                      connect_retry_s=0.0, read_timeout_s=_BROKER_DEREGISTER_TIMEOUT_S)
     except _BrokerUnavailable as e:
         _LOG.warning("broker deregister failed id=%s reason=%s", report_id, e)
 

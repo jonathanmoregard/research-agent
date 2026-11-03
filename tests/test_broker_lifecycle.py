@@ -246,8 +246,16 @@ def test_drain_persists_before_joining_in_flight(tmp_path, sig):
         # Not 401 "run not registered": the token survived the kill.
         assert status != 401, reply
         assert rig.scraper.hits == ["https://start.example/"]
+        t_sig = time.monotonic()
         p2.send_signal(signal.SIGTERM)
-        assert p2.wait(20) == 0
+        try:
+            p2.wait(20)
+        except subprocess.TimeoutExpired:  # seen once in ~55 runs; keep the evidence
+            p2.kill()
+            p2.wait(5)
+            raise AssertionError(f"drain stuck {time.monotonic() - t_sig:.1f}s after "
+                                 f"SIGTERM; broker stderr: {p2.stderr.read()!r}") from None
+        assert p2.returncode == 0
     finally:
         rig.close()
 
@@ -259,13 +267,19 @@ def test_admin_health_reports_location_independent_code_hash(rig, tmp_path):
     where the tree is mounted."""
     sys.path.insert(0, str(REPO))
     try:
-        from broker.server import code_digest
+        from broker.digest import code_digest
     finally:
         sys.path.remove(str(REPO))
     p = rig.start()
     status, reply = rig.admin_call("GET", "/admin/health")
     assert status == 200
     assert reply["code"] == code_digest(str(rig.code))
+    # The oneshot's call, exactly (§12.2 step 4): one implementation, run
+    # from the checkout root, printing what the broker reports.
+    cli = subprocess.run([sys.executable, "-m", "broker.digest"], cwd=rig.code,
+                         capture_output=True, text=True, timeout=30)
+    assert cli.returncode == 0, cli.stderr
+    assert cli.stdout.strip() == reply["code"]
     # The same tree mounted elsewhere hashes the same.
     copy = tmp_path / "elsewhere"
     (copy / "broker").mkdir(parents=True)

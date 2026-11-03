@@ -52,6 +52,7 @@ import time  # noqa: E402
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
 
 from broker import config, marketplaces, scraper_proxy, search, trademark, upstream  # noqa: E402
+from broker.digest import code_digest  # noqa: E402,F401 — re-exported for tests
 from broker.runs import Registry, RouteError, Run, log  # noqa: E402
 from scraper import urlpolicy  # noqa: E402
 
@@ -68,29 +69,6 @@ _RUN_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 STATE_FILE = "runs.json"
 STATE_VERSION = 1
 MAX_PROMPT_URLS = urlpolicy.MAX_URLS_PER_TEXT
-
-
-def code_digest(root: str = _ROOT) -> str:
-    """Hash of the code this process would load (broker/*.py + urlpolicy).
-
-    Location-independent: the broker runs from /run/rb, the code-watch
-    oneshot hashes the checkout, and the two must agree. Algorithm (the
-    oneshot reproduces it): sha256 over, for each of the sorted
-    `broker/*.py` names then `scraper/urlpolicy.py`, the bytes
-    `<relative path>\\0<content>\\0` (`<relative path>\\0missing\\0` if
-    unreadable).
-    """
-    h = hashlib.sha256()
-    rels = sorted(f"broker/{f}" for f in os.listdir(os.path.join(root, "broker"))
-                  if f.endswith(".py"))
-    rels.append("scraper/urlpolicy.py")
-    for rel in rels:
-        try:
-            with open(os.path.join(root, rel), "rb") as f:
-                h.update(rel.encode() + b"\0" + f.read() + b"\0")
-        except OSError:
-            h.update(rel.encode() + b"\0missing\0")
-    return h.hexdigest()
 
 
 class Broker:

@@ -53,9 +53,10 @@ class StubBroker(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
     daemon_threads = True
 
-    def __init__(self, path, *, status=200, bind_and_activate=True):
+    def __init__(self, path, *, status=200, delay=0.0, bind_and_activate=True):
         self.requests = []
         self.status = status
+        self.delay = delay
         outer = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -63,6 +64,7 @@ class StubBroker(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
                 n = int(h.headers.get("Content-Length", "0") or 0)
                 body = json.loads(h.rfile.read(n)) if n else None
                 outer.requests.append((h.command, h.path, body))
+                time.sleep(outer.delay)
                 reply = {"status": "ok"}
                 if h.command == "POST":
                     reply["token"] = f"TOKEN-{len(outer.requests)}"
@@ -98,6 +100,7 @@ class Dial:
         monkeypatch.setattr(server, "_GUEST_PROTOCOL_PATH", self.marker)
         monkeypatch.setenv("RESEARCH_BROKER_ADMIN", self.admin)
         monkeypatch.setattr(server, "_BROKER_REGISTER_BUDGET_S", 2.0)
+        monkeypatch.setattr(server, "_BROKER_CONNECT_RETRY_S", 0.5)
         for k, v in {"RESEARCH_SSH_HOST": "127.0.0.1", "RESEARCH_SSH_PORT": "2223",
                      "RESEARCH_SSH_KEY": "/fake/key", "RESEARCH_SSH_USER": "agent",
                      "RESEARCH_SSH_KNOWN_HOSTS": str(tmp_path / "ssh" / "known_hosts"),
@@ -282,13 +285,39 @@ def test_broker_only_with_socket_absent_fails_closed_reading_no_key(dial, monkey
             return super().__getitem__(k)
 
     monkeypatch.setattr(os, "environ", Env(os.environ))
+    # A long read budget must not matter: no socket is no reload (§2.6).
+    monkeypatch.setattr(server, "_BROKER_REGISTER_BUDGET_S", 30.0)
+    t0 = time.monotonic()
     with pytest.raises(server._BrokerUnavailable):
         dial.run()
+    assert time.monotonic() - t0 < 3, "the era's verdict after the short retry only"
     assert dial.calls == [], "no ssh dial"
     assert dial.keyring_calls == []
     assert not set(read) & set(KEY_ENV), f"keyed env read on the closed path: {read}"
-    line = dial.mode_line()
-    assert "mode=legacy" not in line and "era=broker-only" in line
+    assert "mode=closed reason=broker-absent era=broker-only" in dial.mode_line()
+
+
+def test_broker_only_rides_out_a_socket_unit_restart(dial):
+    """The socket path reappears within the short retry: broker mode, no error."""
+    dial.era.write_text("broker-only\n")
+    dial.marker.write_text("broker-v1\n")
+    b = StubBroker(dial.admin, bind_and_activate=False)
+
+    def bring_up():
+        time.sleep(0.2)
+        b.server_bind()
+        b.server_activate()
+        b.serve()
+
+    t = threading.Thread(target=bring_up, daemon=True)
+    t.start()
+    try:
+        rc, _ = dial.run()
+    finally:
+        t.join(5)
+        b.shutdown()
+    assert rc == 0 and dial.fields()[0] == "broker-v1"
+    assert "mode=broker" in dial.mode_line()
 
 
 def test_broker_only_without_protocol_marker_fails_closed(dial):
@@ -346,15 +375,32 @@ def test_research_reports_broker_unavailable(dial, monkeypatch, tmp_path):
 
 # --- the registration client ------------------------------------------------------
 
-def test_registration_budget_outlasts_a_broker_drain():
-    """TimeoutStopSec=210 plus start: anything shorter fails calls that start
-    inside a reload window (§12.2)."""
-    assert server._BROKER_REGISTER_BUDGET_S >= 240
+def test_registration_budgets_split_by_phase():
+    """§2.6: a reload never fails connect() (systemd holds the listener), so
+    the long budget belongs to the read; ENOENT/ECONNREFUSED mean the socket
+    unit is not running and get a short retry only."""
+    assert server._BROKER_REGISTER_BUDGET_S >= 240  # drain 210 s + start
+    assert server._BROKER_CONNECT_RETRY_S <= 30
+    assert server._BROKER_DEREGISTER_TIMEOUT_S <= 10
 
 
-def test_registration_retries_through_a_socket_that_appears_late(dial):
+def test_slow_reply_is_the_reload_window_and_gets_the_read_budget(dial, monkeypatch):
+    """Connected, then the reply takes longer than the whole connect retry:
+    a queued connection waiting out a drain. It must succeed."""
+    monkeypatch.setattr(server, "_BROKER_CONNECT_RETRY_S", 0.2)
+    monkeypatch.setattr(server, "_BROKER_REGISTER_BUDGET_S", 5.0)
+    b = StubBroker(dial.admin, delay=1.0).serve()
+    try:
+        assert server._broker_register(REPORT_ID, "normal", "claude", []) == "TOKEN-1"
+    finally:
+        b.shutdown()
+
+
+def test_registration_retries_through_a_socket_that_appears_late(dial, monkeypatch):
     """ENOENT (socket unit restarting), then ECONNREFUSED (bound, not yet
-    listening), then served — one registration, no error."""
+    listening), then served within the short connect retry — one
+    registration, no error."""
+    monkeypatch.setattr(server, "_BROKER_CONNECT_RETRY_S", 5.0)
     dial.marker.write_text("broker-v1\n")
     b = StubBroker(dial.admin, bind_and_activate=False)
 
@@ -376,13 +422,28 @@ def test_registration_retries_through_a_socket_that_appears_late(dial):
     assert [(m, p) for m, p, _ in b.requests] == [("POST", "/admin/runs")]
 
 
-def test_registration_gives_up_after_its_budget(dial, monkeypatch):
-    monkeypatch.setattr(server, "_BROKER_REGISTER_BUDGET_S", 0.5)
+def test_absent_socket_gives_up_after_the_short_retry_not_the_read_budget(dial, monkeypatch):
+    monkeypatch.setattr(server, "_BROKER_CONNECT_RETRY_S", 0.5)
+    monkeypatch.setattr(server, "_BROKER_REGISTER_BUDGET_S", 30.0)
     t0 = time.monotonic()
     with pytest.raises(server._BrokerUnavailable):
         server._broker_register(REPORT_ID, "normal", "claude", [])
     assert 0.4 < time.monotonic() - t0 < 3
 
+
+def test_deregistration_never_waits_out_a_drain(dial, monkeypatch):
+    """Cleanup on a short timeout: a finished result must not sit behind a
+    reload. Failure is logged, not raised (the TTL is the backstop)."""
+    monkeypatch.setattr(server, "_BROKER_DEREGISTER_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(server, "_BROKER_REGISTER_BUDGET_S", 30.0)
+    b = StubBroker(dial.admin, delay=3.0).serve()
+    t0 = time.monotonic()
+    try:
+        server._broker_deregister(REPORT_ID)
+    finally:
+        b.shutdown()
+    assert time.monotonic() - t0 < 1.5
+    assert any("deregister failed" in r.getMessage() for r in dial.caplog.records)
 
 
 def test_checkout_ships_the_protocol_marker_server_reads():
