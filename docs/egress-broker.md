@@ -946,6 +946,16 @@ bandit already includes `broker/` and semgrep already scans `.`, so no CI path c
     missing CA variable fails T0/T2 outright. Consequence for sequencing: the lane must be green
     before the research-agent PR merges, which §12.6 step 0 already requires. Do not promote the
     jail change on the strength of "NixOS has `/etc/ssl/certs`".
+
+    A live probe (nixos-A, 2026-11-03) narrowed which defaults are load-bearing without
+    discharging anything. Python's `ssl` and `curl_cffi` both reach the CA through the **file**
+    `/etc/ssl/certs/ca-certificates.crt` — curl_cffi via its compiled-in `DEFAULT_CACERT` — not
+    through `SSL_CERT_FILE` or `NIX_SSL_CERT_FILE`; and with `LOCALE_ARCHIVE` unset, glibc falls
+    back to `/run/current-system/sw/lib/locale/locale-archive`. The prediction is therefore that
+    `--clearenv` costs nothing for TLS or locale, because both resolve through compiled-in or
+    filesystem defaults rather than environment lookups. A prediction is not a proof: the probe ran
+    on the host rather than inside the jail in the VM, and it cannot see a variable the CLIs read
+    for some other purpose. The lane stays the gate.
 - **Hermetic exfil integration test (CI):**
   - start the broker in-process with a fake scraper (a local HTTP stub recording every request)
     and a fake upstream;
@@ -1324,7 +1334,13 @@ drained **roll**.
 
 Triggers:
 - `research-vm-roll-research-agent.path` / `-scraper.path` with
-  `PathChanged=/var/lib/microvms/<name>/current` (the switch re-links it);
+  `PathChanged=/var/lib/microvms/<name>` — the **directory**, not the `current` symlink inside it
+  (the switch re-links `current`). A path unit pointed at the symlink never fires: systemd resolves
+  the watch target before adding the inotify watch (`primary_wd` in systemd's `path.c` follows the
+  link), so re-linking `current` rewrites a directory entry while the watch sits on the old store
+  path, which itself never changes. Watching the directory sees the re-link as the create/move it
+  is. Proved by the nixos-A lane (GREEN8): the symlink form never triggered the roll, the directory
+  form did;
 - for the scraper, also `PathChanged=/home/jonathan/Repos/research-agent/scraper`. New scraper
   code is loaded only when `scraper-http` restarts, and virtiofs does not deliver host-side
   inotify into the guest.
