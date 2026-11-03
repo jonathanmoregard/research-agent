@@ -236,6 +236,12 @@ class ArtifactStore:
                 })
             return out
 
+    def pending(self) -> int:
+        """Un-pulled artifacts (expired ones are not pending: sweep first)."""
+        self.sweep()
+        with self._lock:
+            return sum(len(v["items"]) for v in self._runs.values())
+
     def sweep(self) -> None:
         now = time.monotonic()
         with self._lock:
@@ -313,6 +319,9 @@ class BrowserWorker(threading.Thread):
         if "error" in slot:
             raise RuntimeError(slot["error"])
         return slot["result"]
+
+    def session_count(self) -> int:
+        return len(self._sessions)  # one atomic read of a worker-owned dict
 
     def shutdown(self) -> None:
         self._q.put((None, None, None))
@@ -598,3 +607,9 @@ def get_worker() -> BrowserWorker:
             _worker = BrowserWorker()
             _worker.start()
         return _worker
+
+
+def open_session_count() -> int:
+    """Open browser sessions, for /health. Never boots the worker."""
+    w = _worker
+    return w.session_count() if w is not None and w.is_alive() else 0

@@ -1,41 +1,37 @@
-"""The broker's code digest — the single implementation (§12.2 step 4).
+"""The broker's code digest (docs/egress-broker.md §12.2 step 4).
 
-The broker reports it at GET /admin/health as `code` (the digest of the code
-it LOADED). The nixos code-watch oneshot runs `python3 -m broker.digest` from
-the checkout root and reloads the broker when the two differ. Never
-reimplement this elsewhere: the two repos version independently, and a quiet
-disagreement means the broker reloads on every pull or never again.
+The broker reports the digest of the code it LOADED at GET /admin/health as
+`code`. On SIGHUP it recomputes this over the tree it runs from and drains
+only when the two differ; the root-run code-watch oneshot reloads
+unconditionally and never hashes anything itself.
 
-Algorithm (this docstring is the source of truth): sha256 over, for each of
-the sorted `broker/*.py` names followed by `scraper/urlpolicy.py`, the bytes
-`<path relative to the checkout root>\\0<file content>\\0`, or
-`<relative path>\\0missing\\0` when the file cannot be read. Relative paths,
-so the digest does not depend on where the tree is mounted (the broker sees
-it at /run/rb, the oneshot at /home/jonathan/Repos/research-agent).
+This module only picks the broker's file set: the sorted `broker/*.py`, then
+the scraper/ files the broker imports (SCRAPER_DEPS). The hashing is
+scraper/digest.py's tree_digest(), shared with the scraper's own /health;
+never reimplement it.
 
-Stdlib only, and imports nothing from the repo.
+`python3 -m broker.digest [root]` from the checkout root prints the digest,
+for an operator comparing a checkout with /admin/health.
 """
 from __future__ import annotations
 
-import hashlib
 import os
 import sys
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:  # `python3 -I` puts neither cwd nor the script dir on it
+    sys.path.insert(0, _ROOT)
+
+from scraper.digest import py_files, tree_digest  # noqa: E402
+
+
+# Every scraper/ module the broker imports; a change to any of them is a
+# change to the broker's code.
+SCRAPER_DEPS = ["scraper/digest.py", "scraper/urlpolicy.py"]
 
 
 def code_digest(root: str = _ROOT) -> str:
-    h = hashlib.sha256()
-    rels = sorted(f"broker/{f}" for f in os.listdir(os.path.join(root, "broker"))
-                  if f.endswith(".py"))
-    rels.append("scraper/urlpolicy.py")
-    for rel in rels:
-        try:
-            with open(os.path.join(root, rel), "rb") as f:
-                h.update(rel.encode() + b"\0" + f.read() + b"\0")
-        except OSError:
-            h.update(rel.encode() + b"\0missing\0")
-    return h.hexdigest()
+    return tree_digest(root, py_files(root, "broker") + SCRAPER_DEPS)
 
 
 if __name__ == "__main__":

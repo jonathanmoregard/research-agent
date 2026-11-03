@@ -101,8 +101,8 @@ class Rig:
                 text = text.replace('SCRAPER_TOKEN_FILE = "/var/lib/scraper-bearer/token"',
                                     f'SCRAPER_TOKEN_FILE = "{tmp_path / "bearer"}"')
             (code / "broker" / f.name).write_text(text)
-        (code / "scraper" / "urlpolicy.py").write_text(
-            (REPO / "scraper" / "urlpolicy.py").read_text())
+        for name in ("digest.py", "urlpolicy.py"):  # the scraper/ modules it imports
+            (code / "scraper" / name).write_text((REPO / "scraper" / name).read_text())
         (tmp_path / "bearer").write_text("bearer\n")
         self.creds = tmp_path / "creds"
         self.creds.mkdir()
@@ -274,8 +274,8 @@ def test_admin_health_reports_location_independent_code_hash(rig, tmp_path):
     status, reply = rig.admin_call("GET", "/admin/health")
     assert status == 200
     assert reply["code"] == code_digest(str(rig.code))
-    # The oneshot's call, exactly (§12.2 step 4): one implementation, run
-    # from the checkout root, printing what the broker reports.
+    # The operator's comparison: the same implementation, run from the
+    # checkout root, prints what the broker reports.
     cli = subprocess.run([sys.executable, "-m", "broker.digest"], cwd=rig.code,
                          capture_output=True, text=True, timeout=30)
     assert cli.returncode == 0, cli.stderr
@@ -286,7 +286,8 @@ def test_admin_health_reports_location_independent_code_hash(rig, tmp_path):
     (copy / "scraper").mkdir()
     for f in (REPO / "broker").glob("*.py"):
         (copy / "broker" / f.name).write_bytes(f.read_bytes())
-    (copy / "scraper" / "urlpolicy.py").write_bytes((REPO / "scraper" / "urlpolicy.py").read_bytes())
+    for name in ("digest.py", "urlpolicy.py"):
+        (copy / "scraper" / name).write_bytes((REPO / "scraper" / name).read_bytes())
     assert code_digest(str(copy)) == code_digest(str(REPO))
     p.send_signal(signal.SIGTERM)
     assert p.wait(10) == 0

@@ -8,7 +8,13 @@ POST /render
             "title", "html"}
           or {"status": "error", "error": "<short reason>"}
 
-GET /health → {"status": "ok"}
+GET /health → {"status": "ok", "code", "code_on_disk", "stale",
+               "open_sessions", "pending_artifacts"}
+    Unauthenticated. The drained roll (docs/egress-broker.md §12.3) reads
+    it: `code` is the digest of the scraper code this process loaded,
+    `code_on_disk` the same digest over the share now, `stale` their
+    difference (the scraper checks its own code; root never hashes). It
+    restarts only at 0 open sessions and 0 un-pulled artifacts.
 
 Per-request isolation: each call launches a fresh chromium process via
 Playwright and tears it down. No shared browser, no shared context. A
@@ -29,6 +35,14 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+import digest
+
+# The checkout root as this VM sees it (/workspace, holding scraper/). Hashed
+# BEFORE the imports below: a pull landing in between leaves `code` older than
+# the loaded modules, so the roll restarts us; never the other way round.
+_CHECKOUT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_LOADED_DIGEST = digest.scraper_digest(_CHECKOUT)
+
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import sync_playwright
 
@@ -43,6 +57,7 @@ from sessions import (
     ACT_BUDGET_MS,
     get_artifact_store,
     get_worker,
+    open_session_count,
     nav_ledger,
     nav_predicate,
     page_links,
@@ -833,7 +848,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
-            self._json(200, {"status": "ok"})
+            on_disk = digest.scraper_digest(_CHECKOUT)
+            self._json(200, {
+                "status": "ok",
+                "code": _LOADED_DIGEST,
+                "code_on_disk": on_disk,
+                "stale": on_disk != _LOADED_DIGEST,
+                # Neither may boot the browser worker (or Playwright).
+                "open_sessions": open_session_count(),
+                "pending_artifacts": get_artifact_store().pending(),
+            })
             return
         m = _ARTIFACTS_PATH.match(self.path)
         if m:
