@@ -26,11 +26,9 @@ Run:
 """
 from __future__ import annotations
 
-import io
 import json
 import sys
 import tempfile
-import urllib.error
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -341,25 +339,27 @@ def case_agent_exception_no_leak(tmp: Path) -> list[str]:
 
 
 def case_exa_http_error_no_leak(tmp: Path) -> list[str]:
-    """_direct_exa HTTPError body must not reach caller."""
+    """_direct_exa HTTP error body must not reach caller.
+
+    _direct_exa posts through curl_cffi, so that is what gets stubbed; the
+    urllib stub this case used to install never saw the call, and the case
+    reached the live Exa API (§8.1 T-1)."""
     srv.REPORTS_DIR = tmp
+    from curl_cffi import requests as cfrequests
 
-    def fake_urlopen(req, timeout=30):
-        raise urllib.error.HTTPError(
-            url="https://api.exa.ai/search",
-            code=400,
-            msg="Bad Request",
-            hdrs=None,
-            fp=io.BytesIO(f'{{"echo": "{CANARY_EXA_BODY}"}}'.encode()),
-        )
+    class _Resp:
+        status_code = 400
+        text = f'{{"echo": "{CANARY_EXA_BODY}"}}'
 
-    import urllib.request
-    o1 = _with(urllib.request, "urlopen", fake_urlopen)
+        def json(self):
+            return json.loads(self.text)
+
+    o1 = _with(cfrequests, "post", lambda *a, **kw: _Resp())
     o2 = _with(srv, "_secrets", lambda: {"exa-api-key": "fake"})
     try:
         result = srv.research(prompt="x", depth="fast")
     finally:
-        urllib.request.urlopen = o1
+        cfrequests.post = o1
         srv._secrets = o2
 
     failures: list[str] = []
@@ -374,17 +374,17 @@ def case_exa_http_error_no_leak(tmp: Path) -> list[str]:
 def case_exa_generic_exception_no_leak(tmp: Path) -> list[str]:
     """_direct_exa generic exception str must not reach caller."""
     srv.REPORTS_DIR = tmp
+    from curl_cffi import requests as cfrequests
 
-    def fake_urlopen(req, timeout=30):
+    def fake_post(*a, **kw):
         raise ConnectionError(f"connection refused to {CANARY_EXA_EXC}")
 
-    import urllib.request
-    o1 = _with(urllib.request, "urlopen", fake_urlopen)
+    o1 = _with(cfrequests, "post", fake_post)
     o2 = _with(srv, "_secrets", lambda: {"exa-api-key": "fake"})
     try:
         result = srv.research(prompt="x", depth="fast")
     finally:
-        urllib.request.urlopen = o1
+        cfrequests.post = o1
         srv._secrets = o2
 
     failures: list[str] = []

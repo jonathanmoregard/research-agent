@@ -21,6 +21,8 @@ os.environ["RESEARCH_AGENT_LOG"] = str(_LOG_DIR / "server.log")
 
 import pytest  # noqa: E402
 
+from tests._network_guard import GUARD  # noqa: E402  (installs on import)
+
 _NO_EGRESS_STATE = _LOG_DIR / "no-egress-state"
 
 
@@ -39,3 +41,22 @@ def _host_egress_state_isolated(monkeypatch):
 
     monkeypatch.setattr(server, "_EGRESS_ERA_PATH", _NO_EGRESS_STATE / "egress-era")
     monkeypatch.setenv("RESEARCH_BROKER_ADMIN", str(_NO_EGRESS_STATE / "admin.sock"))
+
+
+@pytest.fixture(autouse=True)
+def _no_external_network():
+    """Fail any test that tried to leave the host (§8.1), even if the code
+    under test caught the refusal and carried on."""
+    mark = len(GUARD.violations)
+    yield
+    tried = GUARD.violations[mark:]
+    if tried:
+        del GUARD.violations[mark:]
+        pytest.fail("test tried to reach the network (tests are hermetic; use a "
+                    "loopback stub): " + ", ".join(f"{v.via} -> {v.target!r}" for v in tried),
+                    pytrace=False)
+
+
+@pytest.fixture
+def network_guard():
+    return GUARD
