@@ -607,7 +607,10 @@ def test_state_survives_a_restart(env):
     assert not (env.tmp / server.STATE_FILE).exists()
 
 
-def test_idle_code_change_restarts_busy_one_does_not(env, tmp_path):
+def test_stale_code_never_refuses_a_registration(env, tmp_path):
+    """§2.2/§12.2: reload is driven from outside (code-watch oneshot →
+    SIGHUP), never by refusing a registration. The old exit-when-idle path
+    answered 503 "restarting", which every MCP client had to absorb."""
     root = tmp_path / "code"
     (root / "broker").mkdir(parents=True)
     (root / "scraper").mkdir()
@@ -615,16 +618,15 @@ def test_idle_code_change_restarts_busy_one_does_not(env, tmp_path):
     (root / "scraper" / "urlpolicy.py").write_text("")
     app = server.Broker(dict(CREDS), transport=env.transport, registry=Registry(),
                         code_root=str(root))
+    loaded = app.handle_admin("GET", "/admin/health", None)[1]["code"]
+    (root / "broker" / "x.py").write_text("a = 2\n")
     reg = {"run_id": RUN_A, "depth": "normal", "ttl_s": 60}
     assert app.handle_admin("POST", "/admin/runs", reg)[0] == 200
-    (root / "broker" / "x.py").write_text("a = 2\n")
-    # A run is active: keep serving on the loaded code.
-    assert app.handle_admin("POST", "/admin/runs", dict(reg, run_id=RUN_B))[0] == 200
     assert not app.exit_requested.is_set()
-    app.deregister(RUN_A)
-    app.deregister(RUN_B)
-    status, reply = app.handle_admin("POST", "/admin/runs", reg)
-    assert status == 503 and reply["error"] == "restarting" and app.exit_requested.is_set()
+    # Health keeps reporting the code this process LOADED, so the oneshot
+    # sees the difference and reloads.
+    status, reply = app.handle_admin("GET", "/admin/health", None)
+    assert reply["code"] == loaded != server.code_digest(str(root))
 
 
 def test_deregister_closes_sessions_and_summarises(env, capsys):

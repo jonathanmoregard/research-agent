@@ -17,14 +17,19 @@ Run as `python3 -I -B /run/rb/broker/server.py`: isolated mode, so the
 directory holding broker/ and scraper/ is put on sys.path here, and only
 that directory (in production it holds exactly those two read-only binds).
 
-Lifecycle:
-  * SIGTERM drains: stop accepting (systemd keeps queueing on the held
-    sockets), finish in-flight requests (never orphan a scraper command),
-    write the live runs to $STATE_DIRECTORY, exit 0. The next start loads
-    them, so a restart mid-run is invisible to the run.
-  * Code reload: at each registration, if the code on disk changed and no
-    run is active, answer 503 "restarting" and exit 0; the next connection
-    starts the new code. The MCP server retries once.
+Lifecycle (docs/egress-broker.md §12.2):
+  * SIGHUP (`systemctl reload`) and SIGTERM drain the same way:
+      1. persist the run registry to $STATE_DIRECTORY at once, before any
+         waiting, so a SIGKILL at TimeoutStopSec leaves state at most one
+         drain stale instead of gone;
+      2. stop accepting at once (systemd keeps queueing on the held
+         sockets, so nothing is refused);
+      3. finish in-flight requests (never orphan a scraper command);
+      4. persist again, then exit 0.
+    The next start loads the runs, so a restart mid-run is invisible to
+    the run.
+  * Code reload is driven from outside: the code-watch oneshot compares
+    its tree hash with `code` from GET /admin/health and sends SIGHUP.
 """
 from __future__ import annotations
 
@@ -66,17 +71,25 @@ MAX_PROMPT_URLS = urlpolicy.MAX_URLS_PER_TEXT
 
 
 def code_digest(root: str = _ROOT) -> str:
-    """Hash of the code this process would load (broker/*.py + urlpolicy)."""
+    """Hash of the code this process would load (broker/*.py + urlpolicy).
+
+    Location-independent: the broker runs from /run/rb, the code-watch
+    oneshot hashes the checkout, and the two must agree. Algorithm (the
+    oneshot reproduces it): sha256 over, for each of the sorted
+    `broker/*.py` names then `scraper/urlpolicy.py`, the bytes
+    `<relative path>\\0<content>\\0` (`<relative path>\\0missing\\0` if
+    unreadable).
+    """
     h = hashlib.sha256()
-    files = sorted(os.path.join(root, "broker", f)
-                   for f in os.listdir(os.path.join(root, "broker")) if f.endswith(".py"))
-    files.append(os.path.join(root, "scraper", "urlpolicy.py"))
-    for path in files:
+    rels = sorted(f"broker/{f}" for f in os.listdir(os.path.join(root, "broker"))
+                  if f.endswith(".py"))
+    rels.append("scraper/urlpolicy.py")
+    for rel in rels:
         try:
-            with open(path, "rb") as f:
-                h.update(path.encode() + b"\0" + f.read() + b"\0")
+            with open(os.path.join(root, rel), "rb") as f:
+                h.update(rel.encode() + b"\0" + f.read() + b"\0")
         except OSError:
-            h.update(path.encode() + b"\0missing\0")
+            h.update(rel.encode() + b"\0missing\0")
     return h.hexdigest()
 
 
@@ -166,7 +179,7 @@ class Broker:
     def handle_admin(self, method: str, path: str, body: dict | None) -> tuple[int, dict]:
         if method == "GET" and path == "/admin/health":
             return 200, {"status": "ok", "active_runs": self.registry.active(),
-                         "code_stale": code_digest(self.code_root) != self.loaded_digest}
+                         "code": self.loaded_digest}
         if method == "POST" and path == "/admin/runs":
             return self._register(body)
         m = _ADMIN_RUN_PATH.match(path)
@@ -189,10 +202,6 @@ class Broker:
         if not isinstance(urls, list) or len(urls) > MAX_PROMPT_URLS \
                 or not all(isinstance(u, str) for u in urls):
             return 400, {"status": "error", "error": "bad prompt_urls"}
-        if code_digest(self.code_root) != self.loaded_digest and self.registry.active() == 0:
-            # Pulled code and nothing in flight: restart onto it.
-            self.exit_requested.set()
-            return 503, {"status": "error", "error": "restarting"}
         token, run = self.registry.register(run_id, depth, provider, urls, float(ttl))
         log(f"run={run_id} registered depth={depth} provider={provider} "
             f"prompt_urls={len(urls)} ttl_s={int(ttl)}")
@@ -230,9 +239,11 @@ class Broker:
                     "sessions": run.sessions, "refusals": dict(run.refusals),
                     "market_closed": run.market_closed,
                 })
-        fd, tmp = tempfile.mkstemp(dir=self.state_dir, prefix=".runs.")
+        fd, tmp = tempfile.mkstemp(dir=self.state_dir, prefix=".runs.")  # 0600
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump({"version": STATE_VERSION, "runs": runs}, f)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, os.path.join(self.state_dir, STATE_FILE))
         log(f"state saved: {len(runs)} run(s)")
 
@@ -420,21 +431,32 @@ def serve(app: Broker, socks: dict[str, socket.socket]) -> int:
         log(f"signal {signum}: draining")
         app.exit_requested.set()
 
-    signal.signal(signal.SIGTERM, _term)
-    signal.signal(signal.SIGINT, _term)
-    # exit_requested: SIGTERM/SIGINT, or an idle code reload (registration).
+    # SIGHUP is `systemctl reload` (ExecReload=kill -HUP $MAINPID): the same
+    # drain as a stop; socket activation then starts the new code.
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, _term)
     while not app.exit_requested.wait(config.SWEEP_INTERVAL_S):
         try:
             app.sweep()
         except Exception as e:  # never let the sweeper kill the broker
             log(f"sweep failed: {type(e).__name__}")
+    # Persist first: everything below can outlast TimeoutStopSec, and a
+    # SIGKILL then must cost at most the drain's progress, not the registry.
+    _save(app)
     for s in servers:
-        s.shutdown()          # stop accepting; systemd queues new connections
+        s.shutdown()          # stop accepting at once; systemd queues new connections
     for s in servers:
-        s.server_close()      # joins in-flight request threads
-    app.save_state()
+        s.server_close()      # joins in-flight request threads (bounded by route timeouts)
+    _save(app)                # the handover includes work finished during the drain
     log("drained, exiting")
     return 0
+
+
+def _save(app: Broker) -> None:
+    try:
+        app.save_state()
+    except OSError as e:  # a full disk must not stop the drain
+        log(f"state save failed: {type(e).__name__}")
 
 
 def main() -> int:
