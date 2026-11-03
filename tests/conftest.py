@@ -40,6 +40,7 @@ def _host_egress_state_isolated(monkeypatch):
     from mcp_server import server
 
     monkeypatch.setattr(server, "_EGRESS_ERA_PATH", _NO_EGRESS_STATE / "egress-era")
+    monkeypatch.setattr(server, "_ROLL_MARKER_PATH", _NO_EGRESS_STATE / "rolling")
     monkeypatch.setenv("RESEARCH_BROKER_ADMIN", str(_NO_EGRESS_STATE / "admin.sock"))
     # Nor this host's scraper: research() pulls and discards its artifacts at
     # 127.0.0.1:8123 with the host bearer, which is world-readable. No bearer

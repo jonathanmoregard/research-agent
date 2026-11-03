@@ -992,8 +992,39 @@ def _read_secs(
     return clamped
 
 
+# §12.7: while nixos-A's drained roll holds every slot it touches this
+# marker; a call's own budget must not be spent against the roll.
+_ROLL_MARKER_PATH = Path("/run/research-agent/rolling")
+# Total wait ceiling while a roll is marked. The marked phase is bounded by
+# the roll itself (scraperQuietSeconds 300 s, restart, ready check 600 s),
+# so 3600 s total gives a call that already waited its 1800 s that whole
+# phase again with room to spare. Only the §12.3 step-7 path (ready check
+# timed out, marker and slots kept) reaches it, and there a clear failure
+# beats a call that hangs forever. An input, not a fitted criterion.
+_ROLL_WAIT_CEILING_SECS = _read_secs(
+    os.environ.get("RESEARCH_ROLL_WAIT_CEILING_SECS"), 3600.0,
+    lo=0.0, hi=6 * 3600.0, name="RESEARCH_ROLL_WAIT_CEILING_SECS")
+# Step 6 removes the marker, then releases the slots: a call that sees the
+# marker gone keeps polling this long for the release.
+_ROLL_RELEASE_GRACE_SECS = 30.0
+
+
+def _rolling() -> bool:
+    try:
+        return _ROLL_MARKER_PATH.exists()
+    except OSError:
+        return False
+
+
 class _VMBusy(Exception):
-    """Raised when the cross-process VM lock can't be acquired in time."""
+    """Raised when the cross-process VM lock can't be acquired in time.
+
+    `during_roll`: the wait was extended for a marked roll and still ran
+    out (the roll is stuck), so the caller can say so."""
+
+    def __init__(self, during_roll: bool = False):
+        super().__init__("roll" if during_roll else "busy")
+        self.during_roll = during_roll
 
 
 @contextlib.contextmanager
@@ -1005,7 +1036,9 @@ def _vm_lock(wait_secs: int):
     (`<_VM_LOCK_PATH>.<i>`); acquiring means winning a non-blocking flock
     on any one of them. Polls the whole set until a slot frees or
     `wait_secs` elapses; on timeout raises `_VMBusy` so the caller returns
-    a clean busy error. The slot is always released and every fd closed on
+    a clean busy error. While a drained roll is marked (`_ROLL_MARKER_PATH`,
+    §12.7) the wait extends past `wait_secs`, up to `_ROLL_WAIT_CEILING_SECS`
+    in total: a roll delays a call, it must not fail it. The slot is always released and every fd closed on
     exit — a crash inside the `with` body still frees it because flock is
     tied to the open fd (kernel drops it when the process dies).
 
@@ -1032,7 +1065,10 @@ def _vm_lock(wait_secs: int):
         for fd in fds:
             os.close(fd)
         raise
-    deadline = time.monotonic() + wait_secs
+    start = time.monotonic()
+    deadline = start + wait_secs
+    ceiling = start + max(wait_secs, _ROLL_WAIT_CEILING_SECS)
+    roll_seen = False
     delay = 0.5
     held: int | None = None
     try:
@@ -1047,9 +1083,15 @@ def _vm_lock(wait_secs: int):
                         raise
             if held is not None:
                 break
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            if deadline - now <= 0 and _rolling():
+                if not roll_seen:
+                    _LOG.info("VM lock wait extended: a microVM roll holds the slots")
+                roll_seen = True
+                deadline = min(ceiling, now + _ROLL_RELEASE_GRACE_SECS)
+            remaining = deadline - now
             if remaining <= 0:
-                raise _VMBusy() from None
+                raise _VMBusy(during_roll=roll_seen) from None
             time.sleep(min(delay, remaining))
             delay = min(delay * 1.5, 5.0)
         yield
@@ -2195,12 +2237,19 @@ def research(
         try:
             with _vm_lock(_VM_LOCK_WAIT_SECS):
                 _code, _output = _run_agent(prompt, report_id, depth, model or None)  # type: ignore[arg-type]
-        except _VMBusy:
+        except _VMBusy as busy:
             _LOG.warning(
-                "research busy id=%s — VM lock wait exceeded %ds",
+                "research busy id=%s — VM lock wait exceeded %ds%s",
                 report_id, _VM_LOCK_WAIT_SECS,
+                " (extended for a roll, ceiling reached)" if busy.during_roll else "",
             )
             report_path.unlink(missing_ok=True)
+            if busy.during_roll:
+                return {
+                    "status": "error",
+                    "error": "research backend busy — a microVM roll has held the "
+                    "agent VM past the wait ceiling and may be stuck; retry later.",
+                }
             return {
                 "status": "error",
                 "error": "research backend busy — another research call is "
