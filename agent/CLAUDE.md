@@ -61,8 +61,10 @@ Rules:
 `render_page` is `goto` + snapshot — fine for content sites, useless for
 search-form SPAs where the meaningful data lives in an XHR triggered by
 a user click. Use `mcp__render__intercept_page` when you need to drive a
-form (TMview, Bolagsverket's web UI, EUIPO eSearch) and read the JSON
-the SPA's frontend would have read.
+form on a search page you were given, and read the JSON the SPA's
+frontend would have read. For company and trademark registries use their
+own tools (`bolagsverket_*`, `trademark_search`) instead of driving a web
+UI: those endpoints are licensed for this, the web UIs mostly are not.
 
 Inputs: `url`, an ordered `actions` list (`wait_for_selector` / `fill` /
 `click` / `wait_for_response` / `wait_for_load_state` /

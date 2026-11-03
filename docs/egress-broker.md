@@ -543,20 +543,54 @@ counted in the choice-channel estimate (§7.1).
 
 ### 3.7 Operator-listed fixed URLs
 
-The prompt and tool text tell the model to open some fixed entry points that no search returns:
-- `render_shim.py:233`: the TMview template `https://www.tmdn.org/tmview/`;
-- `agent/CLAUDE.md:63-66`: TMview, Bolagsverket's web UI, EUIPO eSearch.
+The prompt and tool text used to point the model at fixed entry points that no search returns, and
+which the gate therefore refused:
+- `render_shim.py` (the `intercept_page` description): the TMview template
+  `https://www.tmdn.org/tmview/`;
+- `agent/CLAUDE.md`: TMview, Bolagsverket's web UI, EUIPO eSearch, named as forms to drive.
 
-`urlpolicy` gains a second operator entry type, `FixedURL(url, prefix: bool)`. It is an exact
-URL, or a path prefix with **no query and no free parameter**, maintained next to
-`SHOP_TEMPLATES`. Initial entries are the three SPA entry URLs above (exact URLs confirmed by
-the implementer from the current prompt text). `check()` allows a URL that equals an exact
-entry, or whose scheme, host and path start with a prefix entry and whose query is empty.
+`urlpolicy` gains a second operator entry type, `FixedURL(url, why)`. Implemented **exact-URL
+only**, tightening what this section first proposed: a prefix entry would hand the model a free
+path suffix, which is a data channel, so the `prefix: bool` idea was dropped. `why` records where
+the prompt points at the entry. `check()` allows a URL equal to an entry's normalized form.
 
-Drift test (§8.1): every `https://` literal in `agent/CLAUDE.md`, `agent/AGENTS.md`,
-`DEPTH_GUIDANCE` and every shim tool description must pass `check()` against an empty ledger
-after placeholder substitution (`<query>` → `test`). The alternative is an explicit
-`DOC_ONLY_URLS` exemption with a reason, for links that are never meant to be opened.
+**`FIXED_URLS` ships EMPTY, and that is the resolution, not an omission.** The only entry the
+prompt actually named was TMview, and `tmdn.org`'s Legal Notice reserves against automated use, so
+the 2026-10-04 call was to take TMview out of the prompt rather than allow-list it
+(`scraper/urlpolicy.py:304-307` carries that reasoning). The other two this section listed,
+Bolagsverket's web UI and EUIPO eSearch, were never in the prompt as URLs at all — only named in
+prose — so the model could not have been handed them, and both registries already have licensed
+API shims (`bolagsverket_*`, `trademark_search`). Driving their web UIs was the wrong route anyway.
+
+That decision was only half-carried-out until the drift test went in: `render_shim.py` still
+offered `url: 'https://www.tmdn.org/tmview/'` as its worked `intercept_page` template, and
+`agent/CLAUDE.md` still named all three as forms to drive, while `agent/CLAUDE.md` separately said
+TMview is "for manual cross-checks only". The prompt contradicted itself and the gate refused the
+URL it advertised. Both sites now show a URL-free shape instead. **Re-adding a `FixedURL` entry is
+a widening and a licensing question, not a config tweak.**
+
+Drift test (§8.1, `tests/test_prompt_url_drift.py`): every `https://` literal in
+`agent/CLAUDE.md`, `agent/AGENTS.md`, `DEPTH_GUIDANCE` and every shim tool description must pass
+`check()` against an empty ledger, or carry a `DOC_ONLY_URLS` exemption with a reason. Empty
+ledger because these are entry points, reachable before any search has run.
+
+Placeholders are judged by **position**, which is the part worth getting right:
+- in the query (`...?q=<query>`) it is a documented parameter of an entry point the model is told
+  to build, so it is substituted and checked — a bare `...?q=` prefix gets a value too, since an
+  empty free parameter is refused by design;
+- in the path or host (`https://host/<slug>`) it describes the shape of a URL the model will be
+  *handed* from a result list. Those are reachable only through the ledger, so requiring one to
+  pass against an empty ledger would assert the opposite of what the gate exists for.
+
+`DOC_ONLY_URLS` lives in the test, deliberately **not** in `urlpolicy`: it grants nothing and is
+only a list of strings the test agrees not to check. Next to `SHOP_TEMPLATES` and `FIXED_URLS` it
+would read as a third operator allowlist and get wired into `check()` by a later reader. Its two
+entries are the Sellpy item shape (carries a literal ellipsis) and `https://www.clasohlson.com/se`
+— a base the prompt tells the model to *concatenate*, never to open, with §3.3 ledgering the joined
+item URL that actually gets fetched.
+
+The test also asserts its own corpus is non-empty and holds at least 15 URLs, so a refactor that
+quietly stops collecting prompt text fails loudly instead of passing vacuously.
 
 ### 3.8 What the model sees
 
@@ -1073,33 +1107,46 @@ Still open:
 
 Each item gets a red test first.
 
-- [ ] G1 `query_is_bounded` (and the shared typed-text rule) refuses `://` / `%3a%2f%2f`
+- [x] G1 `query_is_bounded` (and the shared typed-text rule) refuses `://` / `%3a%2f%2f`
       after decoding (echo laundering).
-- [ ] G2 the scraper returns `links[]` (exact DOM hrefs); the broker harvests it alongside the
+- [x] G2 the scraper returns `links[]` (exact DOM hrefs); the broker harvests it alongside the
       displayed text.
-- [ ] G3 per-run ledger cap (400 000) and per-host cap (20 000) in the broker; `ledger_full`
-      reason.
-- [ ] G5 one policy module in `scraper/urlpolicy.py`; `netguard.typed_text_error`'s mirror is
+- [x] G3 per-run ledger cap (400 000) in the broker; `ledger_full` reason.
+      **The per-host cap (20 000) this item asked for was dropped on purpose** by the 2026-10-04
+      advisor pass: a single-host shopping run legitimately exceeds 20 000 URLs, so the cap would
+      refuse ordinary work (`broker/config.py`, the comment above `LEDGER_MAX_URLS`). The 20 000
+      that remains is `NAV_POLICY_MAX_URLS` — how many ledger URLs travel to the scraper with each
+      intercept/open/act — which is a per-call transfer bound, not a per-host cap. Do not read the
+      shared number as evidence the cap exists.
+- [x] G5 one policy module in `scraper/urlpolicy.py`; `netguard.typed_text_error`'s mirror is
       removed.
-- [ ] G6 `service_workers="block"` on every `new_context` (render, intercept, sessions).
-- [ ] Fix the `install_request_guard` docstring: subresources can carry typed text once the
+- [x] G6 `service_workers="block"` on every `new_context` (render, intercept, sessions).
+- [x] Fix the `install_request_guard` docstring: subresources can carry typed text once the
       agent has typed into the page.
-- [ ] `nav_allowed` on intercept and sessions only, with the same-host GET allowance (§4.1).
-- [ ] §3.3 relative-path harvest + Clas Ohlson `relative_base`, with a recorded fixture.
-- [ ] §3.6 number normalisation + browser-action budget.
-- [ ] §3.7 `FixedURL` entries + drift test over all prompt and tool-text URLs.
-- [ ] §2.3 search-query URL refusal; per-route timeouts with asserted ordering.
-- [ ] §2.4 per-attempt registration, with the ≥240 s timeout and ENOENT retry of §12.2.
-- [ ] §12.4 era-file read, dual-mode dispatch, and the legacy branch's **env-only** key resolver
+- [x] `nav_allowed` on intercept and sessions only, with the same-host GET allowance (§4.1).
+- [x] §3.3 relative-path harvest + Clas Ohlson `relative_base`, with a recorded fixture.
+- [x] §3.6 number normalisation + browser-action budget.
+- [x] §3.7 `FixedURL` entries + drift test over all prompt and tool-text URLs.
+- [x] §2.3 search-query URL refusal; per-route timeouts with asserted ordering.
+- [x] §2.4 per-attempt registration, with the ≥240 s timeout and ENOENT retry of §12.2.
+- [x] §12.4 era-file read, dual-mode dispatch, and the legacy branch's **env-only** key resolver
       (it must not reach `_keyring_lookup`).
 - [ ] ~~`_SECRET_ENV` trim~~ — **moved to PR 4** (§12.1). Doing it in PR 2 would break the legacy
       branch that PR 2 still has to serve.
-- [ ] §8.1 `--clearenv` + exact env allowlist in `run-agent.sh`.
+- [x] §8.1 `--clearenv` + exact env allowlist in `run-agent.sh`.
 - [x] §8.1 conftest network guard covering both `socket` and `curl_cffi` (connect/connect_ex/sendto
       + DNS; `Session.request`, `AsyncSession.request`, `Curl.setopt(URL)`). Not T-1 — see §8.1 for
       why that file is out of the suite's reach, and for the subprocess/redirect gaps.
-- [ ] Budgets single-sourced in `broker/config.py` + drift test against `agent/CLAUDE.md`.
-- [ ] Session and artifact run binding (§4.3).
+- [x] Budgets single-sourced in `broker/config.py` (`CALL_BUDGETS`, `BROWSER_ACTIONS`,
+      `TYPED_CHARS`, `MAX_DRAGS_PER_RUN`, `MAX_XY_TARGETS_PER_RUN`). ~~drift test against
+      `agent/CLAUDE.md`~~ — **nothing to drift against:** the prompt states no numeric budgets at
+      all (it uses "budget" only for research effort), so the test would assert over an empty set
+      and pass vacuously. If the prompt is ever given the real numbers so the model can pace
+      itself, add the test in the same change; `tests/test_prompt_url_drift.py` is the pattern,
+      including its guard that the corpus is non-empty.
+- [x] Session and artifact run binding (§4.3). `validate_run_id` +
+      `scraper/sessions.py` keying; a cross-run `act` is refused 403 "another run" and
+      `save_artifact` is forced back to the owning run (`tests/test_broker.py`).
 
 ---
 
