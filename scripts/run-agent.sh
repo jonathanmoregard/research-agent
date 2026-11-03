@@ -224,6 +224,53 @@ case "${SCRATCH_DIR}" in
 esac
 chmod 700 "${SCRATCH_DIR}"
 
+# Pin the agent tree for the lifetime of this run.
+#
+# /workspace/agent used to be bound straight from the live checkout, and the
+# host pulls every 30 minutes with runs in flight. Shims are separate
+# processes started after the jail (the CLI spawns its MCP servers during
+# session init, and a scripted client may start one later still), so a pull
+# landing in that window hands a running run shim code from a DIFFERENT
+# commit than it began with.
+#
+# That is a provenance-gate bypass, not a cosmetic inconsistency. A run that
+# registered with the broker and holds a broker token can start a pre-broker
+# `render_shim.py`, which has no broker client and posts directly to the
+# scraper at 10.0.2.2:8123 — reachable in the `expand` era, with the scraper
+# bearer readable. Every later call in that run then skips the URL gate.
+# Found by vm-egress-switchover at T6b (2026-11-04): the rollback's revert
+# landed mid-run and two canary URLs came back `ok` instead of `refused`,
+# with the canary host actually resolved. No key leaked — the jail runs
+# `--clearenv`, so the old code found none — but the gate was off.
+#
+# A snapshot makes "every shim in a run is the code the run started with" a
+# property of the jail rather than a timing accident. It is the working tree,
+# not `git archive HEAD`, deliberately: uncommitted local edits to the
+# checkout must keep taking effect, which is how this is developed.
+# Residual window, far smaller and worth naming: `cp -a` is not atomic
+# against a concurrent pull, so a snapshot taken exactly as one lands can
+# still tear across files. It shrinks the exposure from a whole run to the
+# duration of one copy of 14 files.
+#
+# NOT inside SCRATCH_DIR: that is bound writable at /scratch, so the agent
+# could rewrite its own shim code there and have the next shim load it.
+AGENT_SNAPSHOT=$(mktemp -d --suffix=.agentsnap)
+case "${AGENT_SNAPSHOT}" in
+  /tmp/*) ;;
+  *) echo "run-agent: refusing agent snapshot outside /tmp (got ${AGENT_SNAPSHOT})" >&2; exit 3 ;;
+esac
+chmod 700 "${AGENT_SNAPSHOT}"
+cp -a "${AGENT_DIR}/." "${AGENT_SNAPSHOT}/" || {
+  echo "run-agent: cannot snapshot ${AGENT_DIR}" >&2
+  exit 3
+}
+# Fail closed rather than run an agent with no tools: a missing .mcp.json
+# would silently become a run with no shims at all.
+[[ -f "${AGENT_SNAPSHOT}/.mcp.json" ]] || {
+  echo "run-agent: agent snapshot is missing .mcp.json" >&2
+  exit 3
+}
+
 # Codex auth and state live in a fresh directory on the guest's /tmp.  The
 # directory is bind-mounted into the already-ephemeral bwrap home, then removed
 # when this call exits.  The auth JSON arrived over ssh stdin, never argv.
@@ -250,7 +297,8 @@ if [[ "${PROVIDER}" == "codex" ]]; then
   # jail, allowing Codex to persist an in-call token refresh.
   : > "${CODEX_STATE_DIR}/auth.json"
   exec {CODEX_AUTH_FD}< <(printf '%s' "${CODEX_AUTH_JSON}")
-  cp "${AGENT_DIR}/codex-config.toml" "${CODEX_STATE_DIR}/config.toml"
+  # From the snapshot, so the run's Codex config is the run's own commit too.
+  cp "${AGENT_SNAPSHOT}/codex-config.toml" "${CODEX_STATE_DIR}/config.toml"
   chmod 600 "${CODEX_STATE_DIR}/auth.json" "${CODEX_STATE_DIR}/config.toml"
   CODEX_BIND_ARGS=(
     --dir "/home/agent/.codex"
@@ -268,6 +316,9 @@ fi
 # shellcheck disable=SC2329  # invoked by the EXIT trap below
 cleanup() {
   rm -rf -- "${SCRATCH_DIR}"
+  if [[ -n "${AGENT_SNAPSHOT:-}" ]]; then
+    rm -rf -- "${AGENT_SNAPSHOT}"
+  fi
   if [[ -n "${CODEX_STATE_DIR}" ]]; then
     rm -rf -- "${CODEX_STATE_DIR}"
   fi
@@ -458,7 +509,7 @@ bwrap \
   --dev /dev \
   --tmpfs /tmp \
   --tmpfs "${HOME_DIR}" \
-  --ro-bind "${AGENT_DIR}" "${AGENT_DIR}" \
+  --ro-bind "${AGENT_SNAPSHOT}" "${AGENT_DIR}" \
   "${CODEX_BIND_ARGS[@]}" \
   --bind "${SCRATCH_DIR}" /scratch \
   --unshare-user \

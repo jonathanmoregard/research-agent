@@ -403,3 +403,67 @@ def test_received_protocol_is_recorded_to_the_guest_log(jail, tmp_path, extra, l
     assert line in log and UUID in log
     assert line in p.stderr
     assert BROKER_TOKEN not in log
+
+
+def _agent_bind(rec):
+    """The bind source that lands at /workspace/agent inside the jail."""
+    srcs = [src for src, dst in rec["binds"] if dst == "/workspace/agent"]
+    assert len(srcs) == 1, f"expected exactly one /workspace/agent bind: {rec['binds']}"
+    return srcs[0]
+
+
+def test_the_jail_binds_a_per_run_snapshot_of_agent_not_the_live_tree(jail):
+    """A pull landing mid-run must not change the code that run is using.
+
+    /workspace/agent used to be bound straight from the live checkout, and
+    the host pulls every 30 minutes with runs in flight. Shims are separate
+    processes started after the jail, so a run could end up loading shim
+    code from a different commit than it registered with — and a pre-broker
+    `render_shim.py` has no broker client, so it posts directly to the
+    scraper at 10.0.2.2:8123 and every later call in that run skips the URL
+    gate. vm-egress-switchover caught it at T6b (2026-11-04): the rollback's
+    revert landed mid-run and two canary URLs came back `ok` instead of
+    `refused`, with the canary host actually resolved.
+    """
+    p, rec, _ = jail()
+    assert p.returncode == 0, p.stderr
+    src = _agent_bind(rec)
+
+    # Not the live tree: that is the whole point.
+    assert src != "/workspace/agent", (
+        "the jail binds the live checkout, so a pull mid-run still swaps a "
+        "running run's shim code"
+    )
+    assert src.startswith("/tmp/") and src.endswith(".agentsnap"), (
+        f"unexpected agent bind source: {src}"
+    )
+
+    # The path inside the jail is unchanged, so .mcp.json, CLAUDE.md and the
+    # agent's cwd all still resolve exactly where they did before.
+    pre = _pre(rec)
+    assert _flag(pre, "--chdir") == "/workspace/agent"
+
+    # NOT inside the directory bound writable at /scratch. If it were, the
+    # agent could rewrite its own shim code and have the next shim load it.
+    assert rec["scratch"], "no /scratch bind recorded"
+    assert not src.startswith(rec["scratch"].rstrip("/") + "/"), (
+        f"agent snapshot {src} sits inside the writable scratch bind "
+        f"{rec['scratch']}: the agent could edit its own shims"
+    )
+
+    # Removed when the call exits — a snapshot per run, not a growing pile.
+    assert not os.path.exists(src), f"agent snapshot {src} outlived the run"
+
+
+def test_each_run_snapshots_the_agent_tree_separately(jail):
+    """Per-run, not a shared cache.
+
+    A single cached copy would be poisoned by one pull for every run that
+    followed it, which is the same defect with a longer fuse.
+    """
+    p1, rec1, _ = jail()
+    p2, rec2, _ = jail()
+    assert p1.returncode == 0 and p2.returncode == 0
+    assert _agent_bind(rec1) != _agent_bind(rec2), (
+        "both runs bound the same agent snapshot path"
+    )

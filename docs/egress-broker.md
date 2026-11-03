@@ -1652,6 +1652,38 @@ would have come back "verified" without having been tested. Run T1 before trusti
     legacy.
 - **Shims (new):** with `RESEARCH_BROKER_TOKEN` set → broker routes. Without it → today's direct
   calls (keys from env, scraper via `10.0.2.2:8123` and `/etc/scraper/token`).
+
+  **This whole table assumes one run uses one version of the code. That was not true, and the
+  assumption is the dangerous part** (found by the lane at T6b, 2026-11-04; fixed by pinning the
+  agent tree per run in `scripts/run-agent.sh`). `/workspace/agent` was bound from the live
+  checkout, and the host pulls every 30 minutes with runs in flight. Shims are separate processes
+  started *after* the jail, so a pull landing in that window gave a running run shim code from a
+  different commit than it registered with. The rows above read down the columns — "new server +
+  new shims" — and that row did not always exist.
+
+  The damage is one-directional and it is the rollback that is dangerous. **Backwards** (code⁻¹
+  during a rollback, in the `expand` era) a broker-mode run that holds a broker token can start a
+  *pre-broker* `render_shim.py`, which has no broker client at all and posts straight to
+  `10.0.2.2:8123` — routable in `expand`, with the scraper bearer readable. Every later call in
+  that run then bypasses the provenance gate entirely: the lane saw `canary_render` and
+  `canary_template` return **`ok`** instead of `refused`, with `canary.test` actually resolved. No
+  key leaked, because the jail runs `--clearenv` and the old code finds nothing in env — but the
+  URL gate was simply off. **Forwards** (the pull at T2) the same mixing happens and is harmless:
+  new shims work without a token, and since `975c900` they send the run id.
+
+  Under `contract` it cannot happen at all: the mandated order puts B⁻¹ first and the `contract`
+  guest has no `:8123` route. So the exposure was exactly PR 2's own rollback — the step whose
+  whole purpose is to be safe.
+
+  Pinning the tree makes "every shim in a run is the code the run started with" a property of the
+  jail instead of a timing accident. It snapshots the **working tree**, not `git archive HEAD`, on
+  purpose: uncommitted local edits must keep taking effect, since that is how this is developed.
+  The snapshot lives outside the writable `/scratch` bind, or the agent could rewrite its own shim
+  code and have the next shim load it. Residual window, named rather than hidden: `cp -a` is not
+  atomic against a concurrent pull, so a snapshot taken exactly as one lands can still tear across
+  files — the exposure drops from a whole run to one copy of 14 files.
+  Pinned by `tests/test_run_agent_jail.py::test_the_jail_binds_a_per_run_snapshot_of_agent_not_the_live_tree`
+  and `::test_each_run_snapshots_the_agent_tree_separately`.
 - **Scraper (new):**
   - accepts broker requests (with `run_id`, `nav_policy`) and legacy requests (no `nav_policy`:
     no nav gate, exactly today's behaviour on `/render` and `/intercept`);
