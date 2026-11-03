@@ -9,7 +9,7 @@ not share a disposition:
     opaque and quarantine-only. Unchanged by this module's feature.
 
   * SETUP / INFRA (an outage) — `*_unavailable:*` (including behind the
-    `honeypot:` / `lakera_arbitration:` wrapper prefixes) plus the bare
+    `honeypot:` / `l2_arbitration:` wrapper prefixes) plus the bare
     `no-key` / `key-config-error` / `bad-response` codes. "This report was
     blocked" is not the secret; the report's CONTENT is. So an outage
     stays an outage even in a layer that only runs on already-flagged
@@ -135,6 +135,13 @@ INFRA_REASONS = [
     "lakera_unavailable:service-unavailable",
     "lakera_unavailable:HTTPError",
     "lakera_unavailable:TimeoutError",
+    "lakera_unavailable:url-config-error",
+    "model_armor_unavailable:no-key",
+    "model_armor_unavailable:url-config-error",
+    "model_armor_unavailable:token-error:401",
+    "model_armor_unavailable:too-large",
+    "model_armor_unavailable:bad-result",
+    "l2_unavailable:unhandled:RuntimeError",
     "unicode_sanitize_unavailable:unhandled:ValueError",
     "secret_shapes_unavailable:unhandled:RecursionError",
     "honeypot_unavailable:unhandled:ImportError",
@@ -144,8 +151,11 @@ INFRA_REASONS = [
     "judge_unavailable:unhandled:RuntimeError",
     # Arbitration only runs on already-flagged text, but "was blocked" is
     # not the secret — a judge outage is an outage the operator must see.
-    "lakera_arbitration:judge_unavailable:unhandled:RuntimeError",
-    "lakera_arbitration:judge_unavailable:panel:unavailable:key-config-error",
+    # The shapes injection_scanner's judge emits under intercept's wrapper.
+    "l2_arbitration:judge_unavailable:anthropic_haiku45:unhandled:RuntimeError",
+    "l2_arbitration:judge_unavailable:openai_4o_mini:key-config-error",
+    "l2_arbitration:judge_unavailable:openai_41_mini:api-error:RateLimitError:429",
+    "l2_arbitration:judge_unavailable:panel-incomplete",
     # Bare setup codes, in case a future call site emits one on its own.
     "no-key",
     "key-config-error",
@@ -158,10 +168,11 @@ CONTENT_REASONS = [
     "unicode_anomaly:stripped=91/1200",
     "lakera:prompt_attack",
     "lakera:flagged",
+    "model_armor:prompt_attack",
     "honeypot:honeypot:tool_bait:canary_in_arg:read_file",
     "wrap_escape:close_untrusted",
     # A judge panel that VOTED attack is a detection, not an outage.
-    "lakera_arbitration:attack_vote:gpt-4o-mini",
+    "l2_arbitration:attack:openai_4o_mini",
     # Content length is content-derived.
     "oversized:1048576>524288",
     # The scanner blowing up is not on the named infra allowlist.
@@ -259,12 +270,98 @@ def test_predicate_rejects_non_strings():
              "exc_type": "APIStatusError", "http_status": 503},
         ),
         (
-            "lakera_arbitration:judge_unavailable:unhandled:RuntimeError",
+            "l2_arbitration:judge_unavailable:anthropic_haiku45:unhandled:RuntimeError",
             {"layer": "judge", "condition": "unavailable", "exc_type": "RuntimeError"},
+        ),
+        (
+            "l2_arbitration:judge_unavailable:openai_41_mini:api-error:RateLimitError:429",
+            {"layer": "judge", "condition": "unavailable",
+             "exc_type": "RateLimitError", "http_status": 429},
+        ),
+        (
+            "l2_arbitration:judge_unavailable:openai_4o_mini:no-openai-api-key",
+            {"layer": "judge", "condition": "no_key"},
+        ),
+        (
+            "l2_arbitration:judge_unavailable:panel-incomplete",
+            {"layer": "judge", "condition": "unavailable"},
         ),
         (
             "judge_unavailable:unhandled:ImportError",
             {"layer": "judge", "condition": "unavailable", "exc_type": "ImportError"},
+        ),
+        (
+            "lakera_unavailable:url-config-error",
+            {"layer": "lakera", "condition": "url_config_error"},
+        ),
+        # Model Armor: the setup conditions it shares with Lakera keep their
+        # names; its own vendor-side conditions read as a generic outage.
+        (
+            "model_armor_unavailable:no-key",
+            {"layer": "model_armor", "condition": "no_key"},
+        ),
+        (
+            "model_armor_unavailable:key-config-error",
+            {"layer": "model_armor", "condition": "key_config_error"},
+        ),
+        (
+            "model_armor_unavailable:url-config-error",
+            {"layer": "model_armor", "condition": "url_config_error"},
+        ),
+        (
+            "model_armor_unavailable:throttled",
+            {"layer": "model_armor", "condition": "throttled"},
+        ),
+        (
+            "model_armor_unavailable:limiter-error",
+            {"layer": "model_armor", "condition": "limiter_error"},
+        ),
+        (
+            "model_armor_unavailable:service-unavailable",
+            {"layer": "model_armor", "condition": "service_unavailable"},
+        ),
+        (
+            "model_armor_unavailable:bad-response",
+            {"layer": "model_armor", "condition": "bad_response"},
+        ),
+        (
+            "model_armor_unavailable:HTTPError:429",
+            {"layer": "model_armor", "condition": "unavailable",
+             "exc_type": "HTTPError", "http_status": 429},
+        ),
+        (
+            "model_armor_unavailable:token-error",
+            {"layer": "model_armor", "condition": "unavailable"},
+        ),
+        (
+            "model_armor_unavailable:token-error:401",
+            {"layer": "model_armor", "condition": "unavailable", "http_status": 401},
+        ),
+        # `too-large` is a length threshold on the report: no condition of
+        # its own, so no length bit beyond "model_armor is unavailable".
+        (
+            "model_armor_unavailable:too-large",
+            {"layer": "model_armor", "condition": "unavailable"},
+        ),
+        (
+            "model_armor_unavailable:skipped",
+            {"layer": "model_armor", "condition": "unavailable"},
+        ),
+        (
+            "model_armor_unavailable:partial-invocation",
+            {"layer": "model_armor", "condition": "unavailable"},
+        ),
+        (
+            "model_armor_unavailable:bad-result",
+            {"layer": "model_armor", "condition": "unavailable"},
+        ),
+        (
+            "model_armor_unavailable:unhandled:ValueError",
+            {"layer": "model_armor", "condition": "unavailable", "exc_type": "ValueError"},
+        ),
+        (
+            "l2_unavailable:unhandled:RuntimeError",
+            {"layer": "l2", "condition": "unavailable", "exc_type": "RuntimeError"},
         ),
         ("no-key", {"layer": "other", "condition": "no_key"}),
         ("key-config-error", {"layer": "other", "condition": "key_config_error"}),
@@ -291,6 +388,16 @@ def test_unknown_exception_type_maps_to_other():
     assert diag["exc_type"] == "other"
     assert "VendorSpecificBoomError" not in json.dumps(diag)
     _assert_closed_vocabulary(diag)
+
+
+def test_unknown_model_armor_tail_is_never_echoed():
+    assert srv._infra_diagnosis("model_armor_unavailable:VendorSpecificBoomError:503") == {
+        "layer": "model_armor", "condition": "unavailable",
+        "exc_type": "other", "http_status": 503,
+    }
+    assert srv._infra_diagnosis("model_armor_unavailable:brand-new-condition") == {
+        "layer": "model_armor", "condition": "unavailable",
+    }
 
 
 def test_exc_type_absent_when_there_was_no_exception():
@@ -335,7 +442,7 @@ def test_diagnosis_is_total_and_never_passes_input_through():
         f"lakera_unavailable:{poison}:{poison}",
         f"{poison}_unavailable:{poison}:429",
         f"honeypot:honeypot_unavailable:{poison}:unavailable:{poison}+skipped={poison}",
-        f"lakera_arbitration:judge_unavailable:{poison}",
+        f"l2_arbitration:judge_unavailable:{poison}",
         "lakera_unavailable:" + "x" * 5000,
         "lakera_unavailable::::::",
         "_unavailable",
@@ -365,7 +472,8 @@ def test_infra_diagnosis_is_surfaced_to_caller(reports_dir, monkeypatch):
 def test_arbitration_outage_is_now_visible(reports_dir, monkeypatch):
     """"Was blocked" is not the secret — a judge outage must reach the caller."""
     result = _reject(
-        monkeypatch, "lakera_arbitration:judge_unavailable:unhandled:RuntimeError"
+        monkeypatch,
+        "l2_arbitration:judge_unavailable:anthropic_haiku45:unhandled:RuntimeError",
     )
     assert result[INFRA_KEY]["layer"] == "judge"
     assert result[INFRA_KEY]["condition"] == "unavailable"
@@ -498,3 +606,83 @@ def test_reject_response_default_is_unchanged():
     assert set(out) == OPAQUE_KEYS
     assert out["error"] == OPAQUE_ERROR
     assert out["report_id"] == "rid"
+
+
+@pytest.mark.parametrize("exc", ["ResponseTooLarge", "UnexpectedHTTPStatus"])
+def test_scanner_transport_exception_types_are_named(exc):
+    """vendor_http's own exception types are library vocabulary, so an
+    operator sees `ResponseTooLarge` rather than `other`."""
+    for vendor in ("lakera", "model_armor"):
+        diag = srv._infra_diagnosis(f"{vendor}_unavailable:{exc}")
+        assert diag["exc_type"] == exc
+        _assert_closed_vocabulary(diag)
+
+
+# --------------------------------------------------------------------------
+# Contract with the scanner: reasons produced by injection_scanner itself
+# --------------------------------------------------------------------------
+#
+# The literal strings above pin the parser; these pin the AGREEMENT. Each
+# reason is produced by the installed injection_scanner (real intercept +
+# judge aggregation, vendors and providers stubbed), so if the scanner's
+# judge-outage shape drifts the classification here fails instead of a
+# judge outage silently reading as a content-derived reject.
+
+
+def _scanner_arbitration_reason(monkeypatch, vote) -> str:
+    """Run injection_scanner's real L2 -> L3 -> L4 path to arbitration with
+    every judge answering `vote(judge_id)`; return the Verdict reason."""
+    from injection_scanner import intercept, judge, lakera, modelarmor
+    from injection_scanner.honeypot import HoneypotResult
+    from injection_scanner.judge import JudgeVote
+    from injection_scanner.vendor_http import VendorResult
+
+    flagged = VendorResult(ok=False, flagged=True, reason="lakera:prompt_attack")
+    monkeypatch.setattr(lakera, "check", lambda _t, **_kw: flagged)
+    monkeypatch.setattr(
+        modelarmor, "check", lambda _t, **_kw: VendorResult(ok=True, reason="pass")
+    )
+    monkeypatch.setattr(
+        intercept, "honeypot_check", lambda _t: HoneypotResult(ok=True, reason="pass")
+    )
+
+    async def ask(j, _sealed):
+        return JudgeVote(j["id"], *vote(j["id"]))
+
+    monkeypatch.setattr(judge, "_ask_one", ask)
+    verdict = intercept.scan_text("prose about agent tooling")
+    assert not verdict.ok
+    return verdict.reason
+
+
+def test_a_scanner_judge_outage_is_diagnosed_as_the_judge(monkeypatch):
+    reason = _scanner_arbitration_reason(
+        monkeypatch,
+        lambda jid: ("unavailable", "api-error:RateLimitError:429")
+        if jid == "openai_41_mini" else ("benign", "verdict"),
+    )
+    assert srv._is_infra_reason(reason) is True, reason
+    assert srv._infra_diagnosis(reason) == {
+        "layer": "judge",
+        "condition": "unavailable",
+        "exc_type": "RateLimitError",
+        "http_status": 429,
+    }
+
+
+def test_a_scanner_judge_attack_vote_stays_opaque(monkeypatch):
+    reason = _scanner_arbitration_reason(
+        monkeypatch,
+        lambda jid: ("attack", "verdict") if jid == "openai_4o_mini" else ("benign", "verdict"),
+    )
+    assert srv._is_infra_reason(reason) is False, reason
+
+
+def test_scanner_judge_readiness_is_diagnosed_as_a_missing_judge_key(monkeypatch):
+    from injection_scanner import judge
+
+    monkeypatch.setattr(judge, "_anthropic_key", lambda: "k")
+    monkeypatch.setattr(judge, "_openai_key", lambda: None)
+    reason = judge.ready()
+    assert srv._is_infra_reason(reason) is True, reason
+    assert srv._infra_diagnosis(reason) == {"layer": "judge", "condition": "no_key"}

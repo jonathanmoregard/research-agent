@@ -101,8 +101,8 @@ def test_fast_path_not_gated_by_lock(lockfile, monkeypatch):
     monkeypatch.setattr(server, "_scanner_health_gate", lambda: (True, ""))
     monkeypatch.setattr(server, "_direct_exa", lambda prompt: (True, "# fast\nok"))
 
-    def _deliver(content, report_id, prompt, agent_ms, t_received, t_scan_start):
-        return {"status": "done", "report_path": "x", "report": content}
+    def _deliver(content, report_id, prompt, agent_ms, t_received, t_scan_start, **_kw):
+        return {"status": "done", "report_path": "x", "summary": content}
 
     monkeypatch.setattr(server, "_scan_and_deliver", _deliver)
     with server._vm_lock(5):  # VM lock held
