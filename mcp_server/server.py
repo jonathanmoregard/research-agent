@@ -31,6 +31,7 @@ state isolation is enforced by bubblewrap, not by VM restart.
 """
 from __future__ import annotations
 
+import atexit
 import contextlib
 import errno
 import fcntl
@@ -3307,6 +3308,12 @@ def main() -> None:
     `_SCANNER_HEALTH` starts degraded, so the server is connected but
     refusing until the warmup publishes a passing smoke.
     """
+    # G3 (§12.6 step 3): mark this process as new code, unconditionally —
+    # the gate asks which code runs, not which egress mode it picks. Local
+    # files only, so it is safe before stdio binds.
+    from mcp_server import mcp_marker
+
+    atexit.register(mcp_marker.remove, mcp_marker.write())
     _log_credentials_state()
     threading.Thread(
         target=_scanner_warmup, name="scanner-warmup", daemon=True

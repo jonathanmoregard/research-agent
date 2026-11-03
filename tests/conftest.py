@@ -48,6 +48,10 @@ def _host_egress_state_isolated(monkeypatch):
 
     monkeypatch.setattr(artifact_gate, "SCRAPER_HOST_TOKEN_FILE",
                         str(_NO_EGRESS_STATE / "scraper-bearer"))
+    # Nor write G3 protocol markers into the real /run/user/<uid>.
+    from mcp_server import mcp_marker
+
+    monkeypatch.setattr(mcp_marker, "default_dir", lambda: _NO_EGRESS_STATE / "mcp-markers")
 
 
 @pytest.fixture(autouse=True)
