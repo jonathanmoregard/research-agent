@@ -202,6 +202,10 @@ class ArtifactStore:
         self._lock = threading.Lock()
         self._runs: dict[str, dict] = {}  # run_id -> {"ts": float, "items": [..]}
         self._total = 0
+        # Runs whose collector (the MCP's research() call) holds them open.
+        # A run whose hold ended can never be pulled again: see release().
+        self._held: dict[str, int] = {}
+        self._ever_held: set[str] = set()
 
     def add(self, run_id: str, name: str, data: bytes, mime: str) -> str:
         ext = ".png" if mime == "image/png" else ".jpg"
@@ -236,11 +240,39 @@ class ArtifactStore:
                 })
             return out
 
+    def hold(self, run_id: str) -> None:
+        with self._lock:
+            self._held[run_id] = self._held.get(run_id, 0) + 1
+            self._ever_held.add(run_id)
+
+    def release(self, run_id: str) -> int:
+        """The collector's hold ended (its call returned, or its process
+        died and the kernel closed the socket). Nobody can pull this run's
+        artifacts any more, so they are orphans: discard them. Returns how
+        many were dropped."""
+        with self._lock:
+            n = self._held.get(run_id, 0) - 1
+            if n > 0:
+                self._held[run_id] = n
+                return 0
+            self._held.pop(run_id, None)
+            run = self._runs.pop(run_id, None)
+            if run is None:
+                return 0
+            for i in run["items"]:
+                self._total -= len(i["data"])
+            return len(run["items"])
+
     def pending(self) -> int:
-        """Un-pulled artifacts (expired ones are not pending: sweep first)."""
+        """Artifacts a live run could still pull — what a scraper restart
+        would lose. Excludes expired ones (sweep first) and orphans: a run
+        once held whose hold has ended. A run never held counts: no hold is
+        no proof its collector is gone (older MCP code, or a hold that
+        could not connect), so the TTL sweep is its bound."""
         self.sweep()
         with self._lock:
-            return sum(len(v["items"]) for v in self._runs.values())
+            return sum(len(v["items"]) for rid, v in self._runs.items()
+                       if rid in self._held or rid not in self._ever_held)
 
     def sweep(self) -> None:
         now = time.monotonic()

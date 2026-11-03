@@ -28,7 +28,7 @@ _NO_EGRESS_STATE = _LOG_DIR / "no-egress-state"
 
 @pytest.fixture(autouse=True)
 def _host_egress_state_isolated(monkeypatch):
-    """Never let a test see this host's deploy state (§12.4).
+    """Never let a test see this host's deploy state (§12.4) or its scraper.
 
     `_dial_agent` reads /etc/research-agent/egress-era and the broker admin
     socket. On a host past nixos-A (live broker, `.guest-protocol` in the
@@ -41,6 +41,12 @@ def _host_egress_state_isolated(monkeypatch):
 
     monkeypatch.setattr(server, "_EGRESS_ERA_PATH", _NO_EGRESS_STATE / "egress-era")
     monkeypatch.setenv("RESEARCH_BROKER_ADMIN", str(_NO_EGRESS_STATE / "admin.sock"))
+    # Nor this host's scraper: research() holds its run there and pulls its
+    # artifacts with the host bearer. No bearer file → neither connects.
+    from mcp_server import artifact_gate
+
+    monkeypatch.setattr(artifact_gate, "SCRAPER_HOST_TOKEN_FILE",
+                        str(_NO_EGRESS_STATE / "scraper-bearer"))
 
 
 @pytest.fixture(autouse=True)

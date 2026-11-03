@@ -11,8 +11,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
+import struct
 import sys
 import threading
+import time
 import types
 import urllib.request
 from pathlib import Path
@@ -62,6 +65,7 @@ def health():
         with urllib.request.urlopen(
                 f"http://127.0.0.1:{srv.server_address[1]}/health", timeout=5) as r:
             return r.status, json.loads(r.read())
+    get.port = srv.server_address[1]
     yield get
     srv.shutdown()
     srv.server_close()
@@ -174,3 +178,97 @@ def test_broker_and_scraper_share_one_digest_implementation(tmp_path):
         str(REPO_ROOT), rels + ["scraper/digest.py", "scraper/urlpolicy.py"])
     rels = sorted(f"scraper/{p.name}" for p in (REPO_ROOT / "scraper").glob("*.py"))
     assert digest.scraper_digest(str(REPO_ROOT)) == shared.tree_digest(str(REPO_ROOT), rels)
+
+
+# --- pending_artifacts counts only runs that can still be pulled (§12.3) -----------
+#
+# The MCP's research() call is the only collector of a run's artifacts. It
+# holds `POST /artifacts/<run>/hold` open for its whole life; the hold ends
+# when the call returns or its process dies (the kernel closes the socket),
+# with no clock involved. Artifacts of a run whose hold ended can never be
+# pulled: they are orphans, discarded and not counted.
+
+LIVE, DEAD = "a1" * 16, "b2" * 16
+BEARER = "Bearer stub-token-for-tests"
+
+
+def _hold(port, run_id, bearer=BEARER):
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.sendall(f"POST /artifacts/{run_id}/hold HTTP/1.0\r\nAuthorization: {bearer}\r\n"
+              "Content-Length: 0\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        head += chunk
+    return s, head
+
+
+def _until(pred, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not pred() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return pred()
+
+
+@pytest.fixture
+def store(monkeypatch):
+    s = sessions.ArtifactStore()
+    monkeypatch.setattr(sessions, "_artifact_store", s)
+    return s
+
+
+@pytest.mark.parametrize("ending", ["fin", "rst"])
+def test_pending_artifacts_excludes_an_orphaned_run_and_the_roll_clears(
+        health, checkout, store, ending):
+    live, head = _hold(health.port, LIVE)
+    assert head.startswith(b"HTTP/1.0 200"), head
+    dead, head = _hold(health.port, DEAD)
+    assert head.startswith(b"HTTP/1.0 200"), head
+    try:
+        store.add(LIVE, "shot", b"\x89PNG-fake", "image/png")
+        store.add(DEAD, "shot", b"\x89PNG-fake", "image/png")
+        assert health()[1]["pending_artifacts"] == 2
+        if ending == "rst":  # how a killed process's socket can end
+            dead.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        dead.close()  # its collector crashed, or returned without pulling
+        assert _until(lambda: health()[1]["pending_artifacts"] == 1), \
+            "an orphan must not hold the roll; the live run's artifact still must"
+        assert store.take(DEAD) == [], "an orphan is discarded: nobody can pull it"
+        assert [i["name"] for i in store.take(LIVE)] == ["shot.png"]  # the live pull
+        body = health()[1]
+        # The roll's need-check: nothing open, nothing a live run could collect.
+        assert body["open_sessions"] == 0 and body["pending_artifacts"] == 0
+    finally:
+        live.close()
+        dead.close()
+
+
+def test_a_hold_outlives_the_request_read_timeout(health, checkout, store, monkeypatch):
+    """The 15 s slowloris bound applies to reading requests, not to a hold."""
+    monkeypatch.setattr(server.Handler, "timeout", 0.2)
+    live, head = _hold(health.port, LIVE)
+    try:
+        assert head.startswith(b"HTTP/1.0 200"), head
+        store.add(LIVE, "shot", b"\x89PNG-fake", "image/png")
+        time.sleep(1.0)
+        assert health()[1]["pending_artifacts"] == 1
+    finally:
+        live.close()
+
+
+def test_a_run_never_held_still_counts(health, checkout, store):
+    """No hold is not proof of death (a collector from before this protocol,
+    or one that could not reach us): those artifacts count until pulled or
+    the TTL sweep."""
+    store.add(LIVE, "shot", b"\x89PNG-fake", "image/png")
+    assert health()[1]["pending_artifacts"] == 1
+
+
+@pytest.mark.parametrize("bearer,run_id,status", [
+    ("", LIVE, b"401"), ("Bearer wrong", LIVE, b"403"), (BEARER, "nothex", b"404")])
+def test_hold_needs_the_bearer_and_a_run_id(health, checkout, store, bearer, run_id, status):
+    s, head = _hold(health.port, run_id, bearer)
+    s.close()
+    assert head.split(b" ", 2)[1] == status, head

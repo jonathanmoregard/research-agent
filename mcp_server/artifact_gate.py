@@ -16,11 +16,13 @@ import hashlib
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 SCRAPER_HOST_API = os.environ.get("SCRAPER_HOST_API", "http://127.0.0.1:8123")
 SCRAPER_HOST_TOKEN_FILE = os.environ.get(
@@ -56,6 +58,42 @@ def fetch_artifacts(run_id: str) -> list[dict]:
         print(f"research-agent: artifact fetch failed for {run_id}: "
               f"{type(e).__name__}", file=sys.stderr)
         return []
+
+
+def hold_run(run_id: str) -> socket.socket | None:
+    """Tell the scraper this run's artifacts are still collectable.
+
+    Opens POST /artifacts/<run_id>/hold and keeps the connection open,
+    unread; the caller closes it when it can no longer pull (and the kernel
+    does if this process dies). The scraper discards a released run's
+    un-pulled artifacts as orphans and never counts them toward its roll
+    (docs/egress-broker.md §12.3). Best-effort: None on any failure, which
+    the scraper treats as "liveness unknown" and keeps counting the run.
+    """
+    sock = None
+    try:
+        token = _token()
+        api = urlsplit(SCRAPER_HOST_API)
+        sock = socket.create_connection((api.hostname, api.port or 80), timeout=10)
+        sock.sendall(
+            f"POST /artifacts/{run_id}/hold HTTP/1.0\r\nHost: scraper\r\n"
+            f"Authorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n".encode())
+        head = b""
+        while b"\r\n" not in head and len(head) < 1024:
+            chunk = sock.recv(1024)
+            if not chunk:
+                break
+            head += chunk
+        status = head.split(b" ", 2)[1] if head.count(b" ") >= 2 else b""
+        if status != b"200":
+            raise OSError(f"hold refused: HTTP {status.decode('ascii', 'replace')[:3]}")
+        return sock
+    except Exception as e:
+        if sock is not None:
+            sock.close()
+        print(f"research-agent: artifact hold failed for {run_id}: {type(e).__name__}",
+              file=sys.stderr)
+        return None
 
 
 def discard_artifacts(run_id: str) -> None:
