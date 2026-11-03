@@ -123,14 +123,12 @@ def test_run_agent_stdin_is_eleven_null_terminated_fields():
 def test_each_provider_receives_only_its_own_auth(monkeypatch):
     server = _import_server()
     monkeypatch.setattr(
-        server,
-        "_secrets",
-        lambda: {
-            "claude-token": "claude-private",
-            "codex-auth-json": '{"tokens":{"access_token":"codex-private"}}',
-            "exa-api-key": "exa",
-            "tavily-api-key": "tavily",
-        },
+        server, "_resolve_secret",
+        lambda name: "claude-private" if name == "claude-token" else None,
+    )
+    monkeypatch.setattr(
+        server, "_load_codex_auth_json",
+        lambda: '{"tokens":{"access_token":"codex-private"}}',
     )
     payloads = []
 
@@ -180,13 +178,13 @@ def test_run_agent_timeout_propagates():
             server._run_agent(prompt="x", report_id="0" * 32, depth="normal")
 
 
-def test_run_agent_empty_secrets_still_ships_eleven_fields(monkeypatch):
-    """If _secrets() returns {} the stdin payload still has exactly eleven
-    NUL-terminated fields (empty strings for the ten missing secrets,
-    then the prompt). The guest-side bash reads eleven fields regardless;
-    auth then fails inside the agent layer with a clear per-tool error
-    rather than silently desynchronising the stdin protocol."""
-    monkeypatch.delenv("EXA_API_KEY", raising=False)
+def test_run_agent_missing_secrets_still_ship_eleven_fields(monkeypatch):
+    """Keys absent from env are shipped as empty fields: the stdin payload
+    still has exactly eleven NUL-terminated fields. The guest-side bash
+    reads eleven fields regardless; auth then fails inside the agent layer
+    with a clear per-tool error rather than silently desynchronising the
+    stdin protocol. (With NO key in env at all the legacy dial fails
+    closed instead — tests/test_egress_dual_mode.py.)"""
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.delenv("EUIPO_CLIENT_ID", raising=False)
@@ -196,8 +194,7 @@ def test_run_agent_empty_secrets_still_ships_eleven_fields(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
     server = _import_server()
-    # Stub keyring + claude-credentials lookups so no secrets land in
-    # the cache and the wire-format check sees a true empty payload.
+    # The keyring would answer; the legacy dial must not ask it.
     monkeypatch.setattr(server, "_keyring_lookup", lambda key: None)
     monkeypatch.setattr(server, "_load_claude_credentials_token", lambda: None)
     monkeypatch.setattr(server, "_load_codex_auth_json", lambda: None)
@@ -220,7 +217,9 @@ def test_run_agent_empty_secrets_still_ships_eleven_fields(monkeypatch):
     assert parts[-1] == ""
     fields = parts[:-1]
     assert len(fields) == 11
-    assert fields[:10] == [""] * 10  # every secret slot present and empty
+    assert fields[:2] == ["", ""]  # no provider auth anywhere
+    assert fields[2] == "exa-test-key"
+    assert fields[3:10] == [""] * 7  # every other secret slot present and empty
     assert "hello world" in fields[10]
 
 

@@ -18,7 +18,11 @@ def _env(monkeypatch):
     monkeypatch.setenv("RESEARCH_SSH_HOST", "127.0.0.1")
     monkeypatch.setenv("RESEARCH_SSH_PORT", "2223")
     monkeypatch.setenv("RESEARCH_SSH_KEY", "/fake/key")
-    monkeypatch.setattr(server, "_secrets", lambda: {"claude-token": "t"})
+    # The legacy dial reads its keys from env only (§12.4) and provider auth
+    # through _resolve_secret; stub both so no real credential is read.
+    monkeypatch.setenv("EXA_API_KEY", "exa")
+    monkeypatch.setattr(server, "_resolve_secret", lambda name: "t")
+    monkeypatch.setattr(server, "_load_codex_auth_json", lambda: None)
     monkeypatch.setattr(server, "_SSH_RETRIES", 0)  # keep ssh retry out of the picture
     monkeypatch.setattr(server, "_wait_for_sshd", lambda h, p, t: True)
 

@@ -527,6 +527,179 @@ def _secrets() -> dict[str, str]:
             out[name] = val
     return out
 
+
+# --- §12.4 dual mode: which protocol a dial speaks ----------------------------
+#
+# docs/egress-broker.md §12.4. The predicate that admits the legacy (keys
+# shipped into the VM) path is a DEPLOY-STATE fact, never broker liveness:
+# a root-owned one-word file the nixos module emits. Era first, socket second:
+#
+#   era file      legacy (keys in VM)       broker
+#   absent        permitted (pre-nixos-A)   socket exists AND marker = broker-v1
+#   legacy-ok     permitted (A … B)         same
+#   broker-only   REFUSED, whatever the     socket + marker, else fail closed
+#                 socket's state
+#   other         fail closed
+#
+# Deliberately a constant, not env-configurable: the file is the control.
+_EGRESS_ERA_PATH = Path("/etc/research-agent/egress-era")
+_EGRESS_ERAS = ("legacy-ok", "broker-only")
+# Written by the checkout this server runs from (an editable install), so a
+# reverted checkout under a new in-memory server is seen per dial.
+_GUEST_PROTOCOL_PATH = Path(__file__).resolve().parent.parent / "scripts" / ".guest-protocol"
+_GUEST_PROTOCOL_BROKER = "broker-v1"
+_BROKER_ADMIN_DEFAULT = "/run/research-broker/admin.sock"
+# A registration that starts inside a broker reload waits out the drain
+# (TimeoutStopSec=210) plus the new process's start. Shorter would fail
+# exactly the calls zero-downtime promises to keep (§12.2).
+_BROKER_REGISTER_BUDGET_S = 240.0
+_BROKER_REPLY_CAP = 64 * 1024
+# The 8 third-party keys the legacy protocol ships, by env var.
+_LEGACY_KEY_ENV = {k: v for k, v in _SECRET_ENV.items() if k != "claude-token"}
+
+
+class _BrokerUnavailable(Exception):
+    """Fail closed: no protocol is admissible for this dial. Never ship keys.
+    The message is a closed reason code, never upstream text."""
+
+
+def _broker_admin_path() -> str:
+    return os.environ.get("RESEARCH_BROKER_ADMIN") or _BROKER_ADMIN_DEFAULT
+
+
+def _read_small(path: Path) -> str | None:
+    """A one-word control file: None if absent; raises OSError if unreadable."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as f:
+        return f.read(256).decode("utf-8", "replace")
+
+
+def _egress_mode() -> tuple[str, str, str]:
+    """(mode, reason, era) for one dial; mode is broker | legacy | closed.
+
+    Reads only deploy state (era file, socket path, protocol marker) — no
+    secret, so a closed outcome has touched no key.
+    """
+    try:
+        raw = _read_small(_EGRESS_ERA_PATH)
+    except OSError:
+        return "closed", "era-unreadable", "unrecognised"
+    era = None if raw is None else raw.strip()
+    if era is not None and era not in _EGRESS_ERAS:
+        return "closed", "era-unrecognised", "unrecognised"
+    label = era or "absent"
+    try:
+        marker = (_read_small(_GUEST_PROTOCOL_PATH) or "").strip()
+    except OSError:
+        marker = ""
+    has_marker = marker == _GUEST_PROTOCOL_BROKER
+    has_socket = os.path.exists(_broker_admin_path())
+    if era == "broker-only":
+        if not has_marker:
+            return "closed", "no-protocol-marker", label
+        # Socket absent is still broker mode: registration retries it for its
+        # budget (a socket-unit restart), then fails closed. Never legacy.
+        return "broker", "broker-present" if has_socket else "broker-absent", label
+    if not has_socket:
+        return "legacy", "no-broker", label
+    if not has_marker:
+        return "legacy", "no-protocol-marker", label
+    return "broker", "broker-present", label
+
+
+def _legacy_keys() -> dict[str, str]:
+    """The legacy protocol's 8 keys, from os.environ ONLY.
+
+    Never `_resolve_secret`/`_secrets`: those fall back to the GNOME keyring,
+    so dropping the wrapper's exports (nixos-B) would not remove the legacy
+    key capability — the keyring would still answer and the keys would ship
+    into the VM. Env or nothing (§12.4).
+    """
+    return {name: os.environ.get(var) or "" for name, var in _LEGACY_KEY_ENV.items()}
+
+
+def _broker_admin(method: str, path: str, body: dict | None) -> dict:
+    """One admin-socket request, retried through a reload window.
+
+    ENOENT (socket unit restarting) and ECONNREFUSED (nobody holding the
+    listener) are retried with backoff for `_BROKER_REGISTER_BUDGET_S`; a
+    connection that is accepted into the systemd-held backlog simply waits
+    for the next broker process, so the read gets the same budget. Anything
+    else is final. Raises _BrokerUnavailable.
+    """
+    import http.client
+    import socket
+
+    sock_path = _broker_admin_path()
+    deadline = time.monotonic() + _BROKER_REGISTER_BUDGET_S
+    delay = 0.1
+    while True:
+        remaining = max(deadline - time.monotonic(), 0.1)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(remaining)
+        try:
+            s.connect(sock_path)
+        except (FileNotFoundError, ConnectionRefusedError):
+            s.close()
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise _BrokerUnavailable("unreachable") from None
+            time.sleep(min(delay, left))  # the last try lands at the deadline
+            delay = min(delay * 2, 5.0)
+            continue
+        except OSError:
+            s.close()
+            raise _BrokerUnavailable("connect") from None
+        break
+    conn = http.client.HTTPConnection("localhost", timeout=remaining)
+    conn.sock = s
+    try:
+        data = json.dumps(body).encode() if body is not None else None
+        conn.request(method, path, body=data,
+                     headers={"Content-Type": "application/json"} if data else {})
+        resp = conn.getresponse()
+        raw = resp.read(_BROKER_REPLY_CAP + 1)
+        status = resp.status
+    except (OSError, http.client.HTTPException):
+        raise _BrokerUnavailable("io") from None
+    finally:
+        conn.close()
+    if status != 200 or len(raw) > _BROKER_REPLY_CAP:
+        raise _BrokerUnavailable(f"status-{status}")
+    try:
+        reply = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise _BrokerUnavailable("bad-reply") from None
+    if not isinstance(reply, dict):
+        raise _BrokerUnavailable("bad-reply")
+    return reply
+
+
+def _broker_register(report_id: str, depth: str, provider: str,
+                     prompt_urls: list[str]) -> str:
+    """POST /admin/runs for one ssh attempt; returns the run token (§2.4)."""
+    reply = _broker_admin("POST", "/admin/runs", {
+        "run_id": report_id, "depth": depth, "provider": provider,
+        "prompt_urls": prompt_urls, "ttl_s": AGENT_TIMEOUT + 300,
+    })
+    token = reply.get("token")
+    if not isinstance(token, str) or not token:
+        raise _BrokerUnavailable("bad-reply")
+    return token
+
+
+def _broker_deregister(report_id: str) -> None:
+    """DELETE /admin/runs/<id>. Best effort: the broker's TTL sweep is the
+    backstop, so a failure is logged, never raised."""
+    try:
+        _broker_admin("DELETE", f"/admin/runs/{report_id}", None)
+    except _BrokerUnavailable as e:
+        _LOG.warning("broker deregister failed id=%s reason=%s", report_id, e)
+
+
 # Timeout for a single research call (seconds).
 AGENT_TIMEOUT = int(os.environ.get("RESEARCH_AGENT_TIMEOUT", "1500"))
 
@@ -1147,6 +1320,10 @@ CODEX_PROMPT_TEMPLATE = (
 )
 
 
+# LEGACY protocol (§12.4; deleted in the cleanup PR). Byte-for-byte today's
+# script, so a legacy dial behaves exactly as before the broker — including
+# against a reverted checkout's run-agent.sh.
+#
 # Guest-side inline bash run by sshd inside the microvm. Reads eleven
 # null-terminated fields from stdin (claude_token, codex_auth_json, exa,
 # tavily, euipo_client_id, euipo_client_secret, ebay_client_id,
@@ -1161,7 +1338,7 @@ CODEX_PROMPT_TEMPLATE = (
 #
 # Script is passed via `bash -c` (argv) so stdin can carry the
 # binary-safe secret fields without conflicting with the script source.
-_GUEST_SCRIPT = (
+_GUEST_SCRIPT_LEGACY = (
     "set -euo pipefail; "
     "IFS= read -r -d '' CLAUDE_CODE_OAUTH_TOKEN; "
     "IFS= read -r -d '' CODEX_AUTH_JSON; "
@@ -1177,6 +1354,29 @@ _GUEST_SCRIPT = (
     "export CLAUDE_CODE_OAUTH_TOKEN CODEX_AUTH_JSON EXA_API_KEY TAVILY_API_KEY"
     " EUIPO_CLIENT_ID EUIPO_CLIENT_SECRET"
     " EBAY_CLIENT_ID EBAY_CLIENT_SECRET TRADERA_APP_ID TRADERA_APP_KEY; "
+    'TMP=$(mktemp -p "$HOME" research-prompt.XXXXXX); '
+    'chmod 600 "$TMP"; '
+    "trap 'rm -f \"$TMP\"' EXIT; "
+    'printf %s "$PROMPT_BODY" > "$TMP"; '
+    'exec /workspace/scripts/run-agent.sh "$1" "$TMP"'
+)
+
+# BROKER protocol `broker-v1`: a version field first, then exactly four
+# fields — claude token, codex auth JSON, broker run token, prompt. No
+# third-party key exists on this path. RESEARCH_GUEST_PROTOCOL is the
+# version field run-agent.sh dispatches on; a missing or different version
+# exits non-zero rather than falling through to anything keyed.
+_GUEST_SCRIPT_BROKER = (
+    "set -euo pipefail; "
+    "IFS= read -r -d '' RESEARCH_GUEST_PROTOCOL; "
+    '[ "$RESEARCH_GUEST_PROTOCOL" = broker-v1 ] || '
+    "{ echo 'guest: unknown protocol version' >&2; exit 12; }; "
+    "IFS= read -r -d '' CLAUDE_CODE_OAUTH_TOKEN; "
+    "IFS= read -r -d '' CODEX_AUTH_JSON; "
+    "IFS= read -r -d '' RESEARCH_BROKER_TOKEN; "
+    "IFS= read -r -d '' PROMPT_BODY; "
+    "export RESEARCH_GUEST_PROTOCOL CLAUDE_CODE_OAUTH_TOKEN CODEX_AUTH_JSON"
+    " RESEARCH_BROKER_TOKEN; "
     'TMP=$(mktemp -p "$HOME" research-prompt.XXXXXX); '
     'chmod 600 "$TMP"; '
     "trap 'rm -f \"$TMP\"' EXIT; "
@@ -1240,10 +1440,14 @@ def _dial_agent(
     """One ssh dial to the microvm (with rc=255 transport retry).
 
     Connects to the agent's sshd on RESEARCH_SSH_HOST:RESEARCH_SSH_PORT,
-    streams eleven null-terminated fields over stdin (ten secrets +
-    prompt body), and waits for run-agent.sh inside the VM to complete.
+    streams the protocol's null-terminated fields over stdin, and waits for
+    run-agent.sh inside the VM to complete. The protocol is chosen per dial
+    by `_egress_mode()` (§12.4): `broker-v1` (version + provider auth + run
+    token + prompt, registered with the broker per attempt) or legacy (the
+    eleven fields with the 8 keys, from env only).
 
-    Returns (exit_code, combined_output).
+    Returns (exit_code, combined_output). Raises _BrokerUnavailable when no
+    protocol is admissible (fail closed; nothing is dialled).
     """
     if provider not in ("claude", "codex"):
         raise ValueError("unsupported research provider")
@@ -1259,31 +1463,56 @@ def _dial_agent(
         prompt=prompt,
     )
 
-    secrets = _secrets()
+    # §12.4: pick the protocol from deploy state BEFORE touching any secret,
+    # so a fail-closed dial has read no key from anywhere.
+    mode, reason, era = _egress_mode()
+    legacy_keys: dict[str, str] = {}
+    if mode == "legacy":
+        legacy_keys = _legacy_keys()
+        if not any(legacy_keys.values()):
+            mode, reason = "closed", "legacy-no-keys"
+    _LOG.info("egress dial id=%s mode=%s reason=%s era=%s", report_id, mode, reason, era)
+    if mode == "closed":
+        raise _BrokerUnavailable(reason)
+    prompt_urls: list[str] = []
+    if mode == "broker":
+        from scraper import urlpolicy  # the broker's own extractor; never the template
+        prompt_urls = urlpolicy.extract_prompt_urls(prompt)
 
-    # Eleven null-terminated fields. Mirrors the docker-era contract but
-    # carries the prompt body as the last field — eliminates the
-    # separate docker-cp step. Order MUST match the reader in
-    # `_GUEST_SCRIPT` exactly (claude, codex auth, exa, tavily, euipo-id,
-    # euipo-secret, ebay-id, ebay-secret, tradera-id, tradera-key, prompt). Missing secrets are sent as empty strings
-    # so the wire format stays stable; downstream shims fail cleanly
-    # on auth rather than the protocol desynchronising.
-    stdin_payload = "".join(
-        s + "\0"
-        for s in (
-            secrets.get("claude-token", "") if provider == "claude" else "",
-            secrets.get("codex-auth-json", "") if provider == "codex" else "",
-            secrets.get("exa-api-key", ""),
-            secrets.get("tavily-api-key", ""),
-            secrets.get("euipo-client-id", ""),
-            secrets.get("euipo-client-secret", ""),
-            secrets.get("ebay-client-id", ""),
-            secrets.get("ebay-client-secret", ""),
-            secrets.get("tradera-app-id", ""),
-            secrets.get("tradera-app-key", ""),
-            full_prompt,
-        )
-    )
+    creds: dict[str, str] = {}
+
+    def provider_creds() -> dict[str, str]:
+        # Provider auth only (not a third-party key); re-read per dial so
+        # token refreshes propagate, as `_secrets()` did.
+        if not creds:
+            creds["claude"] = (
+                (_resolve_secret("claude-token") or "") if provider == "claude" else "")
+            creds["codex"] = (
+                (_load_codex_auth_json() or "") if provider == "codex" else "")
+        return creds
+
+    def stdin_payload_for(token: str) -> str:
+        c = provider_creds()
+        if mode == "broker":
+            # Version field, then claude token, codex auth, run token, prompt.
+            # Order MUST match `_GUEST_SCRIPT_BROKER`.
+            fields: tuple[str, ...] = (
+                _GUEST_PROTOCOL_BROKER, c["claude"], c["codex"], token, full_prompt)
+        else:
+            # Eleven null-terminated fields, today's legacy contract. Order
+            # MUST match `_GUEST_SCRIPT_LEGACY` exactly (claude, codex auth,
+            # exa, tavily, euipo-id, euipo-secret, ebay-id, ebay-secret,
+            # tradera-id, tradera-key, prompt). Missing keys are sent as empty
+            # strings so the wire format stays stable; downstream shims fail
+            # cleanly on auth rather than the protocol desynchronising.
+            fields = (
+                c["claude"], c["codex"],
+                *(legacy_keys[name] for name in _LEGACY_KEY_ENV),
+                full_prompt,
+            )
+        return "".join(s + "\0" for s in fields)
+
+    guest_script = _GUEST_SCRIPT_BROKER if mode == "broker" else _GUEST_SCRIPT_LEGACY
 
     ssh = _ssh_settings()
     Path(ssh["known_hosts"]).parent.mkdir(parents=True, exist_ok=True)
@@ -1314,7 +1543,7 @@ def _dial_agent(
     remote_cmd = " ".join(
         [
             *env_assignments,
-            "bash", "-c", shlex.quote(_GUEST_SCRIPT),
+            "bash", "-c", shlex.quote(guest_script),
             "bash", shlex.quote(report_id),
         ]
     )
@@ -1363,6 +1592,11 @@ def _dial_agent(
     # the VM died mid-run (its scratch report is gone) — both mean re-running
     # the agent is correct, not double work. Non-255 rc is returned as-is.
     for attempt in range(_SSH_RETRIES + 1):
+        # Broker mode registers per ssh ATTEMPT (§2.4): each attempt is a new
+        # agent process with a fresh token and ledger, and is deregistered in
+        # its own finally. A failed registration raises _BrokerUnavailable.
+        token = (_broker_register(report_id, depth, provider, prompt_urls)
+                 if mode == "broker" else "")
         t0 = time.monotonic()
         try:
             # Heartbeat ONLY around the live ssh call: while the agent is
@@ -1372,7 +1606,7 @@ def _dial_agent(
             with _activity_heartbeat():
                 result = subprocess.run(
                     ssh_cmd,
-                    input=stdin_payload,
+                    input=stdin_payload_for(token),
                     capture_output=True,
                     text=True,
                     timeout=AGENT_TIMEOUT,
@@ -1383,6 +1617,9 @@ def _dial_agent(
                 report_id, int((time.monotonic() - t0) * 1000), AGENT_TIMEOUT,
             )
             raise
+        finally:
+            if mode == "broker":
+                _broker_deregister(report_id)
         _LOG.info(
             "agent return id=%s rc=%d wall_ms=%d out_bytes=%d err_bytes=%d attempt=%d",
             report_id, result.returncode, int((time.monotonic() - t0) * 1000),
@@ -1949,6 +2186,11 @@ def research(
                 "error": "research backend busy — another research call is "
                 "using the agent VM; retry shortly.",
             }
+        except _BrokerUnavailable as e:
+            # Fail closed (§12.4): no protocol was admissible, nothing shipped.
+            _LOG.error("research broker-unavailable id=%s reason=%s", report_id, e)
+            report_path.unlink(missing_ok=True)
+            return {"status": "error", "error": "research-broker unavailable"}
         except subprocess.TimeoutExpired:
             _LOG.warning("research timeout id=%s", report_id)
             report_path.unlink(missing_ok=True)
