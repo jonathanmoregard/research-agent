@@ -52,6 +52,9 @@ class FakeScraper(http.server.ThreadingHTTPServer):
     def __init__(self):
         self.requests: list[tuple[str, dict]] = []
         self.replies: dict[str, tuple[int, dict]] = {}
+        # path key -> seconds to stall before replying. Empty by default, so a
+        # test that does not ask for a delay behaves exactly as before.
+        self.delays: dict[str, float] = {}
         stub = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -62,6 +65,8 @@ class FakeScraper(http.server.ThreadingHTTPServer):
                 key = self.path
                 if key.startswith("/session/") and key != "/session/open":
                     key = "/session/" + key.rsplit("/", 1)[-1]
+                if key in stub.delays:
+                    time.sleep(stub.delays[key])
                 status, reply = stub.replies.get(key, (200, {"status": "ok"}))
                 data = json.dumps(reply).encode()
                 self.send_response(status)
@@ -389,6 +394,49 @@ def test_render_feeds_final_url_links_and_text_not_requested_url(env):
               "https://text.example/2", "https://start.example/rel/x"):
         assert run.check(u).allowed, u
     assert not run.check("https://requested.example/?k=1").allowed
+
+
+def test_a_hung_session_close_cannot_block_the_registry_save(env):
+    """A sweep stuck closing sessions must not be able to delay `save_state()`.
+
+    `sweep()` deregisters every expired run, and each deregister closes that
+    run's scraper sessions at up to `SCRAPER_TIMEOUT_S["close"]` = 135 s apiece
+    against a hung scraper. §12.2's drain contract is to persist the registry at
+    ONCE on a signal, so a sweep in flight must not hold that write up — which is
+    only true because `Registry` and `Run` carry their own locks and the sweep
+    runs on its own thread (`broker/server.py` `_sweep_loop`). That assumption is
+    load-bearing: if it were false, moving the sweep off the signal loop would
+    have been worse than leaving it there.
+
+    What this does NOT cover, deliberately stated: signal latency end to end.
+    That needs the subprocess harness in `test_broker_lifecycle.py` plus a sweep
+    cadence shorter than `SWEEP_INTERVAL_S`, and `broker/config.py` exposes no
+    env overrides at all — adding one only so a test could run faster would be a
+    seam this config does not otherwise have.
+    """
+    tok = env.register(RUN_A, prompt_urls=["https://x.example/"])
+    sid = "ab" * 8
+    env.scraper.replies["/session/open"] = (200, {"status": "ok", "session_id": sid,
+                                                  "final_url": "https://x.example/",
+                                                  "snapshot": "", "links": []})
+    assert env.vm(tok, "/v1/scraper/session/open", {"url": "https://x.example/"})[0] == 200
+    # The close now stalls far longer than the save may take.
+    env.scraper.delays["/session/close"] = 5.0
+    run = env.app.registry.lookup(tok)
+    run.expires = time.time() - 1
+
+    sweeper = threading.Thread(target=env.app.sweep, daemon=True)
+    sweeper.start()
+    deadline = time.monotonic() + 5.0
+    while not any(p.endswith("/close") for p, _b, _a in env.scraper.requests):
+        assert time.monotonic() < deadline, "the hung close never started"
+        time.sleep(0.01)
+
+    started = time.monotonic()
+    env.app.save_state()
+    elapsed = time.monotonic() - started
+    assert elapsed < 2.0, f"save_state waited {elapsed:.1f}s on a hung close"
+    assert (env.tmp / "runs.json").exists()
 
 
 def test_fragment_is_not_forwarded_to_the_scraper(env):
