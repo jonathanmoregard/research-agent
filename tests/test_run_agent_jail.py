@@ -71,8 +71,11 @@ while i < len(argv):
     i += 1
 canaries = json.loads(os.environ["CANARY_JSON"])
 # The environment bwrap hands the jailed command: its own environ (bwrap
-# keeps it unless --clearenv) with the env flags applied in order.
-jail_env = dict(os.environ)
+# keeps it unless --clearenv) with the env flags applied in order. Read the
+# environ as exec'd: CPython adds LC_CTYPE (PEP 538) and may add
+# LD_LIBRARY_PATH to os.environ after start, which a real bwrap never sees.
+jail_env = dict(kv.split("=", 1) for kv in
+                open("/proc/self/environ").read().split("\0") if "=" in kv)
 j = 0
 while j < len(argv) and argv[j] != "--":
     a = argv[j]
@@ -133,8 +136,12 @@ def jail(tmp_path):
         f'exec {real_cp} "${{args[@]}}"\n'
     )
     cp.chmod(0o755)
+    # The guest log. Faked so a test never writes to this host's journal.
+    logger = bin_dir / "logger"
+    logger.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{tmp_path / "guest.log"}"\n')
+    logger.chmod(0o755)
 
-    def run(provider="claude", rc=0, drop=()):
+    def run(provider="claude", rc=0, drop=(), extra=None):
         log = tmp_path / "bwrap.json"
         env = {
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
@@ -152,6 +159,7 @@ def jail(tmp_path):
             "CODEX_AUTH_JSON": PROVIDER_CANARIES["CODEX_AUTH_JSON"],
             **CANARIES,
         }
+        env.update(extra or {})
         for name in drop:
             del env[name]
         p = subprocess.run(["bash", str(RUN_AGENT), UUID, str(prompt)],
@@ -240,3 +248,72 @@ def test_optional_keys_default_to_empty_in_jail_env(jail):
     p, rec, _ = jail(drop=("EUIPO_CLIENT_SECRET",))
     assert p.returncode == 0, p.stderr
     assert rec["jail_env"].get("EUIPO_CLIENT_SECRET") == ""
+
+
+# --- §12.4 protocol dispatch -------------------------------------------------
+#
+# The new guest script exports RESEARCH_GUEST_PROTOCOL=broker-v1 and the run
+# token, and no third-party key. An OLD server.py's inline script exports the
+# keys and no version: that must keep today's jail exactly.
+
+BROKER_TOKEN = "CANARY-BROKER-TOKEN"
+BROKER = {"RESEARCH_GUEST_PROTOCOL": "broker-v1", "RESEARCH_BROKER_TOKEN": BROKER_TOKEN}
+# §8.1: the exact names a broker-mode jail may carry.
+ALLOWED = {"HOME", "PATH", "LANG", "RESEARCH_SCRATCH_PATH", "RESEARCH_RUN_ID",
+           "RESEARCH_BROKER_URL", "RESEARCH_BROKER_TOKEN",
+           "CLAUDE_STREAM_IDLE_TIMEOUT_MS", "PRV_CACHE_DIR", "BOLAGSVERKET_CACHE_DIR"}
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_broker_jail_env_is_exactly_the_allowlist(jail, provider):
+    """Keys exported anywhere upstream (here: all 8, as if a stale wrapper
+    still set them) must not reach a broker-mode jail."""
+    p, rec, _ = jail(provider=provider, extra=BROKER)
+    assert p.returncode == 0, p.stderr
+    env = rec["jail_env"]
+    allowed = ALLOWED | ({"CLAUDE_CODE_OAUTH_TOKEN"} if provider == "claude" else {"CODEX_HOME"})
+    assert set(env) <= allowed, f"not on the allowlist: {sorted(set(env) - allowed)}"
+    assert env["RESEARCH_BROKER_TOKEN"] == BROKER_TOKEN
+    assert env["RESEARCH_BROKER_URL"] == "http://10.0.2.2:8124"
+    assert not set(CANARIES) & set(env)
+    if provider == "claude":
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "CANARY-CLAUDE-TOKEN"
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_broker_jail_keeps_secrets_out_of_argv(jail, provider):
+    p, rec, _ = jail(provider=provider, extra=BROKER)
+    assert p.returncode == 0, p.stderr
+    values = [BROKER_TOKEN, "CANARY-CLAUDE-TOKEN", "CANARY-CODEX-AUTH", *CANARIES.values()]
+    leaked = sorted({v for v in values for a in rec["argv"] if v in a})
+    assert leaked == [], f"credential values in bwrap argv: {leaked}"
+
+
+def test_broker_protocol_without_token_exits_11(jail):
+    p, rec, _ = jail(extra={"RESEARCH_GUEST_PROTOCOL": "broker-v1"})
+    assert p.returncode == 11, p.stderr
+    assert rec is None, "the jail must not start"
+
+
+def test_legacy_jail_has_no_env_scrub(jail):
+    """No version field → today's jail: keys inherited, no env flags added."""
+    p, rec, _ = jail()
+    assert p.returncode == 0, p.stderr
+    pre = rec["argv"][:rec["argv"].index("--")]
+    assert "--unsetenv" not in pre and "--clearenv" not in pre
+    assert "RESEARCH_BROKER_URL" not in rec["jail_env"]
+
+
+@pytest.mark.parametrize("extra,line", [
+    ({}, "protocol=legacy fields=11 broker_token=absent"),
+    (BROKER, "protocol=broker-v1 fields=4 broker_token=present"),
+])
+def test_received_protocol_is_recorded_to_the_guest_log(jail, tmp_path, extra, line):
+    """The lane attributes legacy dials guest-side: an old server.py writes
+    no `mode=` line of its own (§12.5 T2, §12.6 G2)."""
+    p, _, _ = jail(extra=extra)
+    assert p.returncode == 0, p.stderr
+    log = (tmp_path / "guest.log").read_text()
+    assert line in log and UUID in log
+    assert line in p.stderr
+    assert BROKER_TOKEN not in log

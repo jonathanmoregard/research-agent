@@ -56,6 +56,34 @@ case "${PROVIDER}" in
   *) echo "run-agent: invalid RESEARCH_PROVIDER=${PROVIDER}" >&2; exit 7 ;;
 esac
 
+# Protocol dispatch (docs/egress-broker.md §12.4). The version field comes
+# first: the broker guest script exports RESEARCH_GUEST_PROTOCOL=broker-v1
+# after reading exactly 4 fields (claude token, codex auth, broker run token,
+# prompt). Anything else is the legacy 11-field protocol — an OLD server.py's
+# inline script exports the keys and no version — and gets today's jail
+# unchanged. The legacy branch is deleted in the cleanup PR, after which a
+# missing token is exit 11 unconditionally (§2.4).
+if [[ "${RESEARCH_GUEST_PROTOCOL:-}" == "broker-v1" ]]; then
+  GUEST_PROTOCOL="broker-v1"
+  PROTOCOL_FIELDS=4
+else
+  GUEST_PROTOCOL="legacy"
+  PROTOCOL_FIELDS=11
+fi
+BROKER_TOKEN_STATE="absent"
+[[ -n "${RESEARCH_BROKER_TOKEN:-}" ]] && BROKER_TOKEN_STATE="present"
+# Record what this run was handed, in the guest log. The host can attribute
+# a legacy dial only from here: pre-broker server.py logs no mode= line.
+PROTOCOL_LINE="run-agent: protocol=${GUEST_PROTOCOL} fields=${PROTOCOL_FIELDS} broker_token=${BROKER_TOKEN_STATE} run=${REPORT_UUID}"
+echo "${PROTOCOL_LINE}" >&2
+if command -v logger >/dev/null 2>&1; then
+  logger -t research-agent -- "${PROTOCOL_LINE}" || true
+fi
+if [[ "${GUEST_PROTOCOL}" == "broker-v1" && "${BROKER_TOKEN_STATE}" == "absent" ]]; then
+  echo "run-agent: broker-v1 without RESEARCH_BROKER_TOKEN" >&2
+  exit 11
+fi
+
 # Per-depth tool allowlist. The prompt tells the agent *how* to use these;
 # we restrict *which* are callable at all.
 EXA_TOOLS="mcp__exa__web_search_exa"
@@ -365,19 +393,48 @@ publish_report() {
 # the process. Keep every secret off the bwrap and systemd-run command
 # lines, here and in any future --setenv.
 #
-# `export` is a builtin, so no process ever carries these values in argv.
-# The two required keys abort the call under `set -u` when missing; the
-# optional ones default to "" so every shim sees the name defined.
-# CLAUDE_CODE_OAUTH_TOKEN rides the same inherited environment on the
-# claude path and was unset above on the codex path.
-export EXA_API_KEY="${EXA_API_KEY}" TAVILY_API_KEY="${TAVILY_API_KEY}"
-export EUIPO_CLIENT_ID="${EUIPO_CLIENT_ID:-}" EUIPO_CLIENT_SECRET="${EUIPO_CLIENT_SECRET:-}"
-export EBAY_CLIENT_ID="${EBAY_CLIENT_ID:-}" EBAY_CLIENT_SECRET="${EBAY_CLIENT_SECRET:-}"
-export TRADERA_APP_ID="${TRADERA_APP_ID:-}" TRADERA_APP_KEY="${TRADERA_APP_KEY:-}"
+#
+# broker-v1: the jail env is an explicit allowlist (§8.1). Every name this
+# shell exports that is not a kept secret gets `--unsetenv NAME` (a name, not
+# a value), and the non-secret allowlist entries are `--setenv`; the two
+# secrets — the run token and, on the claude path, CLAUDE_CODE_OAUTH_TOKEN —
+# are the only inherited values. This is `--clearenv` without putting either
+# secret on the command line: `--clearenv` would drop inherited values, so
+# the secrets would have to travel as `--setenv` argv. No third-party key
+# reaches a broker-mode jail even if one is exported upstream.
+ENV_ARGS=()
+if [[ "${GUEST_PROTOCOL}" == "broker-v1" ]]; then
+  unset EXA_API_KEY TAVILY_API_KEY EUIPO_CLIENT_ID EUIPO_CLIENT_SECRET \
+    EBAY_CLIENT_ID EBAY_CLIENT_SECRET TRADERA_APP_ID TRADERA_APP_KEY
+  KEEP_ENV=" RESEARCH_BROKER_TOKEN "
+  [[ "${PROVIDER}" == "claude" ]] && KEEP_ENV+="CLAUDE_CODE_OAUTH_TOKEN "
+  mapfile -t EXPORTED < <(compgen -e)
+  for name in "${EXPORTED[@]}"; do
+    [[ "${KEEP_ENV}" == *" ${name} "* ]] || ENV_ARGS+=(--unsetenv "${name}")
+  done
+  # `_` is set by bash for each exec'd child and is not in `compgen -e`.
+  ENV_ARGS+=(
+    --unsetenv _
+    --setenv LANG "${LANG:-C.UTF-8}"
+    --setenv RESEARCH_BROKER_URL "http://10.0.2.2:8124"
+  )
+else
+  # Legacy (today's jail, byte-for-byte).
+  # `export` is a builtin, so no process ever carries these values in argv.
+  # The two required keys abort the call under `set -u` when missing; the
+  # optional ones default to "" so every shim sees the name defined.
+  # CLAUDE_CODE_OAUTH_TOKEN rides the same inherited environment on the
+  # claude path and was unset above on the codex path.
+  export EXA_API_KEY="${EXA_API_KEY}" TAVILY_API_KEY="${TAVILY_API_KEY}"
+  export EUIPO_CLIENT_ID="${EUIPO_CLIENT_ID:-}" EUIPO_CLIENT_SECRET="${EUIPO_CLIENT_SECRET:-}"
+  export EBAY_CLIENT_ID="${EBAY_CLIENT_ID:-}" EBAY_CLIENT_SECRET="${EBAY_CLIENT_SECRET:-}"
+  export TRADERA_APP_ID="${TRADERA_APP_ID:-}" TRADERA_APP_KEY="${TRADERA_APP_KEY:-}"
+fi
 
 agent_rc=0
 "${MEMGUARD_ARGV[@]}" \
 bwrap \
+  "${ENV_ARGS[@]}" \
   --ro-bind /nix/store /nix/store \
   --ro-bind /run/current-system /run/current-system \
   --ro-bind /run/systemd/resolve /run/systemd/resolve \

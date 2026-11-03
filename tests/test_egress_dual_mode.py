@@ -383,3 +383,12 @@ def test_registration_gives_up_after_its_budget(dial, monkeypatch):
         server._broker_register(REPORT_ID, "normal", "claude", [])
     assert 0.4 < time.monotonic() - t0 < 3
 
+
+
+def test_checkout_ships_the_protocol_marker_server_reads():
+    """The marker must sit where `_egress_mode` looks, saying what the guest
+    side (this checkout's run-agent.sh) speaks. A rename on either side would
+    keep every dial in legacy mode without a sound."""
+    assert server._GUEST_PROTOCOL_PATH.read_text().strip() == server._GUEST_PROTOCOL_BROKER
+    run_agent = (server._GUEST_PROTOCOL_PATH.parent / "run-agent.sh").read_text()
+    assert f'"{server._GUEST_PROTOCOL_BROKER}"' in run_agent
