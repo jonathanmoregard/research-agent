@@ -909,8 +909,28 @@ paths. Add `broker/` to the bandit and semgrep paths in `.github/workflows/ci.ym
     CLIs need (for example TLS CA variables) to channel 1. The test parses the bwrap argv in
     `tests/test_run_agent_jail.py` and asserts: `--clearenv` present; the `--setenv` names equal
     channel 1 exactly; **no `--unsetenv` at all**; and no secret *value* appears anywhere in argv;
-  - `codex-config.toml` `env_vars` names no key;
+  - `codex-config.toml` `env_vars` names no key — **this describes the final state, and it lands
+    in PR 4, not PR 2.** In PR 2 each server's `env_vars` carries the broker names *and* the key
+    names: a legacy Codex dial still needs the keys declared there, while a broker-mode jail
+    passes nothing for them anyway because `--clearenv` leaves nothing to pass. Removing them in
+    PR 2 would break every legacy Codex run, which is the downtime the expand/contract split
+    exists to avoid. Same reasoning, and same destination, as the `_SECRET_ENV` trim (§12.1).
+    A "names no key" test therefore belongs in PR 4; in PR 2 it would fail by design;
   - `.mcp.json` has no `env`.
+  - **The `--clearenv` allowlist is not provable by any hermetic test, and must not be assumed.**
+    Before this branch, bwrap ran *without* `--clearenv` (`run-agent.sh:358`), so the Claude and
+    Codex CLIs inherited the caller's whole environment and whatever they rely on was never
+    enumerated. The research VM's guest config sets no cert or locale variables of its own
+    (`research-agent-microvm.nix` declares only packages), so the CLIs are living on NixOS
+    defaults reaching them implicitly — `SSL_CERT_FILE`, `NIX_SSL_CERT_FILE`, `LOCALE_ARCHIVE`
+    are the candidates. Under `--clearenv` they are gone, and a unit test with a fake bwrap
+    cannot notice, because nothing in it makes a TLS connection.
+
+    This is discharged by the switchover lane, not by inspection: §12.5's `upstream` node serves
+    HTTPS with a test CA and the fake agent drives the real shims from inside the real jail, so a
+    missing CA variable fails T0/T2 outright. Consequence for sequencing: the lane must be green
+    before the research-agent PR merges, which §12.6 step 0 already requires. Do not promote the
+    jail change on the strength of "NixOS has `/etc/ssl/certs`".
 - **Hermetic exfil integration test (CI):**
   - start the broker in-process with a fake scraper (a local HTTP stub recording every request)
     and a fake upstream;
@@ -1150,19 +1170,33 @@ when the pull later creates the file. Add to nixos-A:
      research-broker.service`. The service stop drains under the same `TimeoutStopSec=210`.
   3. If `broker/server.py` exists and the sockets are inactive, run
      `systemctl start research-broker.socket research-broker-admin.socket`.
-  4. If `research-broker.service` is active and the code digest of the checkout differs from the
-     digest the broker reports at `GET /admin/health` (`{"code": "<sha256>"}`), run
-     `systemctl reload research-broker`.
+  4. If `research-broker.service` is active, run `systemctl reload research-broker`
+     **unconditionally**. The oneshot does not compute or compare any code digest.
 
-     **One implementation of that digest, not two.** The oneshot must **not** reimplement the hash
-     in shell: it invokes the repo's own `python3 -m broker.digest`, the same code path the broker
-     uses to answer `/admin/health`. A shell reimplementation is a cross-repo coupling that
-     silently rots — nixos-config and research-agent version independently, so the day the two
-     disagree the broker either reloads on every pull or never reloads again, and both failures
-     are quiet. The digest covers `broker/*.py` plus `scraper/urlpolicy.py`, hashed over paths
-     **relative to the checkout root** so it does not change with the mount point (the broker sees
-     the code at `/run/rb`, the oneshot sees it at `/home/jonathan/Repos/research-agent`). The
-     algorithm is documented in `broker.digest`'s docstring, which is the single source of truth.
+     **The service that owns the code does the comparison; root only acts on the answer.** On
+     `SIGHUP` the broker recomputes its own digest (`broker/digest.py`, covering `broker/*.py`
+     plus `scraper/urlpolicy.py`, hashed over paths **relative to the checkout root** so the value
+     does not change with the mount point — the broker sees the code at `/run/rb`). If the digest
+     is unchanged it treats the reload as a **no-op and keeps serving**: no drain, no re-exec. A
+     spurious path event therefore costs nothing.
+
+     Two designs were rejected on the way here, for different reasons:
+
+     - *The oneshot reimplements the hash in shell.* Two implementations of one contract across
+       two independently-versioned repos. Systematic drift is not cosmetic: it reloads the broker
+       (a ≤210 s drain) on every path event, rolls the scraper VM on every trigger, and destroys
+       the "has the code actually changed?" signal the unit exists to compute. And the inverse is
+       silent — the day the two agree when they shouldn't, the broker serves stale code
+       indefinitely, which is exactly the failure §2.2 says this design replaced. A test pinning
+       the shell script against a Python reference *in nixos-config* does not cover it: it checks
+       the script against a reference the broker does not use.
+     - *The oneshot invokes the repo's own `python3 -m broker.digest`.* One implementation, but
+       the oneshot runs as **root** and the checkout is updated by an unattended `git pull` every
+       30 minutes (§12.0). That turns repo content into root code execution — a worse trade than
+       the problem it solves, in a design whose whole purpose is to shrink what the research path
+       can reach.
+
+     Self-check has neither property: one implementation, and root never executes repo code.
 
   This also catches a missed inotify event on the next change.
 
@@ -1246,8 +1280,11 @@ Triggers:
 Algorithm:
 
 1. **Need check.** Research VM: `readlink current != readlink booted`, otherwise exit 0. Scraper
-   code trigger: the tree hash of `scraper/` differs from the hash `scraper-http` reports on
-   `GET /health` (new field; old scraper code reports none, which counts as "differs").
+   code trigger: `GET /health` reports `stale: true`. The scraper has the checkout on its share,
+   so it compares the digest it loaded against the digest on disk itself and publishes both plus
+   the boolean; the roll only reads the answer. Old scraper code reports no such field, which
+   counts as stale. Same rule as §12.2 step 4 and for the same two reasons — one implementation of
+   the digest, and no hashing in a root-run shell script.
 2. **Take every slot, holding what you win. Never interrupt a run.** Walk
    `agent.lock.0 … agent.lock.$((SLOTS-1))` and take each with a **blocking** `flock` (per-slot
    timeout; whole-step bound 24 h). **Keep every slot already acquired while waiting for the
