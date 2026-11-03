@@ -387,7 +387,13 @@ class BrowserWorker(threading.Thread):
                 raise RuntimeError(
                     "unknown or expired session — call browse_open again"
                 )
-            if cmd.get("run_id") != s.run_id:
+            # A bound session serves only the run that opened it, and
+            # refuses an unnamed caller too. An unbound session (legacy
+            # :8123 path only, until PR 4 — see server._do_session_open) has
+            # no run to check against, which is main's behaviour: any holder
+            # of the scraper bearer and the 64-bit session id could already
+            # drive it today. Bound sessions are the ones this gate protects.
+            if s.run_id and (cmd.get("run_id") or "") != s.run_id:
                 raise SessionForbidden("session belongs to another run")
             s.last_used = time.monotonic()
             if op == "act":
@@ -397,8 +403,14 @@ class BrowserWorker(threading.Thread):
             if op == "save_artifact":
                 data, mime = self._shoot(s.page, full_page=False,
                                          cap=MAX_ARTIFACT_BYTES, artifact=True)
-                # The session's own run, whatever the request named.
-                fname = self.artifacts.add(s.run_id, cmd["name"], data, mime)
+                # A bound session's artifacts go to its own run, whatever
+                # the request named. An unbound session has no run of its
+                # own, so the request's run names the bucket — main's
+                # behaviour; the HTTP layer requires one on this op.
+                bucket = s.run_id or (cmd.get("run_id") or "")
+                if not bucket:
+                    raise RuntimeError("save_artifact needs a run_id")
+                fname = self.artifacts.add(bucket, cmd["name"], data, mime)
                 return {"stored": True, "name": fname}
             if op == "close":
                 self._close(sid)

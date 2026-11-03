@@ -359,6 +359,54 @@ def test_session_ops_refuse_another_run():
         w.shutdown()
 
 
+def test_unbound_session_serves_a_caller_that_names_no_run():
+    """A legacy-path session opened with no run (§12.4): main's semantics,
+    no run check. This is what keeps an in-flight legacy browse alive across
+    the scraper roll, and PR 4 deletes it with the :8123 route."""
+    w = _worker()
+    try:
+        sid = w.submit({"op": "open", "url": "https://x.test/"})["session_id"]
+        for op in ("act", "screenshot", "close"):
+            w.submit({"op": op, "session_id": sid, "actions": []})
+    finally:
+        w.shutdown()
+
+
+def test_bound_session_refuses_a_caller_that_names_no_run():
+    """The flip side, and the security half: tolerating unbound sessions must
+    not let an unnamed caller drive a BOUND (broker) session."""
+    w = _worker()
+    try:
+        sid = w.submit({"op": "open", "url": "https://x.test/", "run_id": RUN})["session_id"]
+        for op in ("act", "screenshot", "save_artifact", "close"):
+            try:
+                w.submit({"op": op, "session_id": sid, "actions": [], "name": "n"})
+                _assert(False, f"{op} accepted a caller naming no run")
+            except RuntimeError as e:
+                _assert(str(e).startswith("SessionForbidden"), f"{op}: wrong error {e}")
+        w.submit({"op": "close", "session_id": sid, "run_id": RUN})
+    finally:
+        w.shutdown()
+
+
+def test_unbound_session_artifact_is_bucketed_under_the_request_run():
+    """An unbound session has no run of its own, so the request names the
+    bucket — otherwise a legacy save_screenshot would store under "" and the
+    /artifacts/<32 hex> pull could never reach it (silent artifact loss at
+    the roll, which a 200 would hide)."""
+    store = ArtifactStore()
+    w = BrowserWorker(browser_factory=_fake_factory, idle_ttl_s=9999, artifacts=store)
+    w.start()
+    try:
+        sid = w.submit({"op": "open", "url": "https://x.test/"})["session_id"]
+        w.submit({"op": "save_artifact", "session_id": sid,
+                  "run_id": OTHER_RUN, "name": "shot"})
+        _assert(len(store.take(OTHER_RUN)) == 1,
+                "legacy artifact not stored under the requesting run")
+    finally:
+        w.shutdown()
+
+
 def test_save_artifact_keys_by_session_run():
     store = ArtifactStore()
     w = BrowserWorker(browser_factory=_fake_factory, idle_ttl_s=9999, artifacts=store)

@@ -171,9 +171,29 @@ def test_open_preset_viewport_kept():
     _assert(_fake.cmds[-1]["viewport"] == {"width": 390, "height": 844}, f"{_fake.cmds[-1]}")
 
 
-def test_open_requires_run_id_and_forwards_policy():
+def test_open_without_run_id_opens_an_unbound_session():
+    """The switchover property (§12.4): the shims of an older deployed commit
+    send no run_id, and a run that started before the scraper roll keeps them
+    for life. 400-ing them here would break every in-flight legacy browse at
+    the roll. Such a session is unbound — the worker gets run_id "".
+    """
+    _fake.cmds.clear()
     code, body = _post("/session/open", {"url": "https://example.com/"})
-    _assert(code == 400 and "run_id" in body.get("error", ""), f"{code}: {body}")
+    _assert(code == 200, f"legacy open without run_id rejected: {code}: {body}")
+    _assert(_fake.cmds[-1]["run_id"] == "",
+            f"unbound session not forwarded as run_id '': {_fake.cmds[-1]}")
+
+
+def test_open_with_malformed_run_id_is_still_400():
+    """Optional is not "unvalidated": a present-but-wrong run_id still 400s,
+    so a typo cannot silently open an unbound session."""
+    for bad in ("short", "A" * 32, 123, ""):
+        code, body = _post("/session/open", {"url": "https://example.com/", "run_id": bad})
+        _assert(code == 400 and "run_id" in body.get("error", ""),
+                f"run_id={bad!r} accepted: {code}: {body}")
+
+
+def test_open_forwards_run_id_and_policy():
     _fake.cmds.clear()
     policy = {"urls": ["https://seen.test/"], "templates": True}
     code, body = _post("/session/open", {"url": "https://example.com/", "run_id": RUN,
@@ -187,8 +207,21 @@ def test_session_ops_forward_run_id_and_map_forbidden_to_403():
     sid = "ab12" * 4
     for op, body in (("act", {"actions": []}), ("screenshot", {}), ("close", {}),
                      ("save_artifact", {"name": "shot"})):
+        # Omitting it is allowed on every op but save_artifact, which needs a
+        # run to bucket the artifact under (and /artifacts/<32 hex> cannot
+        # express ""). Omission reaches the worker as "", where only an
+        # unbound session accepts it.
         code, out = _post(f"/session/{sid}/{op}", body)
-        _assert(code == 400 and "run_id" in out.get("error", ""), f"{op}: {code} {out}")
+        if op == "save_artifact":
+            _assert(code == 400 and "run_id" in out.get("error", ""),
+                    f"{op} without run_id should 400: {code} {out}")
+        else:
+            _assert(code == 200 and _fake.cmds[-1]["run_id"] == "",
+                    f"{op} without run_id should reach the worker as '': {code} {out}")
+        # Present but malformed still 400s on every op.
+        code, out = _post(f"/session/{sid}/{op}", dict(body, run_id="short"))
+        _assert(code == 400 and "run_id" in out.get("error", ""),
+                f"{op} with malformed run_id accepted: {code} {out}")
         _fake.cmds.clear()
         code, out = _post(f"/session/{sid}/{op}", dict(body, run_id=RUN))
         _assert(code == 200 and _fake.cmds[-1]["run_id"] == RUN, f"{op}: {code} {out}")

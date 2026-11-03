@@ -672,8 +672,22 @@ class Handler(BaseHTTPRequestHandler):
         if host_err is not None:
             self._json(400, {"status": "error", "error": host_err})
             return
+        # Naming the run is OPTIONAL here until PR 4 removes the legacy
+        # :8123 route. That is main's behaviour, and it is load-bearing for
+        # the switchover: a run that started before the scraper roll keeps
+        # its own (older) shims for its whole life (§12.4), and those shims
+        # send no run_id. Requiring one would 400 every in-flight legacy
+        # browse the moment the scraper rolls — downtime the switchover
+        # forbids. A session opened without a run is UNBOUND: no run owns
+        # it, so the worker applies no run check (again, main's behaviour).
+        # Broker calls always name the run — scraper_proxy fills it from the
+        # token, never the body — so every broker session is bound, and
+        # under `contract` there is no :8123 route, so no unbound session
+        # can be created at all.
         run_id = req.get("run_id")
-        if not validate_run_id(run_id):
+        if run_id is None:
+            run_id = ""
+        elif not validate_run_id(run_id):
             self._json(400, {"status": "error", "error": "bad run_id"})
             return
         try:
@@ -698,10 +712,15 @@ class Handler(BaseHTTPRequestHandler):
         if err is not None or req is None:
             self._json(400, {"status": "error", "error": err or "bad json"})
             return
-        # Every session op names the run that opened the session; the
-        # worker refuses any other run with 403.
+        # A bound session's ops must name the run that opened it — the
+        # worker refuses any other run with 403, and refuses an unnamed
+        # caller too. Naming it is optional only because an unbound session
+        # has no run to match (see _do_session_open); save_artifact below
+        # needs one regardless.
         run_id = req.get("run_id")
-        if not validate_run_id(run_id):
+        if run_id is None:
+            run_id = ""
+        elif not validate_run_id(run_id):
             self._json(400, {"status": "error", "error": "bad run_id"})
             return
         if op == "act":
@@ -737,6 +756,13 @@ class Handler(BaseHTTPRequestHandler):
                           "run_id": run_id})
             return
         if op == "save_artifact":
+            # The one session op that needs the run named even on the legacy
+            # path: the artifact store is keyed by run and the pull route is
+            # /artifacts/<32 hex>, which cannot express "". main required it
+            # here too, and the legacy shims do send it on this call.
+            if not validate_run_id(run_id):
+                self._json(400, {"status": "error", "error": "bad run_id"})
+                return
             name = req.get("name")
             if not validate_artifact_name(name):
                 self._json(400, {"status": "error", "error": "bad artifact name"})

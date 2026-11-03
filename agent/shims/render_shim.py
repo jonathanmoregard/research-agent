@@ -424,12 +424,15 @@ def _post_scraper(endpoint_url: str, payload: dict, timeout_ms: int,
 
 
 # The scraper's session routes bind every op to the run that opened the
-# session and reject a request without one (`bad run_id`): /session/open in
-# `_do_session_open`, the rest in `_do_session_op` via `_SESSION_PATH`. On the
-# broker path the broker derives the run from the token, so the shim must NOT
-# send one; on the legacy path there is no token, so the shim is the only
-# thing that can. Kept as one set here rather than at each call site so a
-# sixth session route cannot be added without a run_id.
+# session: /session/open in `_do_session_open`, the rest in `_do_session_op`
+# via `_SESSION_PATH`. On the broker path the broker derives the run from the
+# token, so the shim must NOT send one; on the legacy path there is no token,
+# so the shim is the only thing that can. The scraper TOLERATES a legacy
+# session call with no run_id (an unbound session — the shims of an older
+# deployed commit send none, and 400-ing them at the scraper roll would be
+# downtime), so sending it here is not about avoiding a 400: it is what gets
+# a legacy-path session bound at all. Kept as one set rather than at each
+# call site so a sixth session route cannot be added without a run_id.
 # `tests/test_render_shim_browse.py` pins this against the scraper's own regex.
 _SESSION_ROUTES = frozenset({"open", "act", "screenshot", "save_artifact", "close"})
 
