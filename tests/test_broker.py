@@ -391,6 +391,29 @@ def test_render_feeds_final_url_links_and_text_not_requested_url(env):
     assert not run.check("https://requested.example/?k=1").allowed
 
 
+def test_fragment_is_not_forwarded_to_the_scraper(env):
+    """A ledgered URL must not carry a model-written fragment into chromium.
+
+    `normalize()` drops `#…` when keying the ledger, so `https://x.example/#<data>`
+    passes `check()` on the strength of `https://x.example/` being ledgered. Forwarding
+    the raw URL would make the fragment an unbudgeted exfil channel: browsers do not
+    send it to the server, but the page's own JS reads `location.hash`, and a
+    subresource beacon carries it out — netguard leaves subresources ungated by design
+    (scraper/netguard.py docstring), so nothing downstream catches it. The typed-text
+    rule bounds `fill` text, not URLs, so the fragment is unbudgeted too.
+    """
+    tok = env.register(prompt_urls=["https://x.example/"])
+    env.scraper.replies["/render"] = _page("https://x.example/")
+    env.scraper.requests.clear()
+    payload = "A" * 2000
+    status, _reply = env.vm(tok, "/v1/scraper/render",
+                            {"url": f"https://x.example/#{payload}"})
+    assert status == 200
+    _path, body, _auth = env.scraper.requests[-1]
+    assert "#" not in body["url"], f"fragment forwarded: {body['url'][:60]}…"
+    assert payload not in body["url"]
+
+
 def test_clas_ohlson_json_render_ledgers_the_joined_item_url(env):
     search_url = "https://www.clasohlson.com/se/search/getSearchResults?text=vattenkokare"
     tok = env.register()

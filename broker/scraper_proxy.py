@@ -89,7 +89,20 @@ def _gate(run: Run, url, tool: str) -> str:
         shown = (verdict.url or url)[:200]
         raise RouteError(403, f"{tool} refused by the provenance gate: {verdict.reason}\n"
                               f"URL: {shown}", verdict.code or "refused")
-    return url
+    # Forward exactly what was checked, never the caller's raw string. check()
+    # decides on normalize(url), which drops the fragment (§3.1) — so returning the
+    # raw URL would let `https://<ledgered>/#<data>` ride a ledgered entry into
+    # chromium with arbitrary model-written bytes attached. Browsers never send a
+    # fragment to the server, but the page's own JS reads location.hash and a
+    # subresource beacon carries it out, and subresources are ungated by design
+    # (scraper/netguard.py). The typed-text rule bounds fill text, not URLs, so
+    # those bytes would also be unbudgeted. Every allowed branch of check() sets
+    # verdict.url to the normalized form; if one ever does not, fail closed rather
+    # than fall back to the attacker-influenceable input.
+    if not verdict.url:
+        raise RouteError(500, f"{tool}: the gate allowed a URL with no canonical form",
+                         "gate_error")
+    return verdict.url
 
 
 def _timeout(req: dict, default: int = 30000) -> int:

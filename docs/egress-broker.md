@@ -1521,11 +1521,26 @@ would have come back "verified" without having been tested. Run T1 before trusti
   must refuse it. One bit cannot carry both. An explicit value separates them, and an unrecognised
   value fails closed rather than guessing.
 
-  **The era file is the control; keylessness is the backstop.** The design does not rest on one
-  file: from nixos-B the keys are not in the wrapper's env *and* not in the keyring, so even a
-  tampered or stale era file has nothing to ship. Conversely the era file holds even while keys are
-  still present (S1-S3). Either mechanism alone would have a gap; together they overlap across
-  every state.
+  **The era file is the control; keylessness is a PARTIAL backstop — seven keys of eight.** The
+  intent was that the design not rest on one file: from nixos-B the keys are in neither the
+  wrapper's env nor the keyring, so even a tampered or stale era file would have nothing to ship.
+  That holds for seven of the eight. It does **not** hold for Exa: §5.3 item 3 deliberately keeps
+  `EXA_API_KEY` exported after nixos-B, because the MCP keeps the `_direct_exa` fast path and
+  item 2 leaves `exa-api-key` jonathan-owned for it.
+
+  `_legacy_keys()` admits the legacy protocol when **any** of the eight is non-empty
+  (`mcp_server/server.py:1533-1535`: `if not any(legacy_keys.values())` → `legacy-no-keys`), so
+  while that one export exists the keyless check never fires. An era file tampered or rolled back
+  to `legacy-ok` after nixos-B would therefore ship a live Exa key into the guest. For Exa the era
+  file is the **sole** control; for the other seven the two mechanisms overlap as described.
+
+  That is accepted rather than fixed, for a reason worth stating: `_egress_mode()` cannot return
+  `legacy` while the era file reads `broker-only`, so reaching this at all takes a write to a
+  root-owned file under `/etc`. Anyone who can do that has better options. The claim of overlap is
+  what was wrong, not the mechanism — and PR 4 is where to revisit it, by dropping the
+  `_direct_exa` fast path so `EXA_API_KEY` leaves the wrapper env too, at the cost of routing Exa
+  through the broker like everything else. Do not restore the "nothing to ship" wording without
+  doing that first.
 
 - **The legacy branch reads keys from `os.environ` only — never `_keyring_lookup`.**
   `mcp_server/server.py:440-457` resolves every secret env → (`claude-token`: credentials.json) →

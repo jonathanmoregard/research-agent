@@ -494,6 +494,31 @@ def _dev_sockets() -> dict[str, socket.socket]:
     return {config.FD_NAME_VM: vm, config.FD_NAME_ADMIN: admin}
 
 
+def _sweep_loop(app: Broker) -> None:
+    """TTL sweeps, deliberately OFF the loop that reads the signal fd.
+
+    A sweep deregisters every expired run, and each deregister closes that run's
+    scraper sessions (`deregister` -> `close_all`) at up to
+    `SCRAPER_TIMEOUT_S["close"]` = 135 s apiece against a hung scraper. Running that
+    inline on the signal loop meant a SIGTERM arriving mid-sweep was not even READ
+    for minutes: two stuck closes already exceed `TimeoutStopSec=210`, so the drain's
+    "persist at once" (§12.2) never ran and systemd SIGKILLed the broker with no
+    handover file — losing the registry the switchover window depends on. This is the
+    same latency the wakeup fd above was introduced to kill; the sweep was a second
+    door into it.
+
+    `Registry` and every `Run` carry their own locks, and the admin routes already
+    call `deregister` from the request threads, so moving the sweep here introduces
+    no concurrency that did not already exist.
+    """
+    while True:
+        time.sleep(config.SWEEP_INTERVAL_S)
+        try:
+            app.sweep()
+        except Exception as e:  # never let the sweeper kill the broker
+            log(f"sweep failed: {type(e).__name__}")
+
+
 def serve(app: Broker, socks: dict[str, socket.socket]) -> int:
     # Signals reach the main loop through a wakeup fd: CPython's C handler
     # writes the signal number there from whichever thread the kernel chose.
@@ -513,13 +538,13 @@ def serve(app: Broker, socks: dict[str, socket.socket]) -> int:
                                 daemon=True) for s in servers]
     for t in threads:
         t.start()
+    threading.Thread(target=_sweep_loop, args=(app,), daemon=True).start()
 
     while True:
+        # Nothing but signals here. The timeout only bounds how long select blocks;
+        # a wake with no signal pending just loops (see _sweep_loop for why no work
+        # may run on this loop).
         if not select.select([wake_r], [], [], config.SWEEP_INTERVAL_S)[0]:
-            try:
-                app.sweep()
-            except Exception as e:  # never let the sweeper kill the broker
-                log(f"sweep failed: {type(e).__name__}")
             continue
         try:
             got = set(os.read(wake_r, 64))
