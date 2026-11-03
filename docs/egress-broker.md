@@ -211,12 +211,14 @@ capability, and any caller holding the bearer token can act on any sid (A4/F18).
   - Isolated mode (`-I`) and no bytecode writes (`-B`), and an explicit `sys.path` of exactly
     those two dirs. Never anything under `reports/`, which is the one RW share the VM has into
     the checkout.
-- **Code reload: superseded by §12.3.** A path unit starts the sockets when the code first
-  arrives and sends `SIGHUP` when it changes. The broker then reloads gracefully: it stops
-  accepting at an idle instant, finishes in-flight requests, persists the run registry to
-  `StateDirectory`, and exits 0. Socket activation starts the new code on the queued
-  connection. The earlier design (exit when idle at registration) is replaced: under steady
-  load it could serve stale code indefinitely, and it lost run state on exit.
+- **Code reload: superseded by §12.2.** A path unit starts the sockets when the code first
+  arrives and sends `SIGHUP` when it changes. The broker then reloads gracefully, in the order
+  §12.2 fixes: it **persists the run registry to `StateDirectory` first**, then stops accepting
+  at once, then finishes in-flight requests, persists again, and exits 0. Socket activation starts
+  the new code on the queued connection. Two earlier designs are replaced — "exit when idle at
+  registration" (under steady load it could serve stale code indefinitely and lost run state on
+  exit), and "stop accepting at an idle instant, persist after the join" (the idle-wait exceeded
+  `TimeoutStopSec`, so a stop under load was SIGKILLed with the registry still in memory).
 - Hardening:
   - `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`, `PrivateDevices`;
   - `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`, `ProtectClock`,
@@ -367,16 +369,25 @@ Run {
   page family from filling the ledger. At either cap, new URLs from that source are not added
   (fail closed: later fetches of unseen URLs are refused with reason `ledger_full`) and a
   warning is logged.
-- Lifetime is the run. There is no persistence: a broker restart mid-run makes the run's token
-  unknown, every broker tool then answers "run not registered (broker restarted) — finish with
-  what you have", and the MCP server logs an infra failure. Persisting the ledger would only
-  buy surviving a broker restart, which is rare (socket activation plus drain-on-reload).
+- Lifetime is the run. **Amended by §12.2: the registry *is* persisted across a graceful
+  reload.** `SIGHUP`/`SIGTERM` write token hashes, ledgers, budget counters, the sid→run map and
+  absolute `expires` to `$STATE_DIRECTORY/runs.json` (0600 under a 0700 DynamicUser state dir),
+  and the next process loads it, drops expired runs and deletes the file. A run spanning a reload
+  therefore never sees `run not registered` — which is what makes the zero-downtime requirement
+  reachable at all, since the switchover performs at least two reloads.
+
+  Persistence covers **planned** restarts only. An ungraceful crash still loses in-memory runs: the
+  run's token becomes unknown, every broker tool answers "run not registered (broker restarted) —
+  finish with what you have", and the MCP server logs an infra failure. That is a broker bug when
+  it happens, not a switchover effect (§12.7).
 
 ### 2.6 Failure behaviour
 
 | Failure | Behaviour |
 |---|---|
-| Admin socket missing or broker down at registration | **Final state:** `research()` fails fast with infra error `research-broker unavailable`, and never falls back to shipping keys. **Switchover only (§12.4):** a missing admin socket *path* (ENOENT, meaning the broker is not installed yet) falls back to the legacy key-shipping protocol, and only while the wrapper still exports the keys. Any other broker error fails closed. The fallback is deleted in the cleanup PR. |
+| Admin socket missing or broker down at registration | **Decided by `/etc/research-agent/egress-era`, never by the socket (§12.4).** In the `broker-only` era: `research()` fails with infra error `research-broker unavailable` and never falls back to shipping keys, whatever the socket's state. In the transition era (file absent or `legacy-ok`): a missing socket *path* falls back to the legacy protocol, and the legacy branch reads keys from `os.environ` only. Any other broker error fails closed. The fallback is deleted in the cleanup PR. **The earlier "ENOENT means the broker is not installed yet" reading was wrong as a security predicate** — ENOENT also happens when the socket unit is stopped or crash-looping, so it conflated "pre-broker" with "broker broken" and re-opened key shipping on an outage. |
+| Retry budget before that verdict | **Split by phase, not by errno.** systemd holds the listening fd continuously across a reload, so during the drain `connect()` *succeeds* and the connection queues in the backlog — a reload produces no `connect` error at all. Therefore: <br>• **`connect()` succeeded, reply slow** → this *is* the reload window. Give the read the full ≥240 s budget (drain 210 s + start), so a call that lands mid-reload waits instead of failing. <br>• **`ENOENT` or `ECONNREFUSED`** → systemd is *not* holding the listener; the socket unit is stopped or was never started. Neither can be a reload. Retry only briefly (~15 s, enough to cover a unit-restart race) and then take the era's verdict. <br>Without this split every `broker-only` fail-closed costs 240 s of dead waiting, and §12.5 T5b spends four minutes observing a result it could see at once. |
+| Deregistration fails | Logged, nothing else, on a short (~5 s) timeout. The run TTL is the backstop. Deregistration is cleanup and must **never** sit on the ≥240 s budget — doing so would delay returning an already-finished result by up to a full drain, turning a reload into user-visible latency for a call that had already succeeded. |
 | Broker unreachable mid-run | The shim returns the tool error `broker unavailable (infra)`; the agent continues with other tools. |
 | Token unknown or expired | 401 `run not registered`. |
 | Gate refusal | 403 plus the Verdict reason (§3.8); the shim surfaces it as the tool result text. |
@@ -866,17 +877,38 @@ paths. Add `broker/` to the bandit and semgrep paths in `.github/workflows/ci.ym
     also on exception (fake admin socket);
   - `_SECRET_ENV` and `_secrets` no longer look up the seven broker-owned keys (no
     `secret-tool` call for them);
-  - **the jail env is an explicit allowlist.** Today a "no `--setenv` of keys" test would be
-    inert: bwrap inherits the caller's whole environment (no `--clearenv`, `run-agent.sh:360`),
-    so a key exported anywhere upstream would reach the jail. `run-agent.sh` gains
-    `--clearenv` plus explicit `--setenv` for exactly: `HOME`, `PATH`, `LANG`,
-    `RESEARCH_SCRATCH_PATH`, `RESEARCH_RUN_ID`, `RESEARCH_BROKER_URL`,
-    `RESEARCH_BROKER_TOKEN`, `CLAUDE_STREAM_IDLE_TIMEOUT_MS`, `PRV_CACHE_DIR`,
-    `BOLAGSVERKET_CACHE_DIR`, plus `CLAUDE_CODE_OAUTH_TOKEN` (claude path) or `CODEX_HOME`
-    (codex path). Before finalising, the implementer dumps the env a live jail sees today and
-    adds anything the CLIs need (for example TLS CA variables). The test parses the bwrap argv
-    in `tests/test_run_agent_jail.py` and asserts `--clearenv` is present and the
-    `--setenv` names equal that allowlist exactly;
+  - **the jail env is an explicit allowlist, and secret values never appear in argv.** Today a
+    "no `--setenv` of keys" test would be inert: bwrap inherits the caller's whole environment
+    (no `--clearenv`, `run-agent.sh:360`), so a key exported anywhere upstream would reach the
+    jail. `run-agent.sh` gains `--clearenv` plus, in **two separate channels**:
+
+    1. **Non-secret names, via explicit `--setenv`** (argv-visible, which is fine for these):
+       `HOME`, `PATH`, `LANG`, `RESEARCH_SCRATCH_PATH`, `RESEARCH_RUN_ID`,
+       `RESEARCH_BROKER_URL`, `CLAUDE_STREAM_IDLE_TIMEOUT_MS`, `PRV_CACHE_DIR`,
+       `BOLAGSVERKET_CACHE_DIR`, plus `CODEX_HOME` on the codex path.
+    2. **Secret values, via `bwrap --file <fd> /run/agent-secrets`** — `RESEARCH_BROKER_TOKEN`,
+       and `CLAUDE_CODE_OAUTH_TOKEN` on the claude path. `run-agent.sh` writes `NAME=value`
+       lines into a pipe and passes the read end; bwrap materialises them as a 0600 file *inside*
+       the sandbox. The jail's entry point sources it (`set -a; . /run/agent-secrets; set +a`)
+       and execs the CLI. The value therefore never appears in any process's argv and never
+       lands on a host-visible path.
+
+    **`--setenv RESEARCH_BROKER_TOKEN` (the earlier text here) is forbidden**: it puts a live
+    credential in bwrap's command line, which the 2026-10-11 no-secrets-in-argv invariant and
+    `tests/test_no_secrets_in_argv_live.py` prohibit.
+
+    **`--unsetenv <each known bad name>` is also forbidden**, even though it produces the same
+    environment today and keeps secrets out of argv. It inverts the default: it enumerates what
+    to *remove*, so an env var exported upstream tomorrow reaches the jail unless someone
+    remembers to add it to the list. The standing directive is to name safe fields explicitly and
+    never to populate by filtering, precisely so that a field added later defaults to invisible.
+    `--clearenv` plus the two channels above is default-deny; `--unsetenv` is default-allow
+    wearing a denylist.
+
+    Before finalising, the implementer dumps the env a live jail sees today and adds anything the
+    CLIs need (for example TLS CA variables) to channel 1. The test parses the bwrap argv in
+    `tests/test_run_agent_jail.py` and asserts: `--clearenv` present; the `--setenv` names equal
+    channel 1 exactly; **no `--unsetenv` at all**; and no secret *value* appears anywhere in argv;
   - `codex-config.toml` `env_vars` names no key;
   - `.mcp.json` has no `env`.
 - **Hermetic exfil integration test (CI):**
@@ -1118,9 +1150,19 @@ when the pull later creates the file. Add to nixos-A:
      research-broker.service`. The service stop drains under the same `TimeoutStopSec=210`.
   3. If `broker/server.py` exists and the sockets are inactive, run
      `systemctl start research-broker.socket research-broker-admin.socket`.
-  4. If `research-broker.service` is active and the tree hash of `broker/` plus
-     `scraper/urlpolicy.py` differs from the hash the broker reports at
-     `GET /admin/health` (`{"code": "<sha256>"}`), run `systemctl reload research-broker`.
+  4. If `research-broker.service` is active and the code digest of the checkout differs from the
+     digest the broker reports at `GET /admin/health` (`{"code": "<sha256>"}`), run
+     `systemctl reload research-broker`.
+
+     **One implementation of that digest, not two.** The oneshot must **not** reimplement the hash
+     in shell: it invokes the repo's own `python3 -m broker.digest`, the same code path the broker
+     uses to answer `/admin/health`. A shell reimplementation is a cross-repo coupling that
+     silently rots — nixos-config and research-agent version independently, so the day the two
+     disagree the broker either reloads on every pull or never reloads again, and both failures
+     are quiet. The digest covers `broker/*.py` plus `scraper/urlpolicy.py`, hashed over paths
+     **relative to the checkout root** so it does not change with the mount point (the broker sees
+     the code at `/run/rb`, the oneshot sees it at `/home/jonathan/Repos/research-agent`). The
+     algorithm is documented in `broker.digest`'s docstring, which is the single source of truth.
 
   This also catches a missed inotify event on the next change.
 
@@ -1321,7 +1363,9 @@ would have come back "verified" without having been tested. Run T1 before trusti
   - **fail closed** in every other case: socket present but registration fails; socket absent in
     the `broker-only` era; legacy permitted but no keys in env; era value unrecognised. Error
     `research-broker unavailable`.
-  - Every dial logs `mode=broker|legacy reason=… era=<value|absent>`.
+  - Every dial logs `mode=broker|legacy|closed reason=… era=<value|absent>`. `mode=closed` is a
+    refused dial: nothing was dialled and no secret was read. §12.5's assertions use these exact
+    tokens — do not write `era=yes|no` anywhere.
 
   **Why not socket presence alone** (the original design, corrected 2026-11-03 after advisor
   review). Socket presence conflates "the broker is up" with "we are still in the transition era".
@@ -1462,13 +1506,13 @@ Every broker-mode call also runs the canary steps, which must come back `refused
 |---|---|---|
 | T0 | Base configs, old code; start `legacy-mcp`. | 3 calls succeed. |
 | T1 | `host: /run/current-system/specialisation/expand/bin/switch-to-configuration test` (as the auto-deploy would). | Switch output does **not** list `microvm@research-agent` under restarting. The roll fires, waits for an idle window and stub-reboots `agent` into `expand`. In-flight calls complete. **Zero failed calls.** `:8124` and `:8123` reachable from `agent`; `api.exa.ai` resolves; broker sockets inactive (condition). |
-| T2 | `git -C /home/jonathan/Repos/research-agent pull --ff-only`; start `new-mcp`. | The path unit starts the broker sockets. The scraper roll fires (code hash) and restarts once `/health` reports 0 sessions and 0 pending artifacts, with no artifact loss (the screenshot step's artifacts present). `new-mcp` dials log `mode=broker era=yes`. **`legacy-mcp`'s protocol is asserted guest-side, not from its own log:** commit 1's `server.py` has no `mode=` logging at all, so an assertion on `mode=legacy` in its output is vacuous. Instead the new `run-agent.sh` (which commit 1's inline `_GUEST_SCRIPT` execs) records the protocol it was handed — field count and absence of `RESEARCH_BROKER_TOKEN` — to the guest log, and the lane reads it there. Zero failed calls. |
+| T2 | `git -C /home/jonathan/Repos/research-agent pull --ff-only`; start `new-mcp`. | The path unit starts the broker sockets. The scraper roll fires (code hash) and restarts once `/health` reports 0 sessions and 0 pending artifacts, with no artifact loss (the screenshot step's artifacts present). `new-mcp` dials log `mode=broker era=legacy-ok`. **`legacy-mcp`'s protocol is asserted guest-side, not from its own log:** commit 1's `server.py` has no `mode=` logging at all, so an assertion on `mode=legacy` in its output is vacuous. Instead the new `run-agent.sh` (which commit 1's inline `_GUEST_SCRIPT` execs) records the protocol it was handed — field count and absence of `RESEARCH_BROKER_TOKEN` — to the guest log, and the lane reads it there. Zero failed calls. |
 | T2b | Commit a no-op change under `broker/` to origin and pull again. | Broker reload: `runs.json` round-trip (one long browse run spans it and finishes), queued requests served, zero failed calls. |
 | T2c | Wrong-order check (separate fresh sub-run of host+agent at base config with new code). | New `server.py` → `mode=legacy reason=no-broker`, calls succeed. |
 | T3 | Stop `legacy-mcp` between calls (session end); run the G3 gate script. | Gate passes only now. Run it before the stop as well and assert it **fails**. |
 | T4 | `switch-to-configuration test` into `contract`. | Roll → agent reboots into `contract`. Zero failed calls. |
 | T5 | Final state. | Inside a running fake-agent jail: `env`, `/proc/*/environ`, `/workspace`, `/etc` contain none of the 8 test key values, and `/etc/scraper` is absent. `getent ahostsv4 api.exa.ai` fails on `agent`; `10.0.2.2:8123` refused from `agent`; the broker serves (`new-mcp` calls ok); every canary step `refused`; **`/var/log/canary` empty**; upstream logs show no request for a keyed host from the agent's address. **`/etc/research-agent/egress-era` reads `broker-only`**, and the keyring holds none of the 8 keyed secrets. |
-| T5b | **Fail-closed subtest — the security claim of §12.4, tested.** Under `contract`, `systemctl stop research-broker.socket research-broker-admin.socket research-broker.service`, then dial from an MCP process **spawned back at S2, with all 8 keys still in its env**. | The dial returns `research-broker unavailable` (`mode=` never `legacy`, `era=no`). **No key value reaches the guest:** the jail's `env` and `/proc/*/environ` are clean and `/var/log/canary` stays empty. Then restore the sockets and assert calls resume. Without this step the lane never exercises the socket-absent branch under the contract era at all — which is precisely the fail-open the original socket-presence predicate would have had, so a green lane would have told us nothing about the one thing that matters most. |
+| T5b | **Fail-closed subtest — the security claim of §12.4, tested.** Under `contract`, `systemctl stop research-broker.socket research-broker-admin.socket research-broker.service`, then dial from an MCP process **spawned back at S2, with all 8 keys still in its env**. | The dial returns `research-broker unavailable` (`mode=closed`, never `legacy`; `era=broker-only`). **No key value reaches the guest:** the jail's `env` and `/proc/*/environ` are clean and `/var/log/canary` stays empty. Then restore the sockets and assert calls resume. Without this step the lane never exercises the socket-absent branch under the contract era at all — which is precisely the fail-open the original socket-presence predicate would have had, so a green lane would have told us nothing about the one thing that matters most. |
 | T6 | Rollback drill, in the mandated reverse order: **B⁻¹ first** (`switch-to-configuration` back into `expand`, which sets `/etc/research-agent/egress-era` back to `legacy-ok` and restores the key exports), **then** code⁻¹ (`git revert` pushed to origin, pulled); then back to base. | Zero failed calls in both directions (§12.6 rollback). After code⁻¹: **both broker sockets inactive** and `research-broker.service` inactive — the §12.2 step-2 stop ran, rather than leaving conditioned-but-active sockets with no code behind them. Also assert the **wrong order fails loudly**: in a separate sub-run, do code⁻¹ *without* B⁻¹ and assert the calls fail closed with `research-broker unavailable` rather than silently falling back to legacy. That is the designed behaviour, and the lane should pin it so nobody "fixes" it later. |
 | End | Aggregate JSONL. | `failed == 0` across all workers and steps; latency per step printed (not asserted beyond the 1800 s lock bound). |
 
