@@ -520,7 +520,18 @@ def _secrets() -> dict[str, str]:
         "tradera-app-id",
         "tradera-app-key",
     ):
-        if name in SECRETS_CACHE:
+        # Read the cache once and COPY the hit into `out`. Testing
+        # membership and then `continue`ing drops the value whenever another
+        # caller populated the cache after this call took its `out` snapshot
+        # above: the key is in SECRETS_CACHE, so it is skipped, but it was
+        # not in the snapshot, so it never reaches `out`. Two concurrent
+        # first calls then send one run with no provider keys at all. Found
+        # by the vm-egress-switchover lane (its loadgen warms the cache to
+        # dodge it); harmless-looking because single-threaded runs can never
+        # hit it.
+        cached = SECRETS_CACHE.get(name)
+        if cached:
+            out[name] = cached
             continue
         val = _resolve_secret(name)
         if val:

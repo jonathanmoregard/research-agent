@@ -233,3 +233,47 @@ def test_token_value_never_appears_in_log_file(fresh_server, tmp_path, monkeypat
         h.flush()
     body = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
     assert "ULTRA-SECRET-TOKEN-VALUE" not in body
+
+
+def test_a_cache_fill_by_another_caller_still_reaches_this_call(
+    fresh_server, monkeypatch
+):
+    """`_secrets()` must return a key that landed in the cache mid-call.
+
+    The real failure is a race between two concurrent first calls, but the
+    losing interleaving is fully determined, so drive it directly instead of
+    with threads and a sleep. `out` is snapshotted from SECRETS_CACHE at the
+    top of `_secrets()`; here the first resolve publishes a LATER key into
+    the cache, standing in for the other caller getting there first. The
+    loop then reaches that later key, finds it cached, and must copy it —
+    the pre-fix code tested membership and `continue`d, so the key was in
+    neither the snapshot nor `out`, and the run shipped without it.
+    """
+    fresh_server.SECRETS_CACHE.clear()
+    resolved: list[str] = []
+
+    def _fake_resolve(name):
+        resolved.append(name)
+        if name == "exa-api-key":
+            # Another caller finishes the whole set while we are in here.
+            fresh_server.SECRETS_CACHE["tavily-api-key"] = "TAV-from-other-caller"
+            return "EXA-ours"
+        return f"{name}-ours"
+
+    # monkeypatch, not plain assignment: these are module globals, and a
+    # direct assignment would outlive this test and re-stub `_resolve_secret`
+    # for every test that runs after it.
+    monkeypatch.setattr(fresh_server, "_keyring_lookup", lambda key: None)
+    monkeypatch.setattr(fresh_server, "_resolve_secret", _fake_resolve)
+    out = fresh_server._secrets()
+
+    assert out.get("exa-api-key") == "EXA-ours"
+    assert out.get("tavily-api-key") == "TAV-from-other-caller", (
+        "a key cached after the snapshot was dropped: a concurrent first "
+        f"call would ship a run without it (out keys: {sorted(out)})"
+    )
+    # Not re-resolved: the cache hit is honoured, not raced a second time.
+    assert resolved.count("tavily-api-key") == 0
+    # And no provider key is silently missing.
+    for name in ("euipo-client-id", "ebay-client-id", "tradera-app-id"):
+        assert name in out, f"{name} missing from the returned secrets"
