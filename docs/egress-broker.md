@@ -1375,14 +1375,29 @@ Algorithm:
    mean the scraper is safe to restart; its own queue depth does. None of the five fields may start
    the browser worker.
 
-   **`pending_artifacts` counts only artifacts belonging to a still-live run.** Orphans — artifacts
-   whose run has ended or crashed — are excluded. Without that exclusion the roll has a liveness
-   bug: un-pulled artifacts linger until the 30-minute TTL sweep, far beyond
-   `scraperQuietSeconds`, so a single crashed run would keep the counter non-zero through every
-   cap expiry and the scraper roll would never fire — which in turn means nixos-B's guest change
-   never lands and the contract step stalls indefinitely. The exclusion is principled rather than a
-   workaround: an artifact whose run is gone cannot be pulled by anyone, so a restart cannot lose
-   anything by discarding it.
+   **On cap expiry the roll releases every slot and defers.** It must never hold slots while
+   waiting on the scraper, because the two timeouts collide exactly: `ARTIFACT_TTL_S` is 1800 s
+   (`scraper/sessions.py:46`) and `_VM_LOCK_WAIT_SECS` is 1800 s (`server.py:949`). A crashed run
+   leaves un-pulled artifacts that only the TTL sweep clears, so a roll that kept the slots while
+   waiting them out would queue research calls for precisely their lock-wait budget — and some
+   would come back `research backend busy`. That is a failed call, which the zero-downtime
+   definition forbids (§12 preamble: delay yes, error no).
+
+   Releasing is safe where releasing *during acquisition* was not (see above): a half-acquired set
+   starves the roll forever, whereas a fully-released set simply postpones it. The roll is
+   deferrable by design — it retries on the next trigger, and a roll pending over 24 h notifies.
+   Calls are not deferrable past 1800 s. So the slot hold is bounded by `scraperQuietSeconds`, and
+   an orphaned artifact can delay a **roll** but never a **call**.
+
+   That also keeps the criterion simple: `pending_artifacts` is just the un-pulled count, and
+   orphans need no liveness protocol to identify them. Two designs were considered and rejected —
+   making the scraper track which runs still have a live collector (the broker's deregistration
+   cannot serve as that signal, since it precedes the artifact pull, so it would need a new
+   authenticated hold route and a long-lived connection per research call: ~400 lines of new
+   mechanism, a new dependency on the critical path, and a fresh pool of guest-consumable threads,
+   all to save roll latency the design already tolerates), and shortening `ARTIFACT_TTL_S` (a
+   fitted constant racing a different fitted constant). Bounding the slot hold fixes the actual
+   defect, which was holding slots while waiting on an unrelated condition.
 
    `/health` is **unauthenticated**, so during the legacy era the research VM can read the
    aggregate session and artifact counts. That is a small cross-run side channel (counts only, no
@@ -1391,8 +1406,8 @@ Algorithm:
    two counters behind the broker's admin surface, not to drop them.
 
    `scraperQuietSeconds` (default 300) survives only as a **safety cap**: if the counters have not
-   reached zero within it, the roll reports and waits rather than restarting. It is an input, not
-   the correctness criterion. The old design made 300 s the criterion, which is a fitted constant —
+   reached zero within it, the roll logs, releases its slots and defers rather than restarting. It
+   is an input, not the correctness criterion, and it bounds how long the roll may hold slots. The old design made 300 s the criterion, which is a fitted constant —
    the pull follows the post-release injection scan, and under Lakera 429 backoff (observed: one
    success per 4-5 min fleet-wide) that scan alone routinely exceeds 300 s, so the window would
    have expired with screenshots still un-pulled and the restart would have dropped them.
