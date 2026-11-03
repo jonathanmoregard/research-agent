@@ -1417,9 +1417,26 @@ Algorithm:
    counts as stale. Same rule as §12.2 step 4 and for the same two reasons — one implementation of
    the digest, and no hashing in a root-run shell script.
 2. **Take every slot, holding what you win. Never interrupt a run.** Walk
-   `agent.lock.0 … agent.lock.$((SLOTS-1))` and take each with a **blocking** `flock` (per-slot
-   timeout; whole-step bound 24 h). **Keep every slot already acquired while waiting for the
+   `agent.lock.0 … agent.lock.$((SLOTS-1))` and take each with a **blocking** `flock` (60 s
+   per-slot timeout, retried). **Keep every slot already acquired while waiting for the
    next** — never release and retry.
+
+   **There is no whole-step bound, and there must not be one** (corrected 2026-11-04; this step
+   used to claim "whole-step bound 24 h", which contradicted §12.7's own rule that the roll
+   "reports and keeps waiting rather than restarting", and contradicted the code, which waits
+   indefinitely and notifies once past `PENDING_NOTIFY_S`). Asking what a bound would *do* on
+   expiry shows why: restarting anyway kills a live run, which is the one thing this step exists
+   to prevent; giving up stops the roll just as waiting does, but also drops the slots, and
+   releasing acquired slots is precisely the starved design this step replaced. So waiting is the
+   only safe terminal behaviour, and the notification — not a timeout — is the operator's signal.
+
+   **Known cost, accepted:** because the roll keeps slots `0..i-1` while waiting for slot `i`, a
+   roll that waits a long time holds capacity down for that whole time (with `SLOTS=2`, one
+   waiting roll halves it), and because the unit stays `active`, path-unit triggers that arrive
+   meanwhile are coalesced away rather than queued. The roll re-reads `current != booted` after it
+   finally acquires, so it rolls to the newest code rather than the code that triggered it, but
+   the window is real. The mitigation is the notification plus the fact that a single-operator
+   workstation has frequent idle windows. Revisit if the notification ever actually fires.
 
    The earlier design released all acquired slots whenever one was busy and retried from scratch.
    Under any concurrency that starves: with 2 slots and 2 busy workers the roll can lose the race
