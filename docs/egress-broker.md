@@ -127,7 +127,7 @@ After A there is nothing in the VM to steal.
 | `intercept_page` | `render_shim.py:485` | `POST /intercept` (`:751`) | `url`; `actions[].text` (fill), `press` keys; click choice |
 | `browse_open` | `render_shim.py:553` | `POST /session/open` (`:613`) | `url` |
 | `browse_act` | `render_shim.py:566` | `POST /session/<sid>/act` (`:647`) | `goto.url`, `fill.text`, `press.key`, click/drag choice |
-| `browse_screenshot` / `save_screenshot` / `close` | `:577` / `:586` / `:605` | `/session/<sid>/screenshot`, `save_artifact`, `close` | none (`run_id` comes from the shim's env, `:88`, `:596`) |
+| `browse_screenshot` / `save_screenshot` / `close` | `:599` / `:608` / `:632` | `/session/<sid>/screenshot`, `save_artifact`, `close` | none (`run_id` is not model-authored: the broker takes it from the token, the legacy path from `RESEARCH_RUN_ID` — `render_shim.py:93`, injected for every session route at `_post`'s `_SESSION_ROUTES` branch) |
 | Exa search | `exa_shim.py:96` | — (`api.exa.ai/search`) | query (reaches Exa only) |
 | Tavily search | `tavily_shim.py:76` | — (`api.tavily.com/search`) | query (reaches Tavily only) |
 | eBay / Tradera / EUIPO | `shopping_shim.py:506` / `:732`, `trademark_shim.py:310` | — (fixed hosts) | query (reaches the API owner only) |
@@ -668,7 +668,12 @@ it were already bounded at the broker (§3.5).
 `render_shim.py`:
 - drops `TOKEN_FILE`, `_load_token` and the `10.0.2.2:8123` URLs (`:25-35`, `:70`, `:83`);
 - posts to `$RESEARCH_BROKER_URL/v1/scraper/...` with the run token;
-- never sends `run_id`.
+- never sends `run_id` **on the broker path** — the broker derives the run from the token, so a
+  shim-supplied one would be an unbound claim about whose budget to spend. On the legacy path
+  there is no token, so `_post` injects `RESEARCH_RUN_ID` for every route in `_SESSION_ROUTES`
+  and fails closed, naming the env var, when it is unset. The set is kept in one place rather
+  than at the five call sites so a sixth session route cannot be added without a run_id, and
+  `tests/test_render_shim_browse.py` pins it against the scraper's own `_SESSION_PATH` regex.
 
 The other shims post to their `/v1/<api>/...` route and keep only argument validation, text
 formatting and the untrusted wrap.
@@ -1619,8 +1624,17 @@ would have come back "verified" without having been tested. Run T1 before trusti
 - **Shims (new):** with `RESEARCH_BROKER_TOKEN` set → broker routes. Without it → today's direct
   calls (keys from env, scraper via `10.0.2.2:8123` and `/etc/scraper/token`).
 - **Scraper (new):**
-  - accepts broker requests (with `run_id`, `nav_policy`) and legacy requests (no `run_id`:
-    unbound session, no nav gate, exactly today's behaviour);
+  - accepts broker requests (with `run_id`, `nav_policy`) and legacy requests (no `nav_policy`:
+    no nav gate, exactly today's behaviour on `/render` and `/intercept`);
+  - **`run_id` is mandatory on every `/session/*` route in both modes** — `_do_session_open`
+    (`scraper/server.py:675-677`) and `_do_session_op` (`:703-705`) answer 400 `bad run_id`
+    without one. There is no unbound-session path. The broker fills it from the token; the
+    legacy shim must send it from `RESEARCH_RUN_ID` (§4.4).
+    *This entry used to promise an unbound legacy session, and the shim was written to match
+    the promise rather than the code. The vm-egress-switchover lane caught it at T2: the moment
+    the scraper roll loads the new code, every browse call from a pane still on legacy-mcp
+    fails — an outage during the switchover. Fixed in the shim, not by relaxing the scraper:
+    the binding is a security property (§4.3), and the switchover must not need it off.*
   - the old scraper ignores the new fields, so broker → old scraper works too (minus the nav
     gate and binding until the scraper roll).
 - **Broker:** only ever talked to by new code.

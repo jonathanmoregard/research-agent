@@ -423,15 +423,33 @@ def _post_scraper(endpoint_url: str, payload: dict, timeout_ms: int,
     return out
 
 
+# The scraper's session routes bind every op to the run that opened the
+# session and reject a request without one (`bad run_id`): /session/open in
+# `_do_session_open`, the rest in `_do_session_op` via `_SESSION_PATH`. On the
+# broker path the broker derives the run from the token, so the shim must NOT
+# send one; on the legacy path there is no token, so the shim is the only
+# thing that can. Kept as one set here rather than at each call site so a
+# sixth session route cannot be added without a run_id.
+# `tests/test_render_shim_browse.py` pins this against the scraper's own regex.
+_SESSION_ROUTES = frozenset({"open", "act", "screenshot", "save_artifact", "close"})
+
+
 def _post(route: str, scraper_url: str, broker_path: str, payload: dict,
           timeout_ms: int, max_bytes: int | None = None) -> dict:
     """Dual mode (§12.4, §4.4). With a broker token: the broker's scraper
     route — the broker holds the scraper bearer, gates the URL and derives
     the run from the token, so no run_id is ever sent. Without: today's
-    direct call to the scraper VM."""
+    direct call to the scraper VM, which needs the run named explicitly on a
+    session route."""
     if broker_client.enabled():
         return broker_client.post(broker_path, payload, broker_client.SCRAPER_TIMEOUT_S[route],
                                   max_bytes=max_bytes or MAX_BODY_BYTES)
+    if route in _SESSION_ROUTES:
+        if not RUN_ID:
+            raise RuntimeError(
+                "RESEARCH_RUN_ID not set — browser sessions unavailable in this jail"
+            )
+        payload = {**payload, "run_id": RUN_ID}
     if max_bytes is None:  # the legacy call, exactly as before
         return _post_scraper(scraper_url, payload, timeout_ms)
     return _post_scraper(scraper_url, payload, timeout_ms, max_bytes=max_bytes)

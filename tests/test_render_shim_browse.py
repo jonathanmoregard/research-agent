@@ -10,6 +10,7 @@ Use:
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -44,10 +45,17 @@ def _stub_post_scraper(endpoint_url, payload, timeout_ms, max_bytes=None):
     return _captured["return_value"]
 
 
+# A run id of the shape the scraper accepts (`^[a-f0-9]{32}$`). The legacy
+# path names the run on every session route, so the default has to be set or
+# those calls fail closed before reaching the stub.
+LEGACY_RUN_ID = "50b27629113b4f4c98d1ce9fc6078d32"
+
+
 def _reset(return_value: dict) -> None:
     _captured.clear()
     _captured["return_value"] = return_value
     render_shim._post_scraper = _stub_post_scraper
+    render_shim.RUN_ID = LEGACY_RUN_ID
 
 
 # ----- browse_open -------------------------------------------------------
@@ -240,6 +248,114 @@ def test_browse_close():
     _assert(sid in out, f"session_id not in close confirmation: {out!r}")
 
 
+# ----- legacy session routes name the run (§12.4) ------------------------
+#
+# The vm-egress-switchover lane found this at T2: the scraper gained a
+# mandatory `run_id` on /session/* while the shim's legacy path kept sending
+# none, so the moment the scraper roll loaded the new code every browse call
+# from a pane still on legacy-mcp failed with HTTP 400 `bad run_id` — an
+# outage during the switchover, which the zero-downtime constraint forbids.
+
+_LEGACY_SESSION_CALLS = (
+    ("browse_open",
+     lambda: render_shim._tool_browse_open({"url": "https://x.test/"})),
+    ("browse_act",
+     lambda: render_shim._tool_browse_act({
+         "session_id": "ab12cd34ef56a1b2",
+         "actions": [{"type": "click", "target": {"ref": "e1"}}],
+     })),
+    ("browse_screenshot",
+     lambda: render_shim._tool_browse_screenshot({
+         "session_id": "ab12cd34ef56a1b2"})),
+    ("browse_close",
+     lambda: render_shim._tool_browse_close({
+         "session_id": "ab12cd34ef56a1b2"})),
+)
+
+_SESSION_RETURN = {
+    "status": "ok",
+    "session_id": "ab12cd34ef56a1b2",
+    "screenshot_b64": "aGk=",
+    "screenshot_mime": "image/jpeg",
+    "snapshot": "- button [ref=e1]",
+    "final_url": "https://x.test/",
+    "title": "Test",
+    "closed": True,
+}
+
+
+def test_legacy_session_calls_send_the_run_id():
+    for name, call in _LEGACY_SESSION_CALLS:
+        _reset(dict(_SESSION_RETURN))
+        call()
+        _assert(
+            _captured["payload"].get("run_id") == LEGACY_RUN_ID,
+            f"{name} legacy payload has no/wrong run_id: {_captured['payload']}",
+        )
+
+
+def test_legacy_session_calls_fail_closed_without_a_run_id():
+    for name, call in _LEGACY_SESSION_CALLS:
+        _reset(dict(_SESSION_RETURN))
+        render_shim.RUN_ID = ""
+        try:
+            call()
+        except RuntimeError as e:
+            _assert("RESEARCH_RUN_ID" in str(e),
+                    f"{name} error doesn't name RESEARCH_RUN_ID: {e}")
+            continue
+        finally:
+            render_shim.RUN_ID = LEGACY_RUN_ID
+        _assert(False, f"{name} with no RUN_ID did not raise")
+
+
+def test_broker_session_calls_never_send_a_run_id():
+    """The broker derives the run from the token; a shim-supplied run_id
+    would be an unbound claim about whose budget to spend."""
+    sent: dict = {}
+
+    def _stub_broker_post(path, payload, timeout_s, max_bytes=None):
+        sent["path"] = path
+        sent["payload"] = payload
+        return dict(_SESSION_RETURN)
+
+    orig_enabled = render_shim.broker_client.enabled
+    orig_post = render_shim.broker_client.post
+    render_shim.broker_client.enabled = lambda: True
+    render_shim.broker_client.post = _stub_broker_post
+    try:
+        for name, call in _LEGACY_SESSION_CALLS:
+            sent.clear()
+            render_shim.RUN_ID = LEGACY_RUN_ID
+            call()
+            _assert("run_id" not in sent["payload"],
+                    f"{name} sent a run_id to the broker: {sent['payload']}")
+    finally:
+        render_shim.broker_client.enabled = orig_enabled
+        render_shim.broker_client.post = orig_post
+
+
+def test_session_route_set_matches_the_scrapers_own_routes():
+    """Guard the guard: the shim's `_SESSION_ROUTES` is what decides which
+    legacy calls get a run_id, so it must track the scraper's session routes.
+    Read from the scraper source rather than imported — importing
+    scraper/server.py needs a playwright stub and a token file.
+    """
+    src = (REPO_ROOT / "scraper" / "server.py").read_text()
+    m = re.search(r"_SESSION_PATH = re\.compile\(\s*r?\"[^\"]*\(([a-z_|]+)\)",
+                  src)
+    _assert(m is not None, "could not find _SESSION_PATH in scraper/server.py")
+    ops = set(m.group(1).split("|"))
+    _assert(len(ops) >= 4, f"suspiciously few scraper session ops: {ops}")
+    # /session/open is matched by an exact path compare, not the regex.
+    expected = ops | {"open"}
+    _assert(
+        render_shim._SESSION_ROUTES == expected,
+        f"shim session routes {set(render_shim._SESSION_ROUTES)} != "
+        f"scraper's {expected}",
+    )
+
+
 # ----- render_page now wrapped -------------------------------------------
 
 def test_render_page_now_wrapped():
@@ -317,6 +433,10 @@ def main() -> int:
         test_browse_save_no_run_id,
         test_browse_save_payload,
         test_browse_close,
+        test_legacy_session_calls_send_the_run_id,
+        test_legacy_session_calls_fail_closed_without_a_run_id,
+        test_broker_session_calls_never_send_a_run_id,
+        test_session_route_set_matches_the_scrapers_own_routes,
         test_render_page_now_wrapped,
         test_wrap_untrusted_defangs_uppercase,
         test_wrap_untrusted_defangs_space_before_slash,
