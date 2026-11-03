@@ -1163,6 +1163,18 @@ Each item gets a red test first.
 - [x] Session and artifact run binding (§4.3). `validate_run_id` +
       `scraper/sessions.py` keying; a cross-run `act` is refused 403 "another run" and
       `save_artifact` is forced back to the owning run (`tests/test_broker.py`).
+      **Both modes, and note why this needs saying.** This item was ticked on broker-path evidence
+      alone, and in that state the LEGACY path was broken the whole time: making `run_id`
+      mandatory on `/session/*` (`scraper/server.py:675-677`, `:703-705`) landed without the
+      legacy shim ever sending one, so every legacy browse call 400'd the moment the new scraper
+      loaded — found by the lane at T2, not by this checklist. Fixed in `975c900`; the legacy half
+      is now evidenced by `tests/test_render_shim_browse.py`
+      (`test_legacy_session_calls_send_the_run_id`, the fail-closed case, the broker-sends-none
+      case, and `_SESSION_ROUTES` pinned against the scraper's own `_SESSION_PATH` regex).
+      **Lesson for the rest of this checklist: an item that holds in one mode of a dual-mode
+      system is not ticked.** Dual mode exists only during the switchover, which is exactly when
+      a one-mode tick is most dangerous — re-read any item above that predates §12.4 with that in
+      mind.
 
 ---
 
