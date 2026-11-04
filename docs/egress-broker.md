@@ -649,13 +649,20 @@ it were already bounded at the broker (§3.5).
 
 ### 4.3 Session and artifact run binding
 
-- `session/open` gets a mandatory `run_id`, which the broker sets from the token. `_Session`
-  stores it. Every `act`/`screenshot`/`save_artifact`/`close` must carry the same `run_id`, or
-  the scraper answers 403 `session belongs to another run`. This duplicates the broker's own
-  `sid → run` map, which already refuses before forwarding (defence in depth, because only the
-  broker holds the bearer).
-- `save_artifact`: the scraper ignores any `run_id` except the session's own, so the artifact
-  store key is the session's run.
+- `session/open` takes a `run_id`, which the broker sets from the token. `_Session` stores it,
+  and the session is then **bound**: every `act`/`screenshot`/`save_artifact`/`close` must
+  carry the same `run_id`, or the scraper answers 403 `session belongs to another run` — an
+  op naming no run is refused too. This duplicates the broker's own `sid → run` map, which
+  already refuses before forwarding (defence in depth, because only the broker holds the
+  bearer).
+- Giving `run_id` is **optional on the legacy path only, and only until PR 4**; a session
+  opened without one is unbound and takes no run check. See §12.4 for why the switchover
+  needs that and why it costs nothing on the broker path (the broker always names the run).
+  A `run_id` that is present but malformed is always 400 `bad run_id`.
+- `save_artifact`: a bound session's artifact is keyed by the session's own run, whatever the
+  request names. An unbound session has no run of its own, so there the request's `run_id`
+  is the key — and it is required on this one op, since `/artifacts/<32 hex>` cannot express
+  the empty key.
 - `MAX_SESSIONS` (`sessions.py:25`) becomes per run (2 per run, 4 global) so concurrent runs
   cannot starve each other.
 - Run end: the broker's `DELETE /admin/runs` closes the run's sessions. The scraper's idle TTL
@@ -1165,12 +1172,24 @@ Each item gets a red test first.
       `save_artifact` is forced back to the owning run (`tests/test_broker.py`).
       **Both modes, and note why this needs saying.** This item was ticked on broker-path evidence
       alone, and in that state the LEGACY path was broken the whole time: making `run_id`
-      mandatory on `/session/*` (`scraper/server.py:675-677`, `:703-705`) landed without the
-      legacy shim ever sending one, so every legacy browse call 400'd the moment the new scraper
-      loaded — found by the lane at T2, not by this checklist. Fixed in `975c900`; the legacy half
-      is now evidenced by `tests/test_render_shim_browse.py`
+      mandatory on `/session/*` landed without the legacy shim ever sending one, so every legacy
+      browse call 400'd the moment the new scraper loaded — found by the lane at T2, not by this
+      checklist. Fixed in **two** commits, and the first was not enough: `975c900` made the shim
+      send `run_id` on every session route, which fixes a legacy run whose shims are the new
+      ones, but a run that started before the scraper roll keeps its *older* shims for life
+      (§12.4's per-run agent snapshot) and those send none. `282efee` therefore also made the scraper
+      tolerate an unbound session on the legacy path, which §12.1 PR 4 shows was the design all
+      along. Evidenced by `tests/test_render_shim_browse.py`
       (`test_legacy_session_calls_send_the_run_id`, the fail-closed case, the broker-sends-none
-      case, and `_SESSION_ROUTES` pinned against the scraper's own `_SESSION_PATH` regex).
+      case, and `_SESSION_ROUTES` pinned against the scraper's own `_SESSION_PATH` regex),
+      `tests/test_scraper_session_routes.py` (open/ops with no `run_id`, malformed still 400,
+      `save_artifact` still requires one) and `tests/test_scraper_sessions.py` (an unbound
+      session serves an unnamed caller; a **bound** one refuses it; an unbound session's
+      artifact buckets under the requesting run).
+      **Second lesson, from the same item:** a dual-mode fix can be ticked in both modes and
+      still be wrong, if "both modes" means *both modes of the current code*. The legacy mode
+      that matters during a switchover is the code that is **already deployed** — and that code
+      cannot be fixed, only tolerated.
       **Lesson for the rest of this checklist: an item that holds in one mode of a dual-mode
       system is not ticked.** Dual mode exists only during the switchover, which is exactly when
       a one-mode tick is most dangerous — re-read any item above that predates §12.4 with that in
@@ -1687,15 +1706,34 @@ would have come back "verified" without having been tested. Run T1 before trusti
 - **Scraper (new):**
   - accepts broker requests (with `run_id`, `nav_policy`) and legacy requests (no `nav_policy`:
     no nav gate, exactly today's behaviour on `/render` and `/intercept`);
-  - **`run_id` is mandatory on every `/session/*` route in both modes** — `_do_session_open`
-    (`scraper/server.py:675-677`) and `_do_session_op` (`:703-705`) answer 400 `bad run_id`
-    without one. There is no unbound-session path. The broker fills it from the token; the
-    legacy shim must send it from `RESEARCH_RUN_ID` (§4.4).
-    *This entry used to promise an unbound legacy session, and the shim was written to match
-    the promise rather than the code. The vm-egress-switchover lane caught it at T2: the moment
-    the scraper roll loads the new code, every browse call from a pane still on legacy-mcp
-    fails — an outage during the switchover. Fixed in the shim, not by relaxing the scraper:
-    the binding is a security property (§4.3), and the switchover must not need it off.*
+  - **`run_id` binds a session when it is given, and is optional on the legacy path until
+    PR 4.** `_do_session_open` and `_do_session_op` (`scraper/server.py`) validate it whenever
+    it is present — a malformed one, empty string included, is still 400 `bad run_id` — but a
+    session opened without one is **unbound**: no run owns it, and the worker applies no run
+    check to its ops (`scraper/sessions.py::_dispatch`). The one exception is `save_artifact`,
+    which needs a run to bucket under because the pull route is `/artifacts/<32 hex>` and
+    cannot express `""`; main required it there too. A **bound** session still refuses another
+    run *and* an unnamed caller with 403, so no legacy caller can reach a broker session.
+    The broker fills `run_id` from the token on every session route, so broker sessions are
+    always bound; the legacy shim sends it from `RESEARCH_RUN_ID` (§4.4), so a session opened
+    by a *current* shim on the legacy path is bound too. Unbound sessions are therefore
+    reachable only by an older deployed shim, and only while the `:8123` route exists —
+    PR 4 deletes the branch with the route.
+    *Correction history, twice over, because the second pass got it wrong too.* This entry
+    first promised an unbound legacy session and the shim was written to match the promise
+    rather than the code; the lane caught that at T2 as a 400 on every browse from a pane
+    still on legacy-mcp. I then **corrected the doc to match the code** and called the
+    mandatory binding a security property the switchover must not need off. That was the
+    wrong direction: §12.1 PR 4 lists "the scraper (unbound sessions)" as deletion-only work
+    *after* the switchover, so unbound sessions were always part of the design and the
+    implementation simply never had them. Once the per-run agent snapshot (the entry above)
+    stopped a running legacy run from silently picking up new shims mid-run, the real
+    incompatibility
+    surfaced: an older run's shims send no `run_id` for their whole life and cannot be
+    changed, so mandatory binding means a 400 at the scraper roll either way. The fix is the
+    scraper branch above. The security property is preserved where it actually bites — on
+    bound sessions — and is absolute under `contract`, where there is no route to open an
+    unbound session at all.
   - the old scraper ignores the new fields, so broker → old scraper works too (minus the nav
     gate and binding until the scraper roll).
 - **Broker:** only ever talked to by new code.
