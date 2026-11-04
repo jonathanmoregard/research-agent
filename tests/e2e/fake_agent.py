@@ -206,7 +206,29 @@ def variant(a: Agent, v: str, plan: dict) -> None:
         if not url:
             return a.result("render_listing", "error", "no-url")
         a.step("render_listing", "render", "render_page", {"url": url})
-    elif v in ("browse", "long"):
+    elif v in ("browse", "long", "reopen"):
+        if v == "reopen":
+            # T2d (§12.4): prove an OLD shim can still open a session against a
+            # scraper that restarted undrained onto newly pulled code — the one
+            # window `282efee`'s unbound sessions exist for.
+            #
+            # The shim must already be RUNNING before the pull. The real CLI
+            # starts every MCP server at session start, but this harness starts
+            # a shim on its first call to it, so a shim that first runs after
+            # the pull would read the new code off the live /workspace share
+            # and send a run_id — hiding the very case this variant exists to
+            # catch. So: force the shim to start now with one open/close.
+            out = a.step("browse_open_first", "render", "browse_open",
+                         {"url": "https://shop.test/store"})
+            m0 = SID_RE.search(out or "")
+            if not m0:
+                return a.result("browse_close_first", "error", "no-session")
+            # Closed BEFORE the restart on purpose. A session surviving a
+            # scraper restart is a different and unfixable case (sessions are
+            # VM memory), so nothing below may depend on one.
+            a.step("browse_close_first", "render", "browse_close",
+                   {"session_id": m0.group(1)})
+            time.sleep(float(plan.get("long_s", 60)))
         out = a.step("browse_open", "render", "browse_open", {"url": "https://shop.test/store"})
         m = SID_RE.search(out or "")
         if not m:
