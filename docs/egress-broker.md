@@ -2028,6 +2028,21 @@ than the lane can make. Recorded 2026-11-04 from the lane's own construction:
    as **G0** in §12.6 step 0, because no flake assertion can see this — neither input has a local
    notion of "current". **Treat any green run older than the latest `main` commit as
    provisional.**
+14. **G3's per-process marker is written by the harness, so the gate's own write path is
+   untested.** `loadgen.py:66-67` calls `mcp_marker.write()` itself, duplicating the two lines
+   `server.main()` runs at startup. The lane therefore proves that *given* a marker, G3 reads it
+   correctly — and would stay green if `main()` stopped writing one at all, which is the failure
+   that would make G3 pass vacuously on a real host and let nixos-B merge over a live legacy
+   process. The duplication is hard to avoid: the lane bypasses the MCP stdio layer (item 3), so
+   `main()` never runs there at all. **The suite already covers it**, which is why this is a
+   recorded boundary and not open work — `tests/test_mcp_marker.py::
+   test_main_writes_the_marker_before_serving_whatever_the_egress_era` patches `mcp.run` and
+   asserts the marker exists *by the time stdio binds*, then runs the registered `atexit` hook and
+   asserts it is removed. Both halves matter to G3: a missing marker makes it vacuous, a leaked
+   one makes it block forever. Not to be confused with
+   `scripts/.guest-protocol`, the *code-generation* marker `_egress_mode` reads — a file in the
+   checkout, not a runtime marker, and not involved here. Found by the 2026-11-05 review and by
+   the lane author independently, which is the only finding both passes reached alone.
 
 None of these is a reason to weaken an assertion. They are the list of things that still need
 either a different harness or the first live run, and §12.6's gates are where that happens.
