@@ -1167,10 +1167,12 @@ Each item gets a red test first.
       and pass vacuously. If the prompt is ever given the real numbers so the model can pace
       itself, add the test in the same change; `tests/test_prompt_url_drift.py` is the pattern,
       including its guard that the corpus is non-empty.
-- [ ] Session and artifact run binding (§4.3) — **broker path done, legacy path not e2e.**
+- [x] Session and artifact run binding (§4.3) — **both paths e2e as of 2026-11-05.**
       `validate_run_id` + `scraper/sessions.py` keying; a cross-run `act` is refused 403
       "another run" and `save_artifact` is forced back to the owning run
-      (`tests/test_broker.py`). Un-ticked on purpose by this section's own rule: see below.
+      (`tests/test_broker.py`). Ticked only once lane step **T2d** went green *and* its red
+      counterpart failed on exactly the expected error — see §12.4 for both transcripts. It
+      spent two passes un-ticked under this section's own rule; keep reading for why.
       **Both modes, and note why this needs saying.** This item was ticked on broker-path evidence
       alone, and in that state the LEGACY path was broken the whole time: making `run_id`
       mandatory on `/session/*` landed without the legacy shim ever sending one, so every legacy
@@ -1179,11 +1181,10 @@ Each item gets a red test first.
       `282efee` additionally makes the scraper tolerate an **unbound** session on the legacy
       path, which §12.1 PR 4 shows was the design all along. **Read §12.4's correction history
       before reasoning about `282efee`:** I justified it with a window at the scraper roll, b12
-      disproved that (the drained roll leaves no run alive across it), and the branch is
-      currently kept as defensive with its real window — an undrained scraper restart — still
-      unverified. **This item is therefore NOT fully ticked:** the unbound path has unit
-      evidence and no e2e evidence, and lane step T2d exists to settle whether an e2e window
-      exists at all. Unit evidence: `tests/test_render_shim_browse.py`
+      disproved that (the drained roll leaves no run alive across it), and the window that
+      actually exists is an **undrained** scraper restart — which T2d then drove, red and green,
+      in b13r/b13g. The fix was right and my reason for it was wrong; the tick rests on T2d, not
+      on the argument that motivated the commit. Unit evidence: `tests/test_render_shim_browse.py`
       (`test_legacy_session_calls_send_the_run_id`, the fail-closed case, the broker-sends-none
       case, and `_SESSION_ROUTES` pinned against the scraper's own `_SESSION_PATH` regex),
       `tests/test_scraper_session_routes.py` (open/ops with no `run_id`, malformed still 400,
@@ -1775,6 +1776,16 @@ would have come back "verified" without having been tested. Run T1 before trusti
     bucket (a 200 with a lost artifact is the failure mode that matters). It needs the
     `reopen` variant in `tests/e2e/fake_agent.py`, since a shim that first starts *after* the
     pull reads the new code and would hide the case.
+    **Verified e2e 2026-11-05, both directions.** Green (b13g, pin `6afe86f`): `scraper-http`
+    came back through its own `Restart=` (`NRestarts 0 → 1`) on the pulled code 7.2 s after the
+    run's first session closed, all six `reopen` steps ok with `artifacts: 1` and `mode: legacy`,
+    and the run carries no `run-agent: protocol=` line, so it genuinely ran the old guest code.
+    Red (b13r, the same tree with only this commit's `scraper/` change reverted): `EXIT=1` at
+    T2d with `browse_open → error bad-run-id`, `browse_act → error no-session`, `artifacts 0`,
+    on `scraper HTTP 400: {"status": "error", "error": "bad run_id"}`. So the window is real and
+    the branch is load-bearing, not defensive — but note which claim that vindicates: the
+    *mechanism* (a pre-pull shim meeting newly-loaded scraper code), never the *trigger* I first
+    gave for it.
     The security property is unaffected either way: it is preserved where it bites — on bound
     sessions, which refuse both another run and an unnamed caller — and is absolute under
     `contract`, where there is no route to open an unbound session at all.
@@ -1814,7 +1825,7 @@ The inputs are used only by `checks`, never by `nixosConfigurations`.
 
 | Node | Plays | Built from |
 |---|---|---|
-| `host` | dellan | The real `research-broker.nix`, the roll and path units, the watchdog marker logic, `nixos-auto-deploy` **not** included. Specialisations `expand` and `contract` (`legacyPaths` true / false). `/home/jonathan/Repos/research-agent` is a git repo built in the test from `research-agent-old` (commit 1) with `research-agent-new` as commit 2 on a bare "origin". The real `git pull --ff-only` performs the swap. Test CA in `security.pki.certificateFiles`. Agenix replaced by test credential files (as in the `5a8676f` broker-stub assertions). |
+| `host` | dellan | The real `research-broker.nix`, the roll and path units. **Neither watchdog module and `nixos-auto-deploy` are included** — the watchdogs are covered by `vm-microvm` instead, and importing them here would fire real probe timers against stub reboots (item 11 below). Specialisations `expand` and `contract` (`legacyPaths` true / false). `/home/jonathan/Repos/research-agent` is a git repo built in the test from `research-agent-old` (commit 1) with `research-agent-new` as commit 2 on a bare "origin". The real `git pull --ff-only` performs the swap. Test CA in `security.pki.certificateFiles`. Agenix replaced by test credential files (as in the `5a8676f` broker-stub assertions). |
 | `agent` | research VM | The real `research-agent-egress.nix` with base / expand / contract specialisations, sshd, user `agent`, bubblewrap. `/workspace` is a read-only NFS export of the host checkout, so the pull is visible exactly as through virtiofs. **`claude` on PATH is a fake agent** (`tests/e2e/fake_agent.py` in research-agent, taken from `research-agent-new` for both phases). It speaks MCP stdio to the real shims from `agent/.mcp.json` and runs a plan embedded in the prompt (§ below), writing a report with `RESULT <step> ok|refused|error` lines. |
 | `scraper` | scraper VM | The real `scraper/server.py` (from the host checkout over NFS), Playwright + `playwright-driver.browsers`, the real `scraper-egress.nix`. The test CA is in the `scraper` user's NSS DB (`certutil`); production code is unchanged. |
 | `upstream` | internet | dnsmasq answering `api.exa.ai`, `api.tavily.com`, `api.ebay.com`, `api.tradera.com`, `www.ikea.com`, `shop.test`, `canary.test`. A Python HTTPS server with test-CA certs: stub Exa/Tavily/eBay/Tradera JSON whose result URLs point at `shop.test` pages, a stub IKEA search page, and `canary.test`, which logs every hit to `/var/log/canary`. |
@@ -1919,19 +1930,26 @@ than the lane can make. Recorded 2026-11-04 from the lane's own construction:
 6. **T5's keyring assertion is absent**, not merely stubbed: the lane has no keyring, so "the
    keyring holds none of the 8 keyed secrets" is unverified by this lane. It needs a different
    harness or a manual check at the live switchover.
-7. **No step reaches the unbound-session path yet** (`282efee`, §12.4). On the drained path no
-   step *can*: the roll holds every research slot before restarting the scraper, so a run with
-   pre-pull shims is never alive to meet the new scraper. Added 2026-11-04 after b12 showed T2
-   green with zero `bad run_id` lines — which disproved the window I had claimed for that
-   branch rather than confirming it. **T2d** covers the real window (an undrained
-   `scraper-http` restart onto pulled code); until it is green, the legacy half of §11's
-   run-binding item has unit evidence only, and that item is un-ticked.
-8. **The rollback case where an MCP process has no keys in its environment is unreachable
-   here** (the 2026-11-04 advisor finding, §12.7). Every MCP the lane starts is given all 8
-   keys with `--setenv` (T5b asserts `n_keys == 8`) and `new-mcp` dates from T2, so no lane
-   process is in the state that matters: spawned under `broker-only`, hence keyless, and still
-   alive at code⁻¹. The lane needs a keyless MCP started under `contract` and kept through
-   T6b before it can see this at all.
+7. ~~**No step reaches the unbound-session path**~~ (`282efee`, §12.4) — **discharged
+   2026-11-05 by T2d**, red and green (see §12.4). What remains true is narrower and worth
+   keeping: no *drained* step reaches it, and none can, because the roll holds every research
+   slot before restarting the scraper, so a run with pre-pull shims is never alive to meet the
+   new scraper. The entry was written 2026-11-04 after b12 showed T2 green with zero
+   `bad run_id` lines, disproving the window I had claimed rather than confirming it. **Still a
+   fake:** T2d reaches the window with `systemctl kill -s KILL`, which exercises the real
+   `Restart=always` but stands in for the crash, `MemoryMax` kill or watchdog restart that
+   would cause it in production. The path from a real OOM to this restart is untested here.
+8. ~~**The rollback case where an MCP process has no keys in its environment is unreachable
+   here**~~ (the 2026-11-04 advisor finding, §12.7) — **discharged 2026-11-05 by the G2⁻¹
+   step**, green in b13g: a second MCP spawned under `contract` with 0 of the 8 key values in
+   its environment (and its provider token present, so the right environment was read) serves
+   in broker mode at T5, is still ok at T6a, and at T6b fails closed exactly as predicted —
+   `research-broker unavailable reason=legacy-no-keys`, dial line
+   `mode=closed reason=legacy-no-keys era=legacy-ok` — while a fresh spawn after B⁻¹ serves
+   legacy fine. T5b's `n_keys == 8` was left alone: it reads `lane-new-mcp`'s pid only.
+   **Still a fake:** the lane has no wrapper, so "spawned with `--setenv` omitted" is its
+   stand-in for what nixos-B's wrapper will do by *not* exporting the keys. Item 10 is the
+   other half of that same gap.
 9. **The T2 legacy roll's artifact-loss window is masked by the harness**, not covered by it
    (§12.7). `loadgen.py` pulls artifacts immediately and runs no scanner, so the gap the real
    host has — scan first, `fetch_artifacts` after, both outside the slot — does not exist in
@@ -1943,6 +1961,27 @@ than the lane can make. Recorded 2026-11-04 from the lane's own construction:
    nixos-A's `contract` phase removes those exports — dropping them is nixos-B work that does
    not exist yet. Deliberately deferred: when B lands, the lane starts MCPs through the real
    wrapper in every phase and T6a asserts a new spawn has all 8 keys.
+11. **Neither watchdog module is imported by this lane.** The `host` node imports
+   `research-agent-microvm.nix`, `scraper-microvm.nix`, `research-broker.nix` and
+   `research-vm-roll.nix` — not `research-agent-microvm-healthcheck.nix` and not
+   `scraper-microvm-healthcheck.nix` — so nothing here proves the watchdogs stand down during a
+   drained roll, which is the property §12.3 depends on. That is covered instead by
+   **`vm-microvm`**, one subtest per watchdog (`tests/microvm.nix`, `8b10c97`): unit shape, the
+   notify path, the roll guard, and the garbage-`fail-count` case for each. Keeping them out is
+   deliberate, not an oversight — importing them would run real 60 s probe timers against the
+   lane's *stub* reboots, firing restarts mid-step and making the lane flaky. Recorded
+   2026-11-05; the `host` row above said "the watchdog marker logic" and was wrong.
+12. **T2c and T2d run with `new-mcp` paused, and T2c needs that to pass.** They are the last two
+   steps, after T6c, and `new-mcp` is paused from T2c to the end. The first attempt did not pause
+   it and the new MCP never got a slot at all:
+   `new-mcp2 progress {'attempted': 2, 'finished': 0, 'locked': 0} in flight 2` against
+   `[(('new-mcp', 'legacy', True), 40)]` over 60 s — both slots held by the other generation for
+   the whole window. That is #52's inverted arrival order (see §12.7), not a switchover defect,
+   and the probe is now kept in the step as evidence rather than deleted. But it leaves a real
+   boundary: the lane shows a fresh MCP serving legacy on a reverted (pre-nixos-A) host **only
+   when nothing competes with it**, and A⁻¹ in production leaves a host that is contended by
+   definition. Until #52 lands, "legacy still works after a full rollback" is proven for an idle
+   host and *measured false* for a busy one.
 
 None of these is a reason to weaken an assertion. They are the list of things that still need
 either a different harness or the first live run, and §12.6's gates are where that happens.
@@ -1998,14 +2037,14 @@ Forward fixes stay the default; rollback is for a gate that fails without a quic
 | Spot | Why | Closest achievable |
 |---|---|---|
 | Roll step 5 times out (the VM does not come back) | A broken guest config cannot serve calls; queued calls then hit their 1800 s lock bound. | The lane boots-tests the exact guest config first (T1, T4). Rollback is the drained revert. This is a failed deploy, not a switchover property. |
-| Old MCP process stuck in a wait longer than 1800 s | The old code caps lock wait at 1800 s. The roll holds slots only for the restart (~90 s), so this cannot be reached unless step 5 stalls. | Same as above. New `server.py` additionally extends its wait while `/run/research-agent/rolling` exists. |
+| Old MCP process stuck in a wait longer than 1800 s | The old code caps lock wait at 1800 s. ~~The roll holds slots only for the restart (~90 s), so this cannot be reached unless step 5 stalls.~~ **That reasoning was wrong and b13g measured it wrong (2026-11-05):** a T1-stamped call waited **975.5 s** for its slot in a fully green run — 54% of the bound — while the T1 rolls held slots for only ~70 s. The cause is not the roll but `_vm_lock`'s lack of cross-process fairness (https://github.com/jonathanmoregard/research-agent/issues/52, pre-existing on `main`): the longest waiter backs off to a 5 s poll while fresh arrivals poll at 0.5 s, so arrival order is *inverted*. The call was issued when `legacy-mcp` was the only MCP running and got its slot ~16 min later, after `new-mcp` joined at T2. With more panes contending than the lane's four workers, the bound is reachable and the call then fails with `research backend busy`. | Same as above, **plus**: the switchover does not cause this, but it does raise the contention that triggers it (two MCP generations plus a roll holding slots), so #52 should land before the live switchover rather than after. New `server.py` additionally extends its wait while `/run/research-agent/rolling` exists, which helps the roll case and not this one. |
 | A legacy process alive at nixos-B | Its runs need the keyed hosts and `:8123`, which B removes. | G3 makes B wait for it. Contract timing depends on the user's sessions ending: latency of the deploy, not downtime. |
 | `X-RestartIfChanged` read from the old unit at the A switch | The A switch would restart the VM undrained (calls usually survive via the rc=255 re-dial, but not guaranteed). | The lane assertion at T1 detects it. Fallback: split A into A1/A2 (+1 PR). |
 | Broker crash (not a graceful reload) | It loses in-memory runs not yet persisted. | Not caused by the switchover. Persist-on-reload covers every planned restart. |
 | A scraper browse session open across a scraper roll | Sessions are VM-memory. | Cannot happen: the roll holds every slot (no run, hence no session in use) **and** waits for `/health` to report 0 sessions and 0 pending artifacts before restarting (§12.3). |
 | **Broker outage in the `broker-only` era** (crash-loop, failed reload, an operator stopping the socket) | §12.4 refuses legacy whatever the socket's state, so calls fail closed rather than silently re-opening the keyed path. | Accepted, and deliberate: this is the trade that closes the fail-open. The zero-downtime promise covers the planned switchover steps, not an unplanned broker outage. `Restart=on-failure` plus the code-watch oneshot cover the recoverable cases; T5b tests the branch. |
 | **code⁻¹ applied without B⁻¹ first** | New-code processes are fail-closed while `egress-era` is still `broker-only`, until each session reconnects. | Reverse-order rollback (B⁻¹ → code⁻¹ → A⁻¹) avoids it entirely. T6 asserts both the correct order's zero failures and the wrong order's loud failure. |
-| **code⁻¹ in the CORRECT order still fails closed for any MCP process spawned during the `broker-only` era** (the 2026-11-04 advisor finding; chain confirmed in code) | Such a process has no keys in its environment — B dropped the wrapper exports, and an environment cannot be changed after spawn. B⁻¹ restores the exports for *new* spawns only, so these processes are fine while they stay in broker mode, then code⁻¹ removes the protocol marker: `_egress_mode` returns `legacy/no-protocol-marker` (`mcp_server/server.py:637`), `_legacy_keys()` reads `os.environ` ONLY and finds nothing, so the dial becomes `closed/legacy-no-keys` (`:1545`) and raises `research-broker unavailable` until that session reconnects. MCP servers are one per pane and long-lived, so after B lands every new pane is in this state. §12.6 step 2's rollback cell said "legacy mode (keys still exported) ✓" — **true only for processes that predate B or postdate B⁻¹, and the ✓ hid that.** It fails *closed*, so it is downtime and not a leak, but the zero-downtime claim for rollback was false. | Gate code⁻¹ the way G3 gates nixos-B, in the mirror direction: no MCP process spawned under `broker-only` may still be alive. The marker directory `/run/user/1000/research-agent-mcp/<pid>` already distinguishes process generations for G3 and §12.6 step 2, so the check is available; a process in this state must be drained (its pane reconnects) before code⁻¹. Added to §12.6 step 2's rollback cell as **G2⁻¹**. **The lane cannot currently see this** (§12.5 item 8) — every lane MCP is started with all 8 keys. |
+| **code⁻¹ in the CORRECT order still fails closed for any MCP process spawned during the `broker-only` era** (the 2026-11-04 advisor finding; chain confirmed in code) | Such a process has no keys in its environment — B dropped the wrapper exports, and an environment cannot be changed after spawn. B⁻¹ restores the exports for *new* spawns only, so these processes are fine while they stay in broker mode, then code⁻¹ removes the protocol marker: `_egress_mode` returns `legacy/no-protocol-marker` (`mcp_server/server.py:637`), `_legacy_keys()` reads `os.environ` ONLY and finds nothing, so the dial becomes `closed/legacy-no-keys` (`:1545`) and raises `research-broker unavailable` until that session reconnects. MCP servers are one per pane and long-lived, so after B lands every new pane is in this state. §12.6 step 2's rollback cell said "legacy mode (keys still exported) ✓" — **true only for processes that predate B or postdate B⁻¹, and the ✓ hid that.** It fails *closed*, so it is downtime and not a leak, but the zero-downtime claim for rollback was false. | Gate code⁻¹ the way G3 gates nixos-B, in the mirror direction: no MCP process spawned under `broker-only` may still be alive. The marker directory `/run/user/1000/research-agent-mcp/<pid>` already distinguishes process generations for G3 and §12.6 step 2, so the check is available; a process in this state must be drained (its pane reconnects) before code⁻¹. Added to §12.6 step 2's rollback cell as **G2⁻¹**. ~~The lane cannot currently see this.~~ **The lane now proves it, 2026-11-05** (§12.5 item 8): a keyless second MCP spawned under `contract` serves in broker mode at T5, is still ok at T6a, and at T6b fails closed with exactly the predicted `mode=closed reason=legacy-no-keys era=legacy-ok`; a fresh spawn after B⁻¹ serves legacy. So this row is no longer a code-reading inference — the chain was measured end to end, in the correct rollback order, before the gate was written. |
 | **The scraper's pending-artifact count never reaches zero** (sustained load, or a stuck pull) | The roll's criterion is the scraper's own queue depth, so a permanently non-idle scraper defers the roll indefinitely. | `scraperQuietSeconds` caps the wait; past it the roll reports and keeps waiting rather than restarting over un-pulled artifacts. Deferring a roll is latency; restarting on top of live artifacts would be data loss. A roll pending over 24 h notifies. **This row describes the NEW scraper only** — see the next row for the one roll that cannot do this. |
 | **The T2 legacy scraper roll can drop a finished run's artifacts, silently** (found by the 2026-11-04 advisor pass; confirmed in code) | The old scraper reports no idle counters, so the legacy branch of the roll holds every slot for `scraperQuietSeconds` and then restarts "treating as idle" (`research-vm-roll.nix:219-222`) — it cannot distinguish idle from busy. Holding every slot does **not** mean no run is still being processed: `_vm_lock` wraps only `_run_agent` (`mcp_server/server.py:2249`), and the host-side scan plus `fetch_artifacts` run **after** the slot is released. The repo's own measurement makes the window ordinary rather than exotic: under Lakera 429 throttling a scan takes minutes (~1 success per 4–5 min fleet-wide, `session-constraints.md` 2026-09-05), well past a 300 s quiet window. `fetch_artifacts` then returns `[]` "on any failure", the report is delivered without its screenshots, and **nothing reports a loss** — the call still succeeds. Note the `ARTIFACT_TTL_S` of 30 min is NOT the binding constraint; the restart is. | Gate the one legacy roll on the host side instead of guessing a quiet window: §12.6 step 2 now requires no report in flight before the merge (a touched zero-length `reports/<id>.md` is the observable, written at `mcp_server/server.py:2247` before the jail runs). A longer `scraperQuietSeconds` only moves the guess. The real fix — pull artifacts inside the slot, before scanning — is a change to the scanner/quarantine path and does not belong in a switchover PR; it is noted in §11 as follow-up. **The lane cannot see this** (§12.5 item 9). |
 
