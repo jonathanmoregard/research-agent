@@ -587,6 +587,43 @@ def _broker_admin_path() -> str:
     return os.environ.get("RESEARCH_BROKER_ADMIN") or _BROKER_ADMIN_DEFAULT
 
 
+def _broker_reachable(path: str) -> bool:
+    """Is something LISTENING on the admin socket — connect, never stat.
+
+    A socket file outlives its unit: `RemoveOnStop` defaults to `no`, and
+    `/run` persists until reboot, so `research-broker-admin.socket` leaves
+    `/run/research-broker/admin.sock` behind whenever it stops — on an
+    operator stop, a failed start, or the `A⁻¹` revert that removes the unit
+    from the configuration altogether.
+
+    `os.path.exists` cannot tell that corpse from a live broker, and the
+    difference decides the protocol: in the transition era a MISSING socket
+    means "pre-nixos-A host, use legacy", while a socket believed present
+    commits the dial to the broker, which then takes `ConnectionRefusedError`
+    for `_BROKER_CONNECT_RETRY_S` and raises `research-broker unavailable`.
+    Statting therefore turned "the broker is not running" — a state the
+    transition era is explicitly built to survive on legacy — into downtime.
+    Found by the 2026-11-05 independent lane review (§12.7).
+
+    One AF_UNIX connect against a local path, so this costs a syscall pair
+    and cannot block on the network; a full listen backlog is the only thing
+    that waits, and the 1 s timeout bounds it. The probe is deliberately NOT
+    a request: it opens and drops the connection, so it cannot consume a run
+    slot, mutate broker state, or appear in the broker's request log.
+    """
+    import socket as _socket
+
+    s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    s.settimeout(1.0)
+    try:
+        s.connect(path)
+    except OSError:
+        return False
+    finally:
+        s.close()
+    return True
+
+
 def _read_small(path: Path) -> str | None:
     """A one-word control file: None if absent; raises OSError if unreadable."""
     try:
@@ -617,21 +654,30 @@ def _egress_mode() -> tuple[str, str, str]:
         marker = ""
     has_marker = marker == _GUEST_PROTOCOL_BROKER
     admin = _broker_admin_path()
-    has_socket = os.path.exists(admin)
+    # Reachable, not merely present: a stopped socket unit leaves its file
+    # behind (see `_broker_reachable`), and in the transition era that lie
+    # costs a working legacy dial.
+    has_socket = _broker_reachable(admin)
     if era == "broker-only":
         if not has_marker:
             return "closed", "no-protocol-marker", label
-        # Legacy is impossible here; a missing socket gets only the short
-        # unit-restart grace before the era's verdict (closed).
+        # Legacy is impossible here; an unreachable socket gets only the short
+        # unit-restart grace before the era's verdict (closed). The grace now
+        # waits for a LISTENER rather than for a path that a stale file
+        # already satisfies, so a restart is ridden out instead of being
+        # mistaken for a live broker and failing in the dial 15 s later.
         deadline = time.monotonic() + _BROKER_CONNECT_RETRY_S
         while not has_socket and time.monotonic() < deadline:
             time.sleep(min(0.1, max(deadline - time.monotonic(), 0)))
-            has_socket = os.path.exists(admin)
+            has_socket = _broker_reachable(admin)
         if not has_socket:
             return "closed", "broker-absent", label
         return "broker", "broker-present", label
-    # Transition era: a missing socket is today's pre-broker host — legacy at
-    # once, no grace wait on every pre-nixos-A dial.
+    # Transition era: an unreachable socket is a host where the broker is not
+    # serving — a pre-nixos-A host, a stopped unit, or an A⁻¹ revert that left
+    # the file. All three are states this era exists to survive, and legacy is
+    # permitted in all three (keys exported, `:8123` routed), so take it at
+    # once with no grace wait on every pre-nixos-A dial.
     if not has_socket:
         return "legacy", "no-broker", label
     if not has_marker:

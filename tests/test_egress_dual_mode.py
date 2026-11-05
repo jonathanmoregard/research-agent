@@ -175,6 +175,60 @@ def test_legacy_ok_without_protocol_marker_is_legacy(dial):
     assert "mode=legacy reason=no-protocol-marker era=legacy-ok" in dial.mode_line()
 
 
+def test_a_stale_socket_file_with_no_listener_is_still_a_legacy_dial(dial):
+    """A⁻¹ left the socket FILE behind: legacy, not fail-closed downtime.
+
+    `research-broker-admin.socket` has no `RemoveOnStop`, so systemd's default
+    (`no`) applies and `/run/research-broker/admin.sock` survives every stop —
+    an operator stop, a failed start, or the A⁻¹ revert that deletes the unit
+    from the configuration. `/run` then holds that corpse until reboot. With
+    `os.path.exists` as the predicate, a new-code process on such a host read
+    "broker present", committed the dial to the broker, and took
+    ConnectionRefusedError for the whole connect retry before raising
+    `research-broker unavailable` — downtime in the one era whose entire
+    purpose is that legacy still works. Found by the 2026-11-05 independent
+    review of the switchover lane; the lane had been `rm -f`-ing the socket,
+    which is exactly the state production does NOT leave behind.
+
+    The marker is present on purpose: that is the A⁻¹-before-code⁻¹ ordering,
+    where the checkout still ships `scripts/.guest-protocol`.
+    """
+    dial.marker.write_text("broker-v1\n")
+    stale = StubBroker(dial.admin, bind_and_activate=False)
+    stale.server_bind()  # the inode exists; nothing ever listens on it
+    try:
+        assert os.path.exists(dial.admin), "the test must leave a real stale inode"
+        rc, _ = dial.run()
+    finally:
+        stale.server_close()
+    assert rc == 0
+    assert len(dial.fields()) == 11, "must be the 11-field legacy payload"
+    assert "mode=legacy reason=no-broker era=absent" in dial.mode_line()
+
+
+def test_broker_only_names_a_stale_socket_absent_rather_than_present(dial):
+    """Same corpse under `broker-only`: still closed, but for the true reason.
+
+    Here closed is correct and deliberate (§12.7) — legacy is impossible in
+    this era. What the stat predicate got wrong was the *reason* and the
+    timing: it reported `broker-present`, skipped the restart grace entirely
+    because the path was already there, and then spent the connect retry in
+    the dial. Waiting on a listener instead means a genuine socket-unit
+    restart is ridden out, and a corpse is named `broker-absent`.
+    """
+    dial.era.write_text("broker-only\n")
+    dial.marker.write_text("broker-v1\n")
+    stale = StubBroker(dial.admin, bind_and_activate=False)
+    stale.server_bind()
+    try:
+        with pytest.raises(server._BrokerUnavailable):
+            dial.run()
+    finally:
+        stale.server_close()
+    assert dial.calls == [], "no ssh attempt may be made on a closed dial"
+    assert "mode=closed reason=broker-absent era=broker-only" in dial.mode_line()
+
+
 def test_legacy_resolver_never_consults_the_keyring(dial, monkeypatch):
     """After nixos-B drops the wrapper's exports, _secret() would still find
     exa/tavily in the keyring. The legacy branch must not: env or nothing."""
