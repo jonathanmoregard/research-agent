@@ -1900,7 +1900,20 @@ two research-agent pins, the broker, egress, microvm, roll or healthcheck module
 Expected runtime on a GitHub runner: 4 nodes (scraper with chromium at 3 GiB), about 3 min of
 boots plus four stub reboots at ~1 min each, ~100 fake-agent calls at 5-15 s, and two 60 s / 300 s
 idle windows (shortened in the lane through the roll units' `idleSeconds` option to 10 / 20 s).
-That is roughly **15-25 min**; give the job `timeout-minutes: 45`. Locally the same command
+That estimate was **15-25 min**, and measured runs land at the top of it: **1443.55 s** (b14) and
+**1495 s** (b13g) on a KVM host. Two CI facts found in the 2026-11-05 nixos-A review, both of which
+are Jonathan's to decide because they are cross-cutting:
+- the `vm-minimal` job carries **no `timeout-minutes`**, so GitHub's 360-minute default applies.
+  `timeout-minutes` is job-level and the job is a **15-lane matrix**, so a number chosen for this
+  lane also binds `base`, `desktop`, `security-batch` and the rest — it is not a local edit.
+- the build step wraps `nix build` in a **3-attempt retry loop** with backoff. For a sequenced
+  switchover test that is worse than the missing timeout: an ordering or concurrency bug that
+  reproduces 1-in-3 is reported **green**, which is precisely what this lane exists to catch. The
+  retry was added for infra flakes (ENOSPC, cachix 5xx) and is reasonable for the other lanes.
+KVM is not a risk: the job hard-fails unless `DETERMINATE_NIX_KVM=1` and `ls /dev/kvm` succeeds, so
+no run silently falls back to TCG. The required-check name is `vm-minimal (egress-switchover)` and
+must be added to branch protection **in the GitHub UI** — until then a green lane does not block a
+merge, which makes it advisory rather than a gate. Locally the same command
 runs. It needs no external network: the fake agent replaces the LLM, and every upstream is the
 `upstream` node.
 
@@ -1982,6 +1995,24 @@ than the lane can make. Recorded 2026-11-04 from the lane's own construction:
    when nothing competes with it**, and A⁻¹ in production leaves a host that is contended by
    definition. Until #52 lands, "legacy still works after a full rollback" is proven for an idle
    host and *measured false* for a busy one.
+   **The lane works around #52 in four places** — the request hold, the pause hold, and `new-mcp`
+   paused from T2c on — and each is marked in the source with the issue number. **They come out
+   when #52 lands**, or the lane permanently measures a contention pattern production does not
+   have. The 60 s contention probe inside T2c stays regardless: it is the only place either repo
+   measures admission *order*, and a green step is not a reason to delete the measurement that
+   explains why the step needed a workaround.
+13. **The lane's "old" code is only as current as a hand-maintained flake pin**, and a stale pin
+   produces a *green* run that replays a host nobody is running. Measured 2026-11-05:
+   `research-agent-old` sat at `e92646e` while `main` had moved 22 commits to `2cdb188`, across
+   271 insertions / 448 deletions in `mcp_server/server.py` and `scripts/run-agent.sh` —
+   including `e142756`, which moved all eight keys out of `bwrap` argv into inherited exports, the
+   very mechanism T0–T3 exercise. Nothing failed; the lane passed against the wrong past.
+   Mitigating facts, both checked rather than assumed: `agent/` and `scraper/` are byte-identical
+   across that range, so the shims, T2d's red/green pair and §12.4's old-shim verification are
+   unaffected; and the branch already contains `2cdb188`, so only the *old* side was stale. Gated
+   as **G0** in §12.6 step 0, because no flake assertion can see this — neither input has a local
+   notion of "current". **Treat any green run older than the latest `main` commit as
+   provisional.**
 
 None of these is a reason to weaken an assertion. They are the list of things that still need
 either a different harness or the first live run, and §12.6's gates are where that happens.
@@ -2027,7 +2058,7 @@ for the whole switchover window, so a 60 s idle window remains possible. Each it
 
 | Step | Do | Gate (all must hold before the next merge) | Zero-downtime rollback |
 |---|---|---|---|
-| 0 | #308 deployed; lane `vm-egress-switchover` green on the A PR; start the probe. | 30 min of clean probe at S0. | — |
+| 0 | #308 deployed; lane `vm-egress-switchover` green on the A PR; start the probe. | 30 min of clean probe at S0. **G0, added 2026-11-05: re-pin and re-run the lane immediately before this step.** Both flake inputs decay silently and nothing turns red when they do — `research-agent-old` must equal research-agent `main` HEAD, and `research-agent-new` must equal the **exact merge candidate** of step 2. Found by the second nixos-A review: `research-agent-old` was pinned at `e92646e` (PR #40) while `main` had moved 22 commits to `2cdb188`, including `e142756`, which moved all eight keys out of `bwrap` argv into inherited exports — so every old-code step was replaying a host that no longer exists. The new side decays the same way and was measured doing it: pinning `6afe86f` vs `c00831b` gives different lane drvPaths (`s6cf89qg…` / `y7hw9gg6…`), so a stale pin keeps passing against code that is not what gets merged. A flake assertion cannot catch either, since neither input has a local notion of "current" — hence a runbook gate. **Merge #41 as a merge commit, not a squash**, or the pinned sha stops being fetchable once the branch is deleted and the lane becomes unreproducible. | — |
 | 1 | Merge **nixos-A** (auto-deploys). | **G1:** `research-vm-roll@research-agent` finished (`booted == current`; journal shows "idle window → restart → ready"); guest `nft list ruleset` has both `:8123` and `:8124`; `systemctl show research-broker.socket -p ConditionResult` = `no`; the `.path` units are active; probe clean; one real normal research call ok. | Revert A on `main` (auto-deploys). The broker units disappear (they were inert). **A⁻¹ is NOT drained — corrected 2026-11-03, measured in the lane.** Reverting A removes the roll units themselves, so nothing is left to drain with, and `microvm@research-agent` goes back to `restartIfChanged=true`, so `switch-to-configuration` restarts it immediately and kills any in-flight run. Drain by hand before reverting: stop accepting new calls and wait for `_vm_lock` to go free (≤ the 165 s route bound, not the 1800 s lock wait), then revert. The earlier claim that "the roll restarts the VM drained back to base" was false — the roll cannot drain its own removal. |
 | 2 | **Precondition, added 2026-11-04: no report in flight.** `ls -l` the reports dir and confirm no zero-length `<report_id>.md` — that file is touched before the jail runs (`mcp_server/server.py:2247`) and filled at the end, so a zero-length one means a run is still being scanned. This is the gate against the T2 legacy roll dropping that run's artifacts: the roll holds every slot, but `_vm_lock` covers only `_run_agent`, so the scan and `fetch_artifacts` happen after the slot is released and the old scraper reports no counters for the roll to wait on (§12.7). Keep it clear until the scraper roll reports `ready`. Then: merge **research-agent**; the pull arrives (cron, or run it by hand to watch). | **G2:** both broker sockets active; `curl --unix-socket /run/research-broker/admin.sock …/admin/health` has the code hash = the checkout hash; the scraper roll finished (`/health` hash = checkout); `server.log` shows `mode=broker era=legacy-ok` for new processes; **legacy dials are attributed by PID, not by their own log line** — pre-pull `server.py` has no `mode=` logging, so the check is "every `mcp_server.server` PID lacking the `/run/user/1000/research-agent-mcp/<pid>` marker is a pre-pull PID" (the same marker G3 uses), cross-checked against the guest-side protocol record `run-agent.sh` writes; probe clean on **both** paths; §8.4 workflow checks pass; the broker canary (`?k=probe` refused) holds. | **G2⁻¹ first, added 2026-11-04: no MCP process spawned during the `broker-only` era may still be alive.** Such a process has no keys in its environment (B dropped the exports; B⁻¹ only affects new spawns), so when code⁻¹ removes the protocol marker it falls to `legacy/no-protocol-marker` → `closed/legacy-no-keys` → `research-broker unavailable` until its session reconnects. Drain those panes first; identify them with the same `/run/user/1000/research-agent-mcp/<pid>` marker generation check this row's forward gate uses. See §12.7. Then: revert the merge on `main` (cron pulls). New in-memory servers see the protocol marker gone and `egress-era` = `legacy-ok` → legacy mode — **with keys exported only if the process predates B or postdates B⁻¹**; that is what G2⁻¹ is for, and this cell used to claim "keys still exported ✓" unconditionally. The code-watch oneshot sees `broker/` vanish and **explicitly stops** the sockets and the service, draining under the same 210 s (§12.2 step 2). *Not* `ConditionPathExists` — that is evaluated only on start, so nothing would have stopped already-active sockets. The scraper roll reloads old scraper code once `/health` reports idle. |
 | 3 | Wait for old MCP processes to end (sessions close or `/mcp` reconnect naturally). | **G3:** `research-mcp-protocheck` (new, in nixos-A): every live `mcp_server.server` PID has a `/run/user/1000/research-agent-mcp/<pid>` marker written by new `server.py` at start, **and** `server.log` has zero `mode=legacy` dials for 24 h. Lane green on the B PR (pins bumped). | Nothing to roll back. |
