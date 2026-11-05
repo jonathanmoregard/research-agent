@@ -1991,6 +1991,17 @@ scraper emitted the same wrong field name the roll read.
 
 ### 12.6 Live runbook, gates and probe loop
 
+**Precondition on the whole runbook, added 2026-11-05:
+https://github.com/jonathanmoregard/research-agent/issues/52 lands first.** `_vm_lock` has no
+cross-process fairness, and b13g measured a **975.5 s** slot wait (54% of the 1800 s bound) inside
+a *green* run with only four contending workers, plus a window where a newly started MCP got zero
+slots in 60 s while the incumbent completed 40 calls (§12.5 item 12, §12.7 row 2). The switchover
+does not cause this, but every step below raises exactly the contention that triggers it — two MCP
+generations alive at once, plus a roll holding slots — and past the bound a call fails with
+`research backend busy`. A zero-downtime switchover cannot be claimed on top of an admission
+policy that can starve a caller out. This is a research-agent change, not a switchover PR, and it
+is deliberately not on this branch.
+
 **Probe.** `research-switchover-probe` is a host script, run as jonathan. It loops every 120 s
 for the whole switchover window, so a 60 s idle window remains possible. Each iteration:
 
