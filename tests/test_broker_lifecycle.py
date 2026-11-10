@@ -267,6 +267,61 @@ def test_drain_persists_before_joining_in_flight(tmp_path, sig):
         rig.close()
 
 
+def test_a_terminal_stop_serves_registered_runs_out_before_exiting(rig):
+    """code⁻¹ must not orphan a run that is merely between calls.
+
+    A registered run is idle most of its life — a 60 s browse session polls
+    with 10 s waits — so joining in-flight REQUESTS says nothing about
+    whether it still needs the broker. b16's T6b measured the consequence:
+    the drain finished in 4.9 s, saved state for 2 runs, exited, and every
+    later `browse_wait` got `broker unavailable (infra)` with ~55 s of the
+    session still to go. Deleting `broker/server.py` is exactly what the
+    oneshot sees at code⁻¹, and it means the saved state has no reader.
+    """
+    p = rig.start()
+    token = rig.register()
+    (rig.code / "broker" / "server.py").unlink()  # code⁻¹: no successor can load the state
+    p.send_signal(signal.SIGTERM)
+
+    deadline = time.monotonic() + 5
+    while p.poll() is None and time.monotonic() < deadline:
+        status, reply = rig.post("/v1/scraper/render",
+                                 {"url": "https://start.example/"}, token)
+        assert status == 200, f"a registered run must keep being served: {reply}"
+        break
+    assert p.poll() is None, "the drain must still be serving, not exited"
+
+    # Arrivals must not be able to hold the drain open indefinitely.
+    status, reply = rig.admin_call("POST", "/admin/runs", {
+        "run_id": "d" * 32, "depth": "normal", "provider": "claude",
+        "prompt_urls": ["https://start.example/"], "ttl_s": 600})
+    assert (status, reply.get("error")) == (503, "stopping"), reply
+
+    # Deregistering is what releases it — not a timeout.
+    t0 = time.monotonic()
+    status, _ = rig.admin_call("DELETE", f"/admin/runs/{RUN_ID}")
+    assert status == 200
+    p.wait(20)
+    assert p.returncode == 0
+    assert time.monotonic() - t0 < 15, "exit must follow deregistration, not the budget"
+
+
+def test_a_restart_does_not_wait_for_runs_the_successor_will_inherit(rig):
+    """The fast path must stay fast: with the code still on disk, the state
+    file is a handover and systemd queues the run's next call for the next
+    process, so waiting out the registry would delay every reload for no
+    gain. This is the guard against the fix above turning each of §12.2's
+    reloads into a multi-minute stall."""
+    p = rig.start()
+    rig.register()  # registered, and deliberately never deregistered
+    t0 = time.monotonic()
+    p.send_signal(signal.SIGTERM)
+    p.wait(20)
+    assert p.returncode == 0
+    assert time.monotonic() - t0 < 10, (
+        "a drain with a successor must not wait for registered runs")
+
+
 def test_sighup_with_unchanged_code_keeps_the_same_process_serving(rig):
     """§12.2 step 4: the code-watch oneshot reloads unconditionally on every
     path event; the broker owns the comparison. Same digest → no drain, no

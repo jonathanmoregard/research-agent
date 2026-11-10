@@ -116,3 +116,24 @@ SWEEP_INTERVAL_S = 30.0
 # sends its whole request within milliseconds of connecting, and waiting on
 # one that does not would let any VM process stall every reload.
 DRAIN_READ_GRACE_S = 2.0
+
+# A REGISTERED RUN is not a request: it sits between calls for most of its
+# life (a 60 s browse session polls with 10 s waits), so joining requests says
+# nothing about whether a run still needs the broker. When no successor
+# process can exist — code⁻¹ deleted `broker/` and the oneshot is stopping us
+# for good — exiting on an empty request queue orphans every live run, which
+# is what b16's T6b measured: the drain took 4.9 s, saved state for 2 runs,
+# and exited with ~55 s of a browse session still to go. So on a terminal
+# stop the broker keeps SERVING until the registry empties.
+#
+# Under `TimeoutStopSec = 210` (research-broker.nix), and deliberately well
+# under: the budget has to leave room for the request grace, the thread joins
+# and two state writes before systemd's SIGKILL, and overshooting it would
+# cost the registry handover this drain exists to protect.
+#
+# It is a bound, not a guarantee. A research call can outlast any budget
+# (Lakera 429 throttling alone makes multi-minute scans ordinary), so the
+# zero-downtime answer is the §12.6 gate that waits for `active_runs == 0`
+# BEFORE code⁻¹; this is the safety net that makes the remaining case a
+# logged, counted drop instead of a silent one.
+DRAIN_RUNS_BUDGET_S = 150.0

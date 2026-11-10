@@ -96,6 +96,13 @@ class Broker:
         self.code_root = code_root
         self.loaded_digest = loaded_digest or code_digest(code_root)
         self.sleep = sleep
+        # Set once a terminal stop has begun (see `_successor_possible`): the
+        # broker keeps serving the runs it has, and takes no new ones, so the
+        # drain's wait for an empty registry cannot be extended indefinitely
+        # by arrivals. Plain bool, written by the signal loop and read by
+        # request threads: a torn read is impossible and a stale read costs
+        # one extra registration.
+        self.stopping = False
         self._sems = {name: threading.BoundedSemaphore(config.UPSTREAM_CONCURRENCY)
                       for name in list(config.ROUTE_BUDGETS)}
 
@@ -182,6 +189,14 @@ class Broker:
         return 404, {"status": "error", "error": "not found"}
 
     def _register(self, body: dict | None) -> tuple[int, dict]:
+        # A terminal stop is under way: serve the runs already registered,
+        # refuse new ones. Without this the drain's wait for an empty
+        # registry could be held open indefinitely by fresh arrivals, and a
+        # run admitted here would be orphaned seconds later anyway. The
+        # caller sees a closed reason code and fails loudly, which during
+        # code⁻¹ is correct — there is no broker to come back to.
+        if self.stopping:
+            return 503, {"status": "error", "error": "stopping"}
         if not isinstance(body, dict):
             return 400, {"status": "error", "error": "bad json"}
         run_id, depth = body.get("run_id"), body.get("depth")
@@ -561,6 +576,29 @@ def serve(app: Broker, socks: dict[str, socket.socket]) -> int:
                 break
             log(f"signal {signal.SIGHUP}: code unchanged "
                 f"({app.loaded_digest[:12]}), still serving")
+    # A terminal stop — code⁻¹ removed `broker/`, so no successor process can
+    # load the state we are about to save — must wait for the RUNS, not just
+    # the requests. A registered run is idle between calls, so an empty
+    # request queue means nothing about whether it still needs us, and
+    # everything below stops serving. Measured in b16's T6b: the drain
+    # finished in 4.9 s, saved 2 runs and exited with ~55 s of a browse
+    # session left, and every later call got `broker unavailable (infra)`.
+    # Keep accepting for the runs we already have; `app.stopping` refuses new
+    # registrations so arrivals cannot hold this open.
+    if not _successor_possible(app):
+        app.stopping = True
+        deadline = time.monotonic() + config.DRAIN_RUNS_BUDGET_S
+        left = app.registry.active()
+        if left:
+            log(f"terminal stop: serving {left} registered run(s) out, "
+                f"up to {config.DRAIN_RUNS_BUDGET_S:.0f}s")
+        while left and time.monotonic() < deadline:
+            time.sleep(0.2)
+            left = app.registry.active()
+        # Loud either way: a drop here is the one case §12.6's gate exists to
+        # prevent, so it must never be inferable only from a later error.
+        log(f"terminal stop: {'runs drained' if not left else f'DROPPING {left} run(s)'}"
+            f" after {config.DRAIN_RUNS_BUDGET_S - max(deadline - time.monotonic(), 0):.1f}s")
     # Persist first: everything below can outlast TimeoutStopSec, and a
     # SIGKILL then must cost at most the drain's progress, not the registry.
     _save(app)
@@ -586,6 +624,33 @@ def _save(app: Broker) -> None:
         app.save_state()
     except OSError as e:  # a full disk must not stop the drain
         log(f"state save failed: {type(e).__name__}")
+
+
+def _successor_possible(app: Broker) -> bool:
+    """Can another broker process come back and load the state we save?
+
+    This is the question that decides whether a drain may exit on an empty
+    request queue. On a reload or a restart the answer is yes: the state file
+    is a handover, the sockets stay activated, and a run's next call is
+    queued by systemd for the successor to serve — so waiting for runs would
+    only delay the new code for no gain.
+
+    On code⁻¹ the answer is no. The oneshot stops the sockets *and* the
+    service because `broker/server.py` is gone from the checkout, so the
+    saved state has no reader and every registered run is orphaned the
+    moment this process exits.
+
+    Read the entry module itself rather than the tree digest: `code_changed`
+    already treats an unreadable tree as "reload" and cannot distinguish
+    changed from deleted, which is precisely the distinction that matters
+    here. A missing file is unambiguous; any other error means the file is
+    there and something else is wrong, so assume a successor and keep the
+    fast path.
+    """
+    try:
+        return os.path.exists(os.path.join(app.code_root, "broker", "server.py"))
+    except OSError:
+        return True
 
 
 def main() -> int:
